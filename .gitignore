@@ -1,0 +1,95 @@
+.gradle/
+build/
+bin/
+run/
+logs/
+crash-reports/
+
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+*.zip
+*.log
+*.log.gz
+
+.tmp*/
+tmp_*/
+tmp*/
+src_decompiled/
+src_common/
+upstream_voxyserver/
+external/
+
+mcmodsrepo/
+out/
+*.class
+
+.idea/
+*.iml
+.vscode/
+
+# Local game state and ad-hoc build output.
+/cache/
+/config/
+/.intentionally-empty-file.o
+/b.txt
+/build_out.txt
+
+# Local prediction validation records and terrain matrix tooling stay untracked.
+/tools/prediction/*_20[0-9][0-9]-*.md
+/tools/prediction/terrain-releases.json
+/tools/prediction/terrain-version-matrix.ps1
+/tools/rust/vss-native-core/examples/sparse_bench.rs
+
+# Local Python bytecode and diagnostic write-ups (tracked docs are unaffected).
+__pycache__/
+*.py[cod]
+/tools/prediction/*.md
+# Ad-hoc local GL inspection; the bounded rendercapture command is the supported diagnostic.
+/tools/prediction/VoxyPipelineSnapshot.java
+/tools/rust/*_20[0-9][0-9]-*.md
+/docs/PORT_*_SYNC_20[0-9][0-9]-*.md
+
+# Local packaged JAR archives, manifests and sampling screenshots.
+/lib/
+/minecraft-window.png
+/sampling-current.png
+/screen-now.png
+
+# Isolated local Gradle caches, build trees and profiling output.
+/.gradle-*/
+/build-*
+/merge-budget-run-*.txt
+*.jfr
+*.sparkprofile
+
+# Raw captures and copied source snapshots are local experiment inputs.
+# Reusable fixtures under java/, src/ and baseline-src/ remain versioned.
+/tools/prediction/**/before-src/
+/tools/prediction/**/before-files/
+/tools/prediction/**/before-resources/
+/tools/prediction/**/before-tests/
+/tools/prediction/**/production-src/
+/tools/prediction/**/regression-src/
+/tools/prediction/**/pre-integration/
+/tools/prediction/**/baseline/
+/tools/prediction/**/comparison-src/
+/tools/prediction/**/inputs/
+/tools/prediction/**/live/
+/tools/prediction/**/profile/
+/tools/prediction/**/diagnostics/
+/tools/prediction/**/active/
+/tools/prediction/**/results/
+/tools/prediction/far-terrain-20261014/instrumented-baseline.java
+/tools/prediction/**/*.csv
+/tools/prediction/**/*.tsv
+/tools/prediction/**/*.xml
+/tools/prediction/**/*.json
+/tools/prediction/**/*.jsonl
+/tools/prediction/**/*.png
+/tools/prediction/**/*.rgba
+/tools/prediction/**/*.bin
+/tools/prediction/**/*.dll
+/tools/prediction/**/*.mf
+/tools/prediction/**/*.patch
+/tools/prediction/**/*.txt
+!/tools/prediction/**/test-sources.txt

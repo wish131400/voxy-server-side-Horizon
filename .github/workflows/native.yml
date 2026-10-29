@@ -1,0 +1,50 @@
+name: Native prediction core
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - tools/rust/vss-native-core/**
+      - .github/workflows/native.yml
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+            library: vss_native_core.dll
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            library: libvss_native_core.so
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+            library: libvss_native_core.so
+          - os: macos-15-intel
+            platform: macos-x86_64
+            library: libvss_native_core.dylib
+          - os: macos-15
+            platform: macos-aarch64
+            library: libvss_native_core.dylib
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: tools/rust/vss-native-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify native algorithms
+        run: cargo test --locked --lib
+      - name: Build production library
+        run: cargo build --locked --release --lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: tools/rust/vss-native-core/target/release/${{ matrix.library }}
+          if-no-files-found: error
