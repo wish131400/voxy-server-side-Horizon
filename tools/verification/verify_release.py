@@ -34,7 +34,7 @@ def manifest_attributes(data):
 
 
 def class_references(data):
-    """Read real field/method instructions, excluding strings and unused pool entries.
+    """Read real field/method and instanceof instructions, excluding unused entries.
 
     This establishes that a packaged implementation calls its target APIs. It
     does not establish execution, control flow correctness or rendering parity.
@@ -101,6 +101,9 @@ def class_references(data):
                     owner = pool[pool[member[1]][1]]
                     signature = pool[member[2]]
                     entries.add((owner, pool[signature[1]], pool[signature[2]]))
+                elif opcode == 193:
+                    target = pool[int.from_bytes(code[offset + 1:offset + 3], "big")]
+                    entries.add((pool[target[1]], "<instanceof>", None))
                 if opcode in (170, 171):
                     aligned = (offset + 4) & ~3
                     if opcode == 170:
@@ -396,7 +399,16 @@ def verify(jar, platform, build_id, source, minecraft=None):
         requests = check_class("networking/client/LodRequestManager", "reserveLocalGeneration")
         require(b"localGenerationLimit" not in requests, "Non-atomic generation admission still packaged")
 
-        check_class("compat/VoxyFluidSurface", "top", "pack", "transitions", "meshTransitions", "LiquidBlock")
+        fluid = check_class("compat/VoxyFluidSurface", "top", "pack", "transitions", "meshTransitions")
+        # 1.21.11 remapJar uses the pinned intermediary mapping for LiquidBlock;
+        # 26.x artifacts retain Mojang names. Require the actual type instruction
+        # in both admission paths, not a named string left in the constant pool.
+        liquid = "net/minecraft/class_2404" if minecraft == "1.21.11" else "net/minecraft/world/level/block/LiquidBlock"
+        fluid_references = class_references(fluid)
+        for method in ("body", "top"):
+            require(any((liquid, "<instanceof>", None) in entries
+                        for (declared, _), entries in fluid_references.items() if declared == method),
+                    "Missing liquid type check: VoxyFluidSurface." + method + " -> " + liquid)
         check_class("compat/VoxySurfaceHeights", "// VSS liquid surface remainder", "vssLiquidDrop")
         check_class("client/prediction/PredictionVoxySource", "VoxyFluidSurface")
         check_class("mixin/voxy/StrictVoxyVisibilityMixin", "observeUnifiedView")
