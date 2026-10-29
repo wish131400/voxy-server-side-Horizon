@@ -50,6 +50,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify native algorithms
         run: cargo test --locked --release --lib
+      - name: Verify required biome routing and density graph parity
+        run: cargo test --locked --release --test terrablender --test terrablender_end --test worldgen --test vanilla_parity
       - name: Verify decoration bounds and compare vegetation against Minecraft references
         run: cargo test --locked --release --test interior --test vegetation --test vegetation263
       - name: Build production library

@@ -22,6 +22,8 @@ pub enum Unary {
     Squeeze,
     Log,
     Sign,
+    Sin,
+    Cos,
 }
 #[derive(Clone, Copy)]
 pub enum Binary {
@@ -53,6 +55,17 @@ pub enum Node {
         shifts: Option<[Id; 3]>,
     },
     Shift(usize, u8),
+    CoordinateShift(Id, [Id; 3]),
+    FastNoise(
+        Box<fastnoise_lite::FastNoiseLite>,
+        f64,
+        f64,
+        Option<[Id; 3]>,
+    ),
+    Cellular(
+        Box<crate::lithostitched::Cellular>,
+        Option<(Id, f32, f32, f32)>,
+    ),
     Range(Id, f32, f32, Id, Id),
     Interval(Id, Vec<f32>, Vec<Id>),
     Lerp(Id, Id, Id),
@@ -86,6 +99,24 @@ fn java_min(a: f32, b: f32) -> f32 {
 fn java_max(a: f32, b: f32) -> f32 {
     super::java_max(a as f64, b as f64) as f32
 }
+fn float_compare(a: f32, b: f32) -> std::cmp::Ordering {
+    if a < b {
+        return std::cmp::Ordering::Less;
+    }
+    if a > b {
+        return std::cmp::Ordering::Greater;
+    }
+    // InclusiveRange<Float> uses Float.compareTo, including signed zero and
+    // canonical NaNs; primitive comparisons alone change condition results.
+    let bits = |v: f32| {
+        if v.is_nan() {
+            0x7fc00000i32
+        } else {
+            v.to_bits() as i32
+        }
+    };
+    bits(a).cmp(&bits(b))
+}
 impl Node {
     pub fn uses_y(&self, d: &[bool]) -> bool {
         match self {
@@ -95,6 +126,11 @@ impl Node {
                 *y != 0. || shifts.is_some_and(|s| s.iter().any(|n| d[*n]))
             }
             Self::Shift(_, kind) => *kind == 0,
+            Self::CoordinateShift(input, shifts) => d[*input] || shifts.iter().any(|n| d[*n]),
+            Self::FastNoise(_, _, y, shifts) => {
+                *y != 0. || shifts.is_some_and(|s| s.iter().any(|n| d[*n]))
+            }
+            Self::Cellular(noise, _) => noise.vertical != 0,
             Self::Unary(_, n) | Self::Clamp(n, ..) | Self::Cache(n) | Self::Slice(0 | 2, _, n) => {
                 d[*n]
             }
@@ -139,6 +175,8 @@ impl Node {
                         v / 2. - v * v * v / 24.
                     }
                     Unary::Log => (v as f64).ln() as f32,
+                    Unary::Sin => (v as f64).sin() as f32,
+                    Unary::Cos => (v as f64).cos() as f32,
                     Unary::Sign => {
                         if v == 0. || v.is_nan() {
                             v
@@ -234,6 +272,57 @@ impl Node {
             Self::Range(n, a, b, yes, no) => {
                 let v = ev(*n, s);
                 ev(if v >= *a && v < *b { *yes } else { *no }, s)
+            }
+            Self::CoordinateShift(input, shifts) => {
+                let shifts = shifts.map(|n| ev(n, s));
+                // 2.0.6 intentionally has different scalar and volume casts:
+                // scalar truncates offsets before adding, volume casts the sum
+                // (X/Z in double, Y in float). Both then call sampleValue.
+                let q = if is_volume(mode) {
+                    [
+                        (p[0] as f64 + shifts[0] as f64) as i32,
+                        (p[1] as f32 + shifts[1]) as i32,
+                        (p[2] as f64 + shifts[2] as f64) as i32,
+                    ]
+                } else {
+                    std::array::from_fn(|i| p[i].wrapping_add(shifts[i] as i32))
+                };
+                let original = s.modern_volume.take();
+                let value = g.compute(*input, q, Mode::Single, s) as f32;
+                s.modern_volume = original;
+                value
+            }
+            Self::FastNoise(noise, xz, y, shifts) => {
+                let shift = shifts.map_or([0.; 3], |n| n.map(|n| ev(n, s) as f64));
+                let value = noise.get_noise_3d(
+                    p[0] as f64 * xz + shift[0],
+                    p[1] as f64 * y + shift[1],
+                    p[2] as f64 * xz + shift[2],
+                );
+                if shifts.is_none() && is_volume(mode) {
+                    0.0 + value
+                } else {
+                    value
+                }
+            }
+            Self::Cellular(noise, condition) => {
+                let (mut value, positions) = noise.sample(g.seed, p);
+                if let Some((input, min, max, fallback)) = condition.filter(|_| noise.result != 0) {
+                    // The condition is sampled at the two cell feature points,
+                    // not at the query position and not through volume caches.
+                    let original = s.modern_volume.take();
+                    for (i, position) in positions.into_iter().enumerate() {
+                        if (i == 0 && noise.result == 2) || (i == 1 && noise.result == 1) {
+                            continue;
+                        }
+                        let v = g.compute(input, position, Mode::Single, s) as f32;
+                        if float_compare(v, min).is_lt() || float_compare(v, max).is_gt() {
+                            value = fallback;
+                        }
+                    }
+                    s.modern_volume = original;
+                }
+                value
             }
             Self::Interval(n, thresholds, functions) => {
                 let v = ev(*n, s);
@@ -511,6 +600,9 @@ impl Builder<'_> {
             return Ok(Node::Constant(c as f32));
         }
         let t = string(v, "type")?;
+        if let Some(t) = t.strip_prefix("lithostitched:") {
+            return self.parse_lithostitched_modern(t, v);
+        }
         let t = t
             .strip_prefix("minecraft:")
             .ok_or_else(|| format!("unsupported modern density {t}"))?;
@@ -735,11 +827,167 @@ impl Builder<'_> {
             _ => return Err(format!("unsupported modern density codec {t}")),
         })
     }
+
+    fn parse_lithostitched_modern(&mut self, kind: &str, v: &Value) -> Result<Node> {
+        Ok(match kind {
+            "sin" | "cos" => Node::Unary(
+                if kind == "sin" {
+                    Unary::Sin
+                } else {
+                    Unary::Cos
+                },
+                self.parse(&v["input"])?,
+            ),
+            "shift" => Node::CoordinateShift(
+                self.parse(&v["input"])?,
+                [
+                    self.parse(&v["shift_x"])?,
+                    self.parse(&v["shift_y"])?,
+                    self.parse(&v["shift_z"])?,
+                ],
+            ),
+            "fast_noise" => {
+                let ids = [
+                    self.parse(v.get("shift_x").unwrap_or(&Value::from(0)))?,
+                    self.parse(v.get("shift_y").unwrap_or(&Value::from(0)))?,
+                    self.parse(v.get("shift_z").unwrap_or(&Value::from(0)))?,
+                ];
+                let zero = ids.iter().all(|id| matches!(&self.graph.nodes[*id], super::Node::Modern(n) if matches!(**n, Node::Constant(0.0))));
+                Node::FastNoise(
+                    Box::new(crate::lithostitched::noise(
+                        self.graph.seed,
+                        &v["config"],
+                        self.doc,
+                    )?),
+                    v.get("xz_scale")
+                        .map_or(Ok(1.), |_| number(v, "xz_scale"))?,
+                    v.get("y_scale").map_or(Ok(1.), |_| number(v, "y_scale"))?,
+                    if zero { None } else { Some(ids) },
+                )
+            }
+            "cellular" => {
+                let condition = if let Some(c) = v.get("condition") {
+                    let range = &c["range"];
+                    let (min, max) = if let Some(range) = range.as_array().filter(|r| r.len() == 2)
+                    {
+                        (
+                            range[0]
+                                .as_f64()
+                                .ok_or("invalid cellular condition range")?
+                                as f32,
+                            range[1]
+                                .as_f64()
+                                .ok_or("invalid cellular condition range")?
+                                as f32,
+                        )
+                    } else {
+                        (
+                            range.get("min_inclusive").map_or(Ok(-f32::MAX), |_| {
+                                number(range, "min_inclusive").map(|v| v as f32)
+                            })?,
+                            range.get("max_inclusive").map_or(Ok(f32::MAX), |_| {
+                                number(range, "max_inclusive").map(|v| v as f32)
+                            })?,
+                        )
+                    };
+                    if float_compare(min, max).is_gt() {
+                        return Err("inverted cellular condition range".into());
+                    }
+                    Some((
+                        self.parse(&c["function"])?,
+                        min,
+                        max,
+                        number(c, "fallback_value")? as f32,
+                    ))
+                } else {
+                    None
+                };
+                Node::Cellular(
+                    Box::new(crate::lithostitched::Cellular::parse(v)?),
+                    condition,
+                )
+            }
+            // These are rewrite placeholders, never executable Java samplers.
+            _ => return Err(format!("unsupported modern Lithostitched density {kind}")),
+        })
+    }
 }
 
 #[cfg(test)]
 mod reference_tests {
     use super::*;
+    #[test]
+    fn lithostitched_modern_operators_use_float_inputs_and_scalar_shifted_sampling() {
+        let slope = serde_json::json!({"type":"minecraft:gradient","axis":"y","from_coordinate":-100,"to_coordinate":100,"from_value":-3.3,"to_value":3.3});
+        let doc = serde_json::json!({"vss_density_semantics":"float-26.3","settings":{"legacy_random_source":false,"noise_router":{
+            "sin":{"type":"lithostitched:sin","input":slope},
+            "cos":{"type":"lithostitched:cos","input":slope},
+            "shift":{"type":"lithostitched:shift","shift_x":0.9,"shift_y":-1.9,"shift_z":1.3,"input":slope},
+            "noise":{"type":"lithostitched:fast_noise","config":{"type":"lithostitched:perlin","frequency":0.013}},
+            "cells":{"type":"lithostitched:cellular","grid_dimensions":{"horizontal":16},"jitter":0.0,"return_type":"distance_1","salt":7},
+            "condition":{"type":"lithostitched:cellular","grid_dimensions":16,"jitter":0.0,"return_type":"distance_1","salt":7,"condition":{"function":0.0,"range":[1.0,2.0],"fallback_value":-0.25}}
+        }}});
+        let graph = Graph::from_document(123, &doc).unwrap();
+        let mut scratch = graph.scratch(-16, 32, 4, 8).unwrap();
+        for mode in [
+            Mode::Raw,
+            Mode::Single,
+            Mode::Block,
+            Mode::Cell,
+            Mode::Slice,
+        ] {
+            for y in -90..90 {
+                let value = -3.3f32 + (y + 100) as f32 * ((3.3f32 - -3.3f32) / 200.0);
+                let shifted_y = if is_volume(mode) {
+                    (y as f32 + -1.9f32) as i32
+                } else {
+                    y - 1
+                };
+                let shifted = -3.3f32 + (shifted_y + 100) as f32 * ((3.3f32 - -3.3f32) / 200.0);
+                for (root, expected) in [
+                    ("sin", (value as f64).sin() as f32),
+                    ("cos", (value as f64).cos() as f32),
+                    ("shift", shifted),
+                    ("cells", 5.0),
+                    ("condition", -0.25),
+                ] {
+                    let p = if root == "cells" {
+                        [-13, y, 4]
+                    } else {
+                        [-13, y, 71]
+                    };
+                    assert_eq!(
+                        (graph.compute(graph.root(root).unwrap(), p, mode, &mut scratch) as f32)
+                            .to_bits(),
+                        expected.to_bits(),
+                        "{root} {y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cellular_float_ranges_preserve_signed_zero_and_nan_order() {
+        assert!(float_compare(-0.0, 0.0).is_lt());
+        assert!(float_compare(0.0, -0.0).is_gt());
+        assert!(float_compare(f32::from_bits(0xff800001), f32::NAN).is_eq());
+        assert!(float_compare(f32::NAN, f32::MAX).is_gt());
+    }
+
+    #[test]
+    fn lithostitched_rewrite_markers_do_not_silently_become_zero() {
+        for kind in [
+            "original_marker",
+            "wrapped_marker",
+            "internal/merged",
+            "axis",
+            "sqrt",
+        ] {
+            let doc = serde_json::json!({"vss_density_semantics":"float-26.3","settings":{"legacy_random_source":false,"noise_router":{"final_density":{"type":format!("lithostitched:{kind}")}}}});
+            assert!(Graph::from_document(0, &doc).is_err(), "{kind}");
+        }
+    }
     #[test]
     fn vanilla_263_worldgen_scalar_and_volume_bits() {
         let mut errors = Vec::new();
