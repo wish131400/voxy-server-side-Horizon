@@ -131,7 +131,13 @@
 - [x] LOD provider 捕获遵循其群系 palette，并隔离旧错误缓存。
 - [x] 必需群系路由失败时拒绝错误的原版预测，并修正原生回退上下文所有权及取消传播。
 - [x] Rust modern 支持实际 Lithostitched 2.0.6 节点，导出 merged.full，保留真实 float 与坐标语义。
-- [ ] 八目标生产编译、模块与迁移回归、实际 TerraBlender JAR 回放及标准包校验。
-- [ ] 五平台新 Rust 库、来源摘要及八目标标准包发布。
+- [x] 八目标生产编译、模块与迁移回归、实际 TerraBlender JAR 回放及标准包校验。
+- [x] 五平台新 Rust 库、来源摘要及八目标标准包发布。
 
 真实 BetterEnd / Lithostitched 发布 JAR 的九项专项检查通过；Rust 与 Java 的 15,824 个标量 / 体积结果逐位一致。该纯数值参考保留为自包含回归。完整模组世界的植被、结构与连续游玩画面仍需实机验收。
+
+最终统一构建标识为 `fabric-6a99d4182883`，生产源码 SHA-256 为 `6a99d4182883efaef6616c18a723ac368dcff456a4713dd214e93ae40be1b25e`。主仓库与通过验证的隔离快照摘要一致，八个标准 JAR 均核对实际生产调用、目标版本、构建身份与五个平台原生库。上一版 `fabric-6a43e0bb24e8` 保留在本地归档，根目录发布标准八目标 JAR、合包与校验清单；未改动兄弟 Forge / NeoForge 项目。
+
+提交 `0f27385` 的 [Fabric CI](https://github.com/wish131400/voxy-server-side-Horizon/actions/runs/40877347218) 共 14/14 个任务通过。八目标记录 4,962 项检查，其中 4,912 项通过、50 项显式基准、可选输入缺失或不适用检查跳过，无失败；六个社区 Voxy 固定输入的独立接口任务也通过。八个专服均生成并保存真实列缓存后正常退出。实际 TerraBlender JAR 的八目标接口专项另记录 481 项，455 项通过、26 项可选或不适用检查跳过；1.20.1 发布没有 End API，其他七目标实际 End 区域链回放通过。
+
+新原生库来自提交 `3f848db` 的五平台构建，其 Rust 生产源码摘要为 `8e512bd598ee0be50fecde78b41479333f425752aed27054a494b0c494be333e`；新增自包含 Lithostitched 数值参考后的 [五平台原生回归](https://github.com/wish131400/voxy-server-side-Horizon/actions/runs/40875398207)同样全部通过。

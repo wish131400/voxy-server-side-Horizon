@@ -82,6 +82,10 @@ tkettela 此固定提交还存在上游配置初始化顺序缺陷：新配置�
 
 这些是对应接口、快照和算法的兼容结论，不等于任意整合包内所有模组的植被、结构和画面均已实机验收。TerraBlender 1.20.1 的当前发布没有末地扩展 API，该版本继续使用普通区域适配；末地扩展的实际 JAR 回放检查按不适用记录。
 
+修复提交 `0f27385` 的[八目标与六社区组合验证](https://github.com/wish131400/voxy-server-side-Horizon/actions/runs/40877347218)全部通过。八目标共记录 4,962 项模块、迁移与真实依赖接口检查：4,912 项通过，50 项显式基准、缺少可选外部输入或不适用检查跳过，无失败；八个专服均启动、生成真实列、保存缓存并正常退出。另使用各目标实际 TerraBlender 发布 JAR 执行 481 项接口专项，455 项通过、26 项可选或不适用检查跳过，无失败；1.21.1–26.3 的真实 End 区域链回放均已执行。
+
+26.3 的实际 BetterEnd / Lithostitched 发布 JAR 九项专项全部通过，包括 `8×4` 原版末地和 `16×8` 自定义采样网格；Rust 与 Lithostitched Java 的 15,824 个标量及体积结果逐位一致。[五平台 Rust 回归](https://github.com/wish131400/voxy-server-side-Horizon/actions/runs/40875398207)全部通过。包内另校验标签同步、必需路由确认、provider 群系映射及实际 API 调用，不能用这一包内检查替代实际游玩。
+
 ## 安装关系
 
 - 服务端安装对应 Minecraft 版本的 Fabric Loader、Fabric API 和 VSS。专用服务器不需要 Voxy。
@@ -125,7 +129,7 @@ gradlew jar -PmcTarget=26.1.2
 
 标准产物位于 `lib`，例如 `vss-0.3.6-fabric-1.21.11.jar`。文件名不追加临时修复后缀，构建标识和源码摘要写入 JAR 清单。
 
-当前八目标候选包的构建标识为 `fabric-6a43e0bb24e8`，均已通过生产构建和包内源码、版本与原生库校验。源码 SHA-256 为 `6a43e0bb24e812fa140678b496b34cb2f9d5b5cd59edf057b8a1f17adc5192ed`。`lib/SHA256SUMS.txt` 按目标列出各标准 JAR 和合包的校验值。
+当前八目标候选包的构建标识为 `fabric-6a99d4182883`，均已通过生产构建和包内源码、版本与原生库校验。源码 SHA-256 为 `6a99d4182883efaef6616c18a723ac368dcff456a4713dd214e93ae40be1b25e`。`lib/SHA256SUMS.txt` 按目标列出各标准 JAR 和合包的校验值。
 
 `lib/vss-0.3.6.zip` 按 Minecraft 版本分目录收纳构建，附带构建清单和源码摘要。该合包只包含本仓库的 Fabric 版本。
 
