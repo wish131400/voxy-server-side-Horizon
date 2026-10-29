@@ -473,7 +473,8 @@ def verify(jar, platform, build_id, source, minecraft=None):
         check_class("compat/VoxySurfaceHeights", "// VSS liquid surface remainder", "vssLiquidDrop")
         check_class("compat/VoxySurfaceHeights", "normalizeLegacyFluidInset", "LEGACY_FLUID_INSET")
         check_class("mixin/voxy/StrictVoxyIngestPlugin", "submittedSnapshot", "submit")
-        check_class("mixin/voxy/VoxyRenderDistanceMixin", "vss$projectionFarPlane", "vss$projectionRangeFarPlane")
+        check_class("mixin/voxy/VoxyRenderDistanceMixin", "vss$projectionFarPlane",
+                    "vss$viewportFarPlane" if minecraft == "26.3" else "vss$projectionRangeFarPlane")
         check_class("compat/VoxyIngestTracker", "ENGINE_COLUMNS", "completion")
         check_class("compat/VoxyCompat", "confirmNativeColumn")
         check_class("client/prediction/PredictionVoxySource", "VoxyFluidSurface")
