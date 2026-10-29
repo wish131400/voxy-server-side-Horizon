@@ -9,10 +9,10 @@ def smokeSources = sourceSets.create('clientSmoke') {
     runtimeClasspath += sourceSets.main.runtimeClasspath
 }
 
-def needsRuntimeRemap = minecraft_version == '1.21.11'
+def needsRuntimeRemap = minecraft_version.startsWith('1.')
 def smokeRuntimeConfiguration = smokeSources.runtimeOnlyConfigurationName
 if (needsRuntimeRemap) {
-    // Published 1.21.11 Fabric mods contain intermediary Minecraft references;
+    // Published 1.x Fabric mods contain intermediary Minecraft references;
     // a raw runtimeOnly file would fail against this named development runtime.
     smokeRuntimeConfiguration = 'modClientSmokeRuntimeOnly'
     loom.addRemapConfiguration(smokeRuntimeConfiguration) {
@@ -32,6 +32,62 @@ externalMods.each { propertyName, modId ->
                 files(providers.gradleProperty(propertyName).map { file(it) }))
     }
 }
+
+// Loom's development classpath does not load a mod's jar-in-jar libraries.
+// Follow each supplied release's own metadata, including transitive nesting,
+// so the probe uses the same dependency contents as a normal Fabric launch.
+def nestedSmokeLibraries = providers.provider {
+    def libraries = new LinkedHashSet<File>()
+    def visited = new HashSet<String>()
+    def cache = layout.buildDirectory.dir('client-smoke-libraries').get().asFile
+    def collectLibraries
+    collectLibraries = { File input, String expectedId ->
+        new java.util.zip.ZipFile(input).withCloseable { archive ->
+            def metadataEntry = archive.getEntry('fabric.mod.json')
+            if (metadataEntry == null) {
+                if (expectedId != null) throw new GradleException('Not a Fabric mod JAR: ' + input)
+                return
+            }
+            def metadata = archive.getInputStream(metadataEntry).withCloseable { stream ->
+                new groovy.json.JsonSlurper().parse(stream)
+            }
+            if (expectedId != null && metadata.id != expectedId) {
+                throw new GradleException('Expected mod ' + expectedId + ', found ' + metadata.id + ': ' + input)
+            }
+            (metadata.jars ?: []).each { nested ->
+                def entry = archive.getEntry(nested.file as String)
+                if (entry == null || entry.directory || !entry.name.endsWith('.jar')) {
+                    throw new GradleException('Invalid nested JAR ' + nested.file + ': ' + input)
+                }
+                def bytes = archive.getInputStream(entry).withCloseable { it.readAllBytes() }
+                def crc = new java.util.zip.CRC32()
+                crc.update(bytes)
+                if (bytes.length != entry.size || crc.value != entry.crc) {
+                    throw new GradleException('Corrupt nested JAR ' + entry.name + ': ' + input)
+                }
+                def digest = java.security.MessageDigest.getInstance('SHA-256')
+                def hash = java.util.HexFormat.of().formatHex(digest.digest(bytes))
+                if (!visited.add(hash)) return
+                // Content-derived paths avoid release-name collisions and never
+                // turn an archive entry name into a filesystem destination.
+                def extracted = new File(cache, hash + '.jar')
+                cache.mkdirs()
+                if (!extracted.isFile() || !java.util.Arrays.equals(extracted.bytes, bytes)) {
+                    extracted.bytes = bytes
+                }
+                collectLibraries(extracted, null)
+                libraries.add(extracted)
+            }
+        }
+    }
+    externalMods.each { propertyName, modId ->
+        if (providers.gradleProperty(propertyName).isPresent()) {
+            collectLibraries(file(providers.gradleProperty(propertyName).get()), modId)
+        }
+    }
+    libraries
+}
+dependencies.add(smokeRuntimeConfiguration, files(nestedSmokeLibraries))
 
 def smokeReport = providers.gradleProperty('vssSmokeReport')
         .map { file(it) }.orElse(layout.buildDirectory.file('client-smoke.json').map { it.asFile })
@@ -67,21 +123,7 @@ tasks.named('runClientSmoke').configure {
                 throw new GradleException('Client smoke requires -P' + propertyName + '=<matching release JAR>')
             }
         }
-        externalMods.each { propertyName, expectedId ->
-            if (!providers.gradleProperty(propertyName).isPresent()) return
-            def input = file(providers.gradleProperty(propertyName).get())
-            if (!input.isFile()) throw new GradleException('Missing client smoke JAR: ' + input)
-            new java.util.zip.ZipFile(input).withCloseable { archive ->
-                def metadataEntry = archive.getEntry('fabric.mod.json')
-                if (metadataEntry == null) throw new GradleException('Not a Fabric mod JAR: ' + input)
-                def metadata = archive.getInputStream(metadataEntry).withCloseable { stream ->
-                    new groovy.json.JsonSlurper().parse(stream)
-                }
-                if (metadata.id != expectedId) {
-                    throw new GradleException(propertyName + ' must contain mod ' + expectedId + ', found ' + metadata.id)
-                }
-            }
-        }
+        // Release identity and nested entries are validated during resolution.
         delete smokeReport.get()
     }
     doLast {
