@@ -19,6 +19,28 @@ pub(super) fn state(value: &Value, palette: &mut Palette) -> Result<StateId> {
     }
 }
 
+/// Registry holder sets encode one direct holder as a string in 26.3.
+/// Named tags require their actual resolved members; never treat a tag as an ID.
+pub(super) fn biome_names(value: &Value, doc: &Value) -> Result<Vec<String>> {
+    fn name(value: &Value) -> Result<String> {
+        let name = value.as_str().ok_or("invalid biome holder")?;
+        if name.starts_with('#') { return Err("tag inside direct biome holder set".into()); }
+        Ok(if name.contains(':') { name.into() } else { format!("minecraft:{name}") })
+    }
+    match value {
+        Value::String(tag) if tag.starts_with('#') => {
+            let tag = &tag[1..];
+            let tag = if tag.contains(':') { tag.to_owned() } else { format!("minecraft:{tag}") };
+            doc["biome_tags"].get(&tag).and_then(Value::as_array)
+                .ok_or_else(|| format!("missing biome tag members {tag}"))?
+                .iter().map(name).collect()
+        }
+        Value::String(_) => Ok(vec![name(value)?]),
+        Value::Array(values) => values.iter().map(name).collect(),
+        _ => Err("invalid biome holder set".into()),
+    }
+}
+
 pub(super) struct OreRule {
     density: Id,
     richness: Id,
@@ -66,6 +88,16 @@ impl OreRule {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn modern_biome_holder_sets_accept_real_singleton_codec_and_resolved_tags() {
+        let doc = json!({"biome_tags":{"minecraft:is_forest":["minecraft:forest","minecraft:birch_forest"]}});
+        assert_eq!(biome_names(&json!("minecraft:wooded_badlands"), &doc).unwrap(), vec!["minecraft:wooded_badlands"]);
+        assert_eq!(biome_names(&json!(["minecraft:forest","birch_forest"]), &doc).unwrap(), vec!["minecraft:forest","minecraft:birch_forest"]);
+        assert_eq!(biome_names(&json!("#is_forest"), &doc).unwrap(), vec!["minecraft:forest","minecraft:birch_forest"]);
+        assert!(biome_names(&json!("#missing"), &doc).is_err());
+        assert!(biome_names(&json!(["#is_forest"]), &doc).is_err());
+    }
 
     fn document() -> Value {
         serde_json::from_str(include_str!("../../tests/fixtures/worldgen/overworld.json")).unwrap()

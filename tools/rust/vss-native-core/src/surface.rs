@@ -773,10 +773,7 @@ fn parse_condition(
         _ => {}
     }
     Ok(match minecraft_type(v)? {
-        "biome" => Condition::Biome(
-            serde_json::from_value(v["biome_is"].clone())
-                .map_err(|e| format!("biome condition: {e}"))?,
-        ),
+        "biome" => Condition::Biome(material::biome_names(&v["biome_is"], doc)?),
         "noise_threshold" => Condition::Noise(
             g.registered_noise(string(v, "noise")?, doc)?,
             number(v, "min_threshold")?,
