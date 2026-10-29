@@ -30,6 +30,9 @@ final class PredictionVegetation {
     static final int STRUCTURE_RUNTIME_SETTINGS_VERSION = 1 << 12;
     // Reject End surfaces/finished voxels generated with an unseeded biome sampler.
     static final int END_CLIMATE_SETTINGS_VERSION = 1 << 13;
+    // Empty decoration/finished voxel records from missing static registries
+    // must not survive restoration after the registry context is repaired.
+    static final int REGISTRY_CONTEXT_SETTINGS_VERSION = 1 << 14;
     private static final int PREDICATE_SETTINGS = FabricLoader.getInstance().isModLoaded("byepregen")
             ? PREDICATE_SETTINGS_VERSION : 0;
     private static final int MAX_CHUNKS = 512;
@@ -72,7 +75,9 @@ final class PredictionVegetation {
 
     static int predicateSettings() { return PREDICATE_SETTINGS; }
 
-    static int runtimeSettings() { return STRUCTURE_RUNTIME_SETTINGS_VERSION | PREDICATE_SETTINGS; }
+    static int runtimeSettings() {
+        return STRUCTURE_RUNTIME_SETTINGS_VERSION | REGISTRY_CONTEXT_SETTINGS_VERSION | PREDICATE_SETTINGS;
+    }
 
     static int runtimeSettings(net.minecraft.resources.Identifier dimension) {
         return runtimeSettings() | (dimension.equals(net.minecraft.world.level.Level.END.identifier())

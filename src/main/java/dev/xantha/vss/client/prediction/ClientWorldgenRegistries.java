@@ -69,7 +69,13 @@ final class ClientWorldgenRegistries {
     private JsonObject snapshotRoot = new JsonObject();
 
     private ClientWorldgenRegistries(RegistryAccess fallback) {
-        this.fallback = fallback;
+        // Network registry access contains dynamic registries only. Feature,
+        // carver, biome and structure codecs also need static block/sound/etc.
+        // holders while decoding, before access() publishes the final snapshot.
+        Map<ResourceKey<? extends Registry<?>>, Registry<?>> merged = new java.util.LinkedHashMap<>();
+        net.minecraft.core.registries.BuiltInRegistries.REGISTRY.forEach(registry -> merged.put(registry.key(), registry));
+        fallback.registries().forEach(entry -> merged.put(entry.key(), entry.value()));
+        this.fallback = new RegistryAccess.ImmutableRegistryAccess(List.copyOf(merged.values()));
         registerInfo(noises);
         registerInfo(densityFunctions);
         registerInfo(configuredCarvers);
@@ -198,7 +204,6 @@ final class ClientWorldgenRegistries {
     /** Use the same holder instances for decoding, biome predicates and feature placement. */
     RegistryAccess access() {
         Map<ResourceKey<? extends Registry<?>>, Registry<?>> merged = new java.util.LinkedHashMap<>();
-        net.minecraft.core.registries.BuiltInRegistries.REGISTRY.forEach(registry -> merged.put(registry.key(), registry));
         fallback.registries().forEach(entry -> merged.put(entry.key(), entry.value()));
         merged.putAll(extraRegistries);
         for (Registry<?> registry : List.of(noises, densityFunctions, configuredCarvers, configuredFeatures,
@@ -278,8 +283,7 @@ final class ClientWorldgenRegistries {
                 // RegistryOps fall back to the client's own registry.
                 disabledCustom.add(registry.key());
                 snapshotRegistries.remove(registry.key());
-                if (dev.xantha.vss.config.VSSClientConfig.CONFIG.debugLogging)
-                    dev.xantha.vss.common.VSSLogger.warn("VSS optional worldgen registry disabled: " + registry.key() + ": " + exception);
+                dev.xantha.vss.common.VSSLogger.warn("VSS optional worldgen registry disabled: " + registry.key(), exception);
             }
         }
     }
@@ -298,8 +302,7 @@ final class ClientWorldgenRegistries {
                 // unbound even when this registry's own values decoded successfully.
                 disabledCustom.add(registry.key());
                 snapshotRegistries.remove(registry.key());
-                if (dev.xantha.vss.config.VSSClientConfig.CONFIG.debugLogging)
-                    dev.xantha.vss.common.VSSLogger.warn("VSS optional worldgen registry has unresolved references: " + registry.key() + ": " + exception);
+                dev.xantha.vss.common.VSSLogger.warn("VSS optional worldgen registry has unresolved references: " + registry.key(), exception);
             }
         }
     }

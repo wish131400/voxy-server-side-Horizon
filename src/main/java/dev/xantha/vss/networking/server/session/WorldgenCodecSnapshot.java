@@ -458,6 +458,14 @@ final class WorldgenCodecSnapshot {
         if (value instanceof Structure structure) {
             encoded.getAsJsonObject().add("biomes", structureBiomeIds(structure.biomes().stream()));
         }
+        if (value instanceof StructureSet set && set.placement() instanceof
+                net.minecraft.world.level.levelgen.structure.placement.ConcentricRingsStructurePlacement rings) {
+            // The client snapshot owns new biome holders but not the server's
+            // dynamic biome tags. An unresolved preferred-biomes tag would
+            // discard the whole biome registry when it freezes.
+            encoded.getAsJsonObject().getAsJsonObject("placement")
+                    .add("preferred_biomes", structureBiomeIds(rings.preferredBiomes().stream()));
+        }
         return encoded;
     }
 
