@@ -17,6 +17,58 @@ permissions:
   contents: read
 
 jobs:
+  community-voxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - mihile-1.20.1
+          - m3-1.20.1
+          - m3-1.21.1
+          - tkettela-1.20.1
+          - wu-bao-1.21.1
+          - water-fix-1.21.1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        if: endsWith(matrix.variant, '-1.20.1')
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Expose both legacy Java runtimes
+        if: endsWith(matrix.variant, '-1.20.1')
+        run: |
+          mkdir -p "${GRADLE_USER_HOME:-$HOME/.gradle}"
+          printf '%s\n' 'org.gradle.java.installations.fromEnv=JAVA_HOME_17_X64,JAVA_HOME' >> "${GRADLE_USER_HOME:-$HOME/.gradle}/gradle.properties"
+      - name: Verify evidence runner regressions
+        run: python -m unittest discover -s tools/verification -p test_community_matrix.py
+      - name: Prepare pinned community binaries and source builds
+        run: >-
+          python tools/verification/fetch_community_voxy.py
+          --variant '${{ matrix.variant }}'
+          --gradle-user-home external/community-build-cache
+      - name: Apply production hooks to the actual community dependency
+        run: >-
+          python tools/verification/community_matrix.py
+          --variant '${{ matrix.variant }}' --stage contracts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: community-${{ matrix.variant }}
+          path: |
+            external/community-compat/*/validation/
+            external/community-compat/*/provenance.json
+
   fabric:
     runs-on: ubuntu-latest
     timeout-minutes: 30

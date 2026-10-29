@@ -73,6 +73,10 @@ public final class VoxyPredictionPlugin implements IMixinConfigPlugin {
             try {
                 ClassNode render = MixinService.getService().getBytecodeProvider().getClassNode(target);
                 if (method(render, "currentFarPlane", "()F") || method(render, "getLodFarPlane", "()F")) return true;
+                if (calls(render, "setupViewport", ROOT + "client/core/VoxyRenderSystem", "computeProjectionMat",
+                        "(Lorg/joml/Matrix4fc;F)Lorg/joml/Matrix4f;")
+                        || calls(render, "setupViewport", ROOT + "client/core/VoxyRenderSystem", "computeProjectionMat",
+                        "(L" + ROOT + "client/core/RenderProperties;Lorg/joml/Matrix4fc;FF)Lorg/joml/Matrix4f;")) return true;
                 return render.methods.stream().filter(m -> m.name.equals("computeProjectionMat"))
                         .flatMap(m -> java.util.stream.StreamSupport.stream(m.instructions.spliterator(), false))
                         .anyMatch(i -> i instanceof LdcInsnNode ldc && Float.valueOf(48000F).equals(ldc.cst));
@@ -143,6 +147,7 @@ public final class VoxyPredictionPlugin implements IMixinConfigPlugin {
                 && VERIFIED_FACE_READERS.contains(faceLayoutFingerprint(node));
     }
     private static final Set<String> VERIFIED_FACE_READERS=Set.of(
+            "fe7429c37c56af6f4e58f14f657d7bb644b43add58cd21f23e5554e39959d93d",
             "3b02a023d767e48f34a9d3fef4df5493bd6818be986676f758cb6e49e75ee1dc",
             "3657673b4c1f290b56d712a4f0056986935f6eebb336afc15d2f5cec7bcd33e2",
             "9d57c81f5eff892ce8b76caf4bc5bf9e0492a8d194fba0f3ab8c4575d334aa1c",

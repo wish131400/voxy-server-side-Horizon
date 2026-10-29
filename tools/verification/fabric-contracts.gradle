@@ -12,7 +12,9 @@ tasks.register('fabricContractTest', Test) {
      'VoxyIngestBytecodeTest', 'VoxyIngestContractTest',
      'VoxyRenderPipelineMixinApplicationTest', 'VoxyNeighborVariantMixinTest',
      'VoxyFluidBakeCompatibilityTest', 'PredictionNormalDepthBridgeTest',
-     'PredictionAtlasTest'].each { include "**/${it}.class" }
+     'PredictionAtlasTest', 'VoxyDelegatedIngestTest',
+     'VoxyServerLodMixinApplicationTest', 'VoxyServerLodServerCompatTest',
+     'VoxyServerLodClientCompatTest', 'VoxyNativeIngestAuthorityTest'].each { include "**/${it}.class" }
     maxHeapSize = '2G'
     maxParallelForks = 1
     forkEvery = 1
@@ -58,7 +60,8 @@ tasks.register('fabricGpuContractTest', Test) {
     classpath = sourceSets.test.runtimeClasspath
     useJUnitPlatform()
     ['StrictVoxyShaderFixtureGpuTest', 'PredictionNormalDepthBridgeGpuTest',
-     'VoxyTraversalCapacityMixinTest', 'VoxyTraversalQueueGpuTest'].each { include "**/${it}.class" }
+     'VoxyTraversalCapacityMixinTest', 'VoxyTraversalQueueGpuTest',
+     'VoxySurfaceHeightsTest'].each { include "**/${it}.class" }
     systemProperty 'vss.gpuTests', 'true'
     jvmArgs '--enable-native-access=ALL-UNNAMED'
     maxHeapSize = '2G'

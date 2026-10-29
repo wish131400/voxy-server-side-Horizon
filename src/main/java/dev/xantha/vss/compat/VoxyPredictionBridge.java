@@ -769,6 +769,16 @@ public final class VoxyPredictionBridge {
                     chunkX * 16 + 32, chunkZ * 16 + 32);
         }
     }
+
+    /** Native community transports must never settle a same-coordinate column in another engine. */
+    public static void realColumnSettled(Object engine, int chunkX, int chunkZ) {
+        VoxyCompat.settlePredictionColumn(engine, chunkX, chunkZ);
+        for (Context ctx : contexts()) if (ctx.engine == engine && ctx.source != null && !ctx.closed && ctx.supported
+                && VoxyCompat.confirmedPredictionColumn(engine, chunkX, chunkZ)) {
+            changed(ctx.source, chunkX * 16 - 16, chunkZ * 16 - 16,
+                    chunkX * 16 + 32, chunkZ * 16 + 32);
+        }
+    }
     public static void detach(Source source) {
         // This path restores native data in a world that remains visible. World unload
         // retires the context first, so it never queues a rebuild of a disappearing scene.

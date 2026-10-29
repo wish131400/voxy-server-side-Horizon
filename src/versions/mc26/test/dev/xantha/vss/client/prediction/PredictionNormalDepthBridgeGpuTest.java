@@ -127,7 +127,7 @@ class PredictionNormalDepthBridgeGpuTest {
         return new String(jar.getInputStream(entry).readAllBytes(), StandardCharsets.UTF_8).replace("\r\n", "\n");
     }
     private static String expand(ZipFile jar, String source) throws Exception {
-        var matcher = Pattern.compile("#import <([^>]+)>").matcher(source);
+        var matcher = Pattern.compile("(?m)^#import <([^>]+)>[ \t]*$").matcher(source);
         var result = new StringBuilder();
         int previous = 0;
         while (matcher.find()) {

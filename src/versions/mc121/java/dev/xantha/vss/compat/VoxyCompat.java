@@ -66,12 +66,35 @@ final class VoxyCompat {
 
     /** Record completion even before a render context exists; later ingests do not revoke it. */
     static void settlePredictionColumn(int x, int z) {
-        if (VoxyIngestTracker.pendingColumn(x, z)) return;
         synchronized (localIndexes) {
-            for (LocalSectionIndex index : localIndexes.values())
-                if (!index.cancelled && index.hasConfirmed(x, z) && !index.hasSettled(x, z))
+            for (var entry : localIndexes.entrySet()) {
+                LocalSectionIndex index = entry.getValue();
+                if (!VoxyIngestTracker.pendingColumn(entry.getKey(), x, z)
+                        && !index.cancelled && index.hasConfirmed(x, z) && !index.hasSettled(x, z))
                     index.markSettled(x, z);
+            }
         }
+    }
+
+    /** A native server reply belongs to one actual engine, including before its renderer exists. */
+    static void settlePredictionColumn(Object engine, int x, int z) {
+        if (VoxyIngestTracker.pendingColumn(engine, x, z)) return;
+        LocalSectionIndex index = localIndexes.get(engine);
+        if (index != null && !index.cancelled && index.hasConfirmed(x, z)) index.markSettled(x, z);
+    }
+
+    static Object engineForLevel(Level level) {
+        if (level == null || worldEngineNullable == null) return null;
+        try { return worldEngineNullable.invoke(level); }
+        catch (Throwable failure) { return null; }
+    }
+
+    /** Caller has completed every native task and captured the full authoritative column. */
+    static boolean confirmNativeColumn(Level level, Object engine, int chunkX, int chunkZ) {
+        if (engine == null || engineForLevel(level) != engine) return false;
+        localIndex(engine).markConfirmed(chunkX, chunkZ);
+        VoxyPredictionBridge.realColumnSettled(engine, chunkX, chunkZ);
+        return true;
     }
 
     static boolean init() {

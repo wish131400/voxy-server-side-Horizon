@@ -1,0 +1,77 @@
+// Independent, remapped world probe. Invoke exportCommunityWorldSmokeArtifacts;
+// never include this source set in a VSS publication or title-screen smoke.
+gradle.projectsEvaluated {
+    def project = gradle.rootProject
+    def targetVersion = project.minecraft_version
+    if (!(targetVersion in ['1.20.1', '1.21.1'])) {
+        throw new GradleException('Community world smoke supports Minecraft 1.20.1 / 1.21.1 only')
+    }
+    def sourceRoot = project.file('tools/verification/community-world-smoke')
+    def generated = project.layout.buildDirectory.dir('generated/community-world-smoke')
+    def prepare = project.tasks.register('prepareCommunityWorldSmoke') {
+        inputs.dir sourceRoot
+        inputs.file project.file('tools/verification/community_world_smoke.gradle')
+        inputs.property('minecraft', targetVersion)
+        outputs.dir generated
+        doLast {
+            def source = new File(sourceRoot, 'java/dev/xantha/vss/smoke/VSSCommunityWorldSmoke.java')
+                    .getText('UTF-8').replace('\r\n', '\n')
+            def connectMarker = '// VSS_WORLD_SMOKE_CONNECT\n        throw new UnsupportedOperationException("Compile using community_world_smoke.gradle");'
+            def disconnectMarker = '// VSS_WORLD_SMOKE_DISCONNECT\n        throw new UnsupportedOperationException("Compile using community_world_smoke.gradle");'
+            if (source.count(connectMarker) != 1 || source.count(disconnectMarker) != 1)
+                throw new GradleException('World probe source insertion contract changed')
+            // Direct Minecraft references are remapped by Loom; reflection names would remain named.
+            def serverData = targetVersion == '1.20.1'
+                    ? 'new net.minecraft.client.multiplayer.ServerData("VSS isolated world smoke", address, false)'
+                    : 'new net.minecraft.client.multiplayer.ServerData("VSS isolated world smoke", address, net.minecraft.client.multiplayer.ServerData.Type.OTHER)'
+            def connection = 'net.minecraft.client.gui.screens.ConnectScreen.startConnecting(new TitleScreen(), client, ' +
+                    'net.minecraft.client.multiplayer.resolver.ServerAddress.parseString(address), ' + serverData + ', false' +
+                    (targetVersion == '1.20.1' ? ');' : ', null);')
+            def disconnection = 'if (client.level != null) client.level.disconnect();\n        ' +
+                    (targetVersion == '1.20.1' ? 'client.clearLevel(new TitleScreen());' : 'client.disconnect(new TitleScreen());')
+            source = source.replace(connectMarker, connection).replace(disconnectMarker, disconnection)
+            if (targetVersion == '1.21.1')
+                source = source.replace('net.minecraft.world.level.chunk.ChunkStatus',
+                        'net.minecraft.world.level.chunk.status.ChunkStatus')
+            def output = generated.get().file('dev/xantha/vss/smoke/VSSCommunityWorldSmoke.java').asFile
+            output.parentFile.mkdirs(); output.setText(source, 'UTF-8')
+        }
+    }
+    def probe = project.sourceSets.create('communityWorldSmoke') {
+        java.srcDir generated
+        resources.srcDir new File(sourceRoot, 'resources')
+        compileClasspath += project.sourceSets.main.compileClasspath + project.sourceSets.main.output
+    }
+    project.tasks.named(probe.compileJavaTaskName).configure { dependsOn prepare }
+    def raw = project.tasks.register('communityWorldSmokeJar', Jar) {
+        from probe.output
+        archiveBaseName = 'vss-world-smoke'
+        archiveVersion = targetVersion
+        archiveClassifier = 'dev'
+        destinationDirectory = project.layout.buildDirectory.dir('community-world-smoke')
+    }
+    def remapType = project.tasks.named('remapJar').get().getClass().getSuperclass()
+    def remapped = project.tasks.register('remapCommunityWorldSmokeJar', remapType) {
+        dependsOn raw
+        inputFile.set(raw.flatMap { it.archiveFile })
+        classpath.from(probe.compileClasspath)
+        sourceNamespace.set('named'); targetNamespace.set('intermediary')
+        addNestedDependencies.set(false)
+        archiveBaseName = 'vss-world-smoke'; archiveVersion = targetVersion; archiveClassifier = ''
+        destinationDirectory = project.layout.buildDirectory.dir('community-world-smoke')
+    }
+    project.tasks.register('exportCommunityWorldSmokeArtifacts') {
+        dependsOn project.tasks.named('remapJar'), remapped
+        doLast {
+            def report = project.layout.buildDirectory.file('community-world-smoke/artifacts.json').get().asFile
+            report.parentFile.mkdirs()
+            report.setText(groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson([
+                minecraft: targetVersion,
+                vssJar: project.tasks.named('remapJar').get().archiveFile.get().asFile.absolutePath,
+                probeJar: remapped.get().archiveFile.get().asFile.absolutePath,
+                validation: 'isolated_real_server_client_network_native_ingest_prediction_lifecycle'
+            ])) + '\n', 'UTF-8')
+            project.logger.lifecycle('Community world smoke artifacts: ' + report)
+        }
+    }
+}

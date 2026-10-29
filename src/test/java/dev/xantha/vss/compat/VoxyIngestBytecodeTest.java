@@ -206,7 +206,7 @@ public class VoxyIngestBytecodeTest {
         for (MethodNode m : node.methods) {
             String name = m.name.equals("vss$processTrackedIngestBody") ? "processJob" : m.name;
             if (m.name.equals("processJob") && node.methods.stream().anyMatch(x -> x.name.equals("vss$processTrackedIngestBody"))) continue;
-            if (!Set.of("processJob", "enqueueJob", "rawIngest0", "enqueueIngest").contains(name)) continue;
+            if (!Set.of("processJob", "enqueueJob", "rawIngest0", "enqueueIngest", "submit").contains(name)) continue;
             List<String> calls = new ArrayList<>();
             for (var insn : m.instructions) {
                 if (insn instanceof MethodInsnNode call && !call.owner.equals(TRACKER))
@@ -229,7 +229,7 @@ public class VoxyIngestBytecodeTest {
 
     private static void verifyTransformedMethods(ClassNode node) throws Exception {
         for (MethodNode method : node.methods) {
-            if (!Set.of("processJob", "vss$processTrackedIngestBody", "enqueueJob", "rawIngest0", "enqueueIngest")
+            if (!Set.of("processJob", "vss$processTrackedIngestBody", "enqueueJob", "rawIngest0", "enqueueIngest", "submit")
                     .contains(method.name)) continue;
             try {
                 new Analyzer<>(new BasicVerifier()).analyze(node.name, method);

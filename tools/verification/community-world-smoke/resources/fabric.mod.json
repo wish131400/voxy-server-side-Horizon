@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "vss_world_smoke",
+  "version": "1.0.0",
+  "name": "VSS Isolated World Verification",
+  "description": "Development-only network, native ingest, prediction and reconnect verification.",
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": { "client": ["dev.xantha.vss.smoke.VSSCommunityWorldSmoke"] },
+  "depends": { "fabricloader": ">=0.18.4", "fabric-api": "*", "vss": "*", "minecraft": "*", "java": ">=21" }
+}

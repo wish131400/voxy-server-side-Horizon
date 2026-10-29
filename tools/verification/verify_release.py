@@ -471,6 +471,11 @@ def verify(jar, platform, build_id, source, minecraft=None):
                         for (declared, _), entries in fluid_references.items() if declared == method),
                     "Missing liquid type check: VoxyFluidSurface." + method + " -> " + liquid)
         check_class("compat/VoxySurfaceHeights", "// VSS liquid surface remainder", "vssLiquidDrop")
+        check_class("compat/VoxySurfaceHeights", "normalizeLegacyFluidInset", "LEGACY_FLUID_INSET")
+        check_class("mixin/voxy/StrictVoxyIngestPlugin", "submittedSnapshot", "submit")
+        check_class("mixin/voxy/VoxyRenderDistanceMixin", "vss$projectionFarPlane", "vss$projectionRangeFarPlane")
+        check_class("compat/VoxyIngestTracker", "ENGINE_COLUMNS", "completion")
+        check_class("compat/VoxyCompat", "confirmNativeColumn")
         check_class("client/prediction/PredictionVoxySource", "VoxyFluidSurface")
         check_class("mixin/voxy/StrictVoxyVisibilityMixin", "observeUnifiedView")
         check_class("client/prediction/PredictionRenderer", "observeUnifiedView", "width", "height")
@@ -499,6 +504,12 @@ def verify(jar, platform, build_id, source, minecraft=None):
         for mixin in ("NormalRenderPipelineDepthMaskMixin", "PredictionFogShaderMixin"):
             require("dev/xantha/vss/mixin/voxy/" + mixin + ".class" in enabled,
                     "Normal depth bridge mixin is not configured: " + mixin)
+        if minecraft == "1.20.1":
+            for mixin in ("VoxyServerLodClientMixin", "VoxyServerLodServerMixin", "VoxyServerLodPlayerStateMixin"):
+                require("dev/xantha/vss/mixin/voxy/" + mixin + ".class" in enabled,
+                        "Native server LOD arbitration is not configured: " + mixin)
+            check_class("compat/VoxyServerLodClientCompat", "beginNativeColumn", "ingestNativeSection")
+            check_class("compat/VoxyServerLodServerCompat", "reconcile", "releaseOutgoing")
         require(not any(n.endswith("Test.class") or n.startswith("xaero/") for n in names),
                 "Test or foreign fixture classes packaged")
         require(not any(n.startswith("dev/xantha/vss/smoke/") for n in names),
@@ -530,7 +541,9 @@ def verify(jar, platform, build_id, source, minecraft=None):
     return {"jar": jar.name, "platform": platform, "buildId": build_id,
             "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
             "bytes": jar.stat().st_size, "nativeSha256": natives,
-            "integratedFixes": ["static-worldgen-codec-context", "inline-stronghold-biome-preference", "registry-context-surface-cache", "versioned-resource-atlas-token", "horizon-planned-root-capacity", "resident-node-traversal-capacity", "non-spinning-gpu-queue-bounds", "two-phase-dirty-capture-handoff", "bounded-capture-retry", "dirty-retention-buffer-fetch", "retired-refresh-barrier", "seeded-fabric-end-biomes", "failed-biome-surface-rejection", "end-decoration-cache-repair", "compact-column-pages", "contributing-feature-query", "native-owner-publication",
+            "integratedFixes": ["community-explicit-far-plane", "community-delegated-ingest-completion", "engine-scoped-real-column-settlement", "community-native-inset-preservation", "legacy-fluid-inset-normalization",
+                                *(["native-server-stream-ownership", "native-column-success-receipts", "native-column-timestamp-order"] if minecraft == "1.20.1" else []),
+                                "static-worldgen-codec-context", "inline-stronghold-biome-preference", "registry-context-surface-cache", "versioned-resource-atlas-token", "horizon-planned-root-capacity", "resident-node-traversal-capacity", "non-spinning-gpu-queue-bounds", "two-phase-dirty-capture-handoff", "bounded-capture-retry", "dirty-retention-buffer-fetch", "retired-refresh-barrier", "seeded-fabric-end-biomes", "failed-biome-surface-rejection", "end-decoration-cache-repair", "compact-column-pages", "contributing-feature-query", "native-owner-publication",
                                 "layout-plan-domain-reset", "partial-vegetation-retention", "terrain-only-parent-proof",
                                 "retained-deferred-detail-demand", "view-priority-readmission", "completion-driven-detail-refill", "dimension-write-bounds", "reverse-coarse-column-coverage", "second-chance-column-cache", "incremental-candidate-union", "exact-display-biome-reuse", "prediction-display-withdrawal", "warm-toggle-reactivation", "concurrent-real-generation", "atomic-generation-admission", "auxiliary-viewport-observer-guard", "native-detail-demand", "authoritative-viewport", "spatial-bootstrap-only", "liquid-surface-remainders", "native-liquid-transition-walls", "native-lod-topology", "world-space-model-inset", "nether-lighting",
                                 "end-floating-columns", "empty-node-sample-readmission",

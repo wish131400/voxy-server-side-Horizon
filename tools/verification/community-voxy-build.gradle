@@ -1,0 +1,7 @@
+// External, checksum-pinned Voxy builds only. Never applied to VSS.
+allprojects {
+    tasks.withType(AbstractArchiveTask).configureEach {
+        preserveFileTimestamps = false
+        reproducibleFileOrder = true
+    }
+}

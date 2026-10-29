@@ -23,6 +23,21 @@ Fabric Loader 最低版本为 0.20.1。26.1 行中的 Sodium / Iris 文件自身
 
 1.20.1 使用 [DA-57EVE 的 Fabric 社区发布](https://github.com/DA-57EVE/voxy-1.20.1-Fabric/releases/tag/mod)。该 Voxy 文件自身使用 Java 21；VSS 的 1.20.1 服务端仍以 Java 17 编译和启动。1.21.1 使用 [m3t4f1v3/voxy 的 mc_1211 分支固定提交](https://github.com/m3t4f1v3/voxy/tree/f308c254fafc23bdcc250ba3f1e5c6a7585f08d0)进行本地构建和接口验证，该依赖不是上游正式发布包。本仓库及合包均不包含这两个 Voxy 文件，需遵守上游的分发要求。
 
+另外为以下社区分支增加独立兼容路径。同一行的 Voxy、Sodium 和 Iris 必须配套；尤其是 1.21.1 的 Sodium 0.8 回移植不能搭配只接受 Sodium 0.6 的官方 Iris 1.8.8。下面的回移植 Iris 由 wu-bao 仓库的固定依赖提供，不能仅按版本号寻找同名文件。每个客户端只安装一个 Voxy。
+
+| Minecraft | 社区 Voxy 与固定版本 | Sodium | Iris |
+| --- | --- | --- | --- |
+| 1.20.1 | [mihile](https://github.com/mihile/voxy/releases/tag/v0.2.20-1.20.1-port.9) 0.2.20 port.9，`82188bda` 发布包 | 0.5.13 | 1.7.6 |
+| 1.20.1 | [m3t4f1v3 multiversion](https://github.com/m3t4f1v3/voxy/tree/42d5037c19e6a540c4b69fd4156be0487f961663)，固定源码构建 | 0.5.13 | 1.7.6 |
+| 1.21.1 | 同上 m3t4f1v3 multiversion 固定提交 | 0.8.12-alpha.3+mc1.21.1 | 1.8.14-beta.1+mc1.21.1 回移植 |
+| 1.20.1 | [tkettela server-lod](https://github.com/tkettela/unofficial-backport-voxy/tree/db2371278a7926d222b8346eddb359e967e47435)，固定源码构建 | 0.5.13 | 1.7.6 |
+| 1.21.1 | [wu-bao](https://github.com/wu-bao/voxy/releases/tag/v0.2.15-beta-1.21.1-fabric-backport) 0.2.15 发布包，包内提交 `aab0ab95` | 0.8.12+mc1.21.1 | 1.8.14-beta.1+mc1.21.1 回移植 |
+| 1.21.1 | [water-fix](https://github.com/mayjhon69669-sys/voxy-water-fix/releases/tag/v0.2.19-mc1.21.1-leaf-tint-fog-fade-test) 0.2.19 leaf-tint-fog-fade 测试发布包 | 0.8.12+mc1.21.1 | 1.8.14-beta.1+mc1.21.1 回移植 |
+
+源码构建保留上游 Java、着色器和依赖声明，只固定构建身份并选择对应 Fabric 目标；它们不等于上游正式发布。wu-bao 的发布包内提交与发布标签对应源码不同，water-fix 发布包没有有效提交标识，因此按实际文件摘要验收。固定依赖工具保留来源和完整校验值；兼容结论仅覆盖这些输入，不自动覆盖各分支后续提交。VSS 安装包不包含上述第三方模组。
+
+本轮适配显式 far 参数的投影接口、不同任务队列的完成回执与邻居平面读取，并避免 water-fix 的旧水面高度校正重复生效。tkettela 分支在 VSS 会话中由 VSS 负责真实列同步，停止该玩家的重复原生请求与发送；无 VSS 会话时保留原生传输。整列原生任务成功完成后再接管预测，包含真实空气；丢弃、失败和旧会话回包不能获得完整列确认。
+
 当前定位为候选移植版。编译、离线回归、真实依赖接口检查、GPU 合同和启动检查分别验收；标题画面初始化不代表实际游戏内地形和光影已经验收。实际游玩、长距离移动、传送、预测切换、重新进入世界及具体光影包的画面与帧时间仍需实机确认。
 
 新增的 1.20.1 和 1.21.1 已完成生产编译、网络与模块回归、世界生成迁移、真实 Voxy / Iris 接口及 GPU 检查。两版专用服务器均完成启动、真实列预生成、缓存保存与正常退出；客户端完成标题初始化，并实际调用生产预测代码验证材质图集读取。1.20.1 的专用服务器使用 Java 17，配套社区 Voxy 的客户端使用 Java 21。测试中需显式启用的分配微基准、未提供的历史 Voxy 或可选世界生成模组输入，均单独记录为跳过。

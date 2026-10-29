@@ -1,0 +1,77 @@
+// Init script: -I tools/verification/production-client-smoke.gradle
+// Produces an independent, remapped probe; no probe classes enter the VSS JAR.
+gradle.projectsEvaluated {
+    def project = gradle.rootProject
+    if (!(project.minecraft_version in ['1.20.1', '1.21.1'])) {
+        throw new GradleException('Production community smoke currently targets 1.20.1 / 1.21.1')
+    }
+    def generated = project.layout.buildDirectory.dir('generated/production-client-smoke')
+    def prepare = project.tasks.register('prepareProductionClientSmoke') {
+        inputs.dir project.file('tools/verification/client-smoke')
+        inputs.file project.file('tools/verification/production-client-smoke.gradle')
+        outputs.dir generated
+        doLast {
+            def original = project.file('tools/verification/client-smoke/java/dev/xantha/vss/smoke/VSSClientSmoke.java').text
+            def marker = '    /** Reflection is confined to this development probe for the 26.2 GUI ownership change. */'
+            if (original.count(marker) != 1) throw new GradleException('Client probe source contract changed')
+            // Reflection names do not remap into intermediary. The 1.x probe can
+            // use ordinary field/method references, which Loom remaps normally.
+            def text = original.substring(0, original.indexOf(marker)) + '''    private static final class GuiProbe {
+        GuiProbe() throws ReflectiveOperationException {}
+        Object screen(Minecraft client) { return client.screen; }
+        Object overlay(Minecraft client) { return client.getOverlay(); }
+    }
+}
+'''
+            def target = generated.get().file('dev/xantha/vss/smoke/VSSClientSmoke.java').asFile
+            target.parentFile.mkdirs()
+            target.setText(text, 'UTF-8')
+        }
+    }
+    def probe = project.sourceSets.create('productionClientSmoke') {
+        java.srcDir generated
+        resources.srcDir project.file('tools/verification/client-smoke/resources')
+        compileClasspath += project.sourceSets.main.compileClasspath + project.sourceSets.main.output
+    }
+    project.tasks.named(probe.compileJavaTaskName).configure { dependsOn prepare }
+    def raw = project.tasks.register('productionClientSmokeJar', Jar) {
+        from probe.output
+        archiveBaseName = 'vss-client-smoke'
+        archiveVersion = project.minecraft_version
+        archiveClassifier = 'dev'
+        destinationDirectory = project.layout.buildDirectory.dir('production-client-smoke')
+    }
+    def remapType = project.tasks.named('remapJar').get().getClass().getSuperclass()
+    def remapped = project.tasks.register('remapClientSmokeJar', remapType) {
+        dependsOn raw
+        inputFile.set(raw.flatMap { it.archiveFile })
+        classpath.from(probe.compileClasspath)
+        sourceNamespace.set('named')
+        targetNamespace.set('intermediary')
+        addNestedDependencies.set(false)
+        archiveBaseName = 'vss-client-smoke'
+        archiveVersion = project.minecraft_version
+        archiveClassifier = ''
+        destinationDirectory = project.layout.buildDirectory.dir('production-client-smoke')
+    }
+    project.tasks.register('exportProductionSmokeArtifacts') {
+        dependsOn project.tasks.named('remapJar'), remapped
+        doLast {
+            def report = project.layout.buildDirectory.file('production-client-smoke/artifacts.json').get().asFile
+            report.parentFile.mkdirs()
+            def source = project.tasks.named('remapJar').get().archiveFile.get().asFile
+            def snapshot = new File(report.parentFile, source.name)
+            java.nio.file.Files.copy(source.toPath(), snapshot.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            def digest = { File value -> java.util.HexFormat.of().formatHex(
+                java.security.MessageDigest.getInstance('SHA-256').digest(value.bytes)) }
+            report.setText(groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson([
+                minecraft: project.minecraft_version,
+                vssJar: snapshot.absolutePath,
+                vssSha256: digest(snapshot),
+                probeJar: remapped.get().archiveFile.get().asFile.absolutePath,
+                probeSha256: digest(remapped.get().archiveFile.get().asFile)
+            ])) + '\n', 'UTF-8')
+            project.logger.lifecycle('Production smoke artifacts: ' + report)
+        }
+    }
+}

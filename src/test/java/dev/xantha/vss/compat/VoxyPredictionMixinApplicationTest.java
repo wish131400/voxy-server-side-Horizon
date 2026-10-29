@@ -88,6 +88,17 @@ class VoxyPredictionMixinApplicationTest {
                 assertTrue(node.methods.stream().flatMap(m -> java.util.stream.StreamSupport.stream(m.instructions.spliterator(), false))
                         .anyMatch(i -> i instanceof MethodInsnNode call && call.owner.equals("dev/xantha/vss/compat/VoxyPredictionBridge")
                                 && call.name.equals("farPlane")), "Actual renderer projection must expand beyond the 48000-block legacy clip");
+                for (MethodNode projection : node.methods) if (projection.name.equals("computeProjectionMat")
+                        && (projection.desc.endsWith(";F)Lorg/joml/Matrix4f;")
+                            || projection.desc.endsWith(";FF)Lorg/joml/Matrix4f;"))) {
+                    // @ModifyVariable must rewrite the far argument, preserving tkettela's near-plane input.
+                    int expected=projection.desc.endsWith(";FF)Lorg/joml/Matrix4f;") ? 3 : 1;
+                    var code=java.util.stream.StreamSupport.stream(projection.instructions.spliterator(),false)
+                            .filter(i->i.getOpcode()>=0).toList();
+                    assertTrue(code.get(0) instanceof VarInsnNode load && load.getOpcode()==Opcodes.FLOAD && load.var==expected);
+                    assertTrue(code.get(1) instanceof MethodInsnNode call && call.name.contains("vss$projection"));
+                    assertTrue(code.get(2) instanceof VarInsnNode store && store.getOpcode()==Opcodes.FSTORE && store.var==expected);
+                }
             }
             if (!name.equals("BuiltSection") && !name.endsWith("$SyncResults")) assertTrue(node.methods.stream().flatMap(m -> java.util.stream.StreamSupport.stream(m.instructions.spliterator(),false))
                     .anyMatch(i -> i instanceof MethodInsnNode call && call.owner.equals("dev/xantha/vss/compat/VoxyPredictionBridge")));

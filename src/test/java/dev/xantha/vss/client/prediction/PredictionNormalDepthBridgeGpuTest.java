@@ -16,6 +16,10 @@ import org.lwjgl.opengl.GL;
 @EnabledIfSystemProperty(named = "vss.gpuTests", matches = "true")
 @EnabledIfSystemProperty(named = "vss.voxyJar", matches = ".+")
 class PredictionNormalDepthBridgeGpuTest {
+    @Test void commentedImportsRetainTheNativeInlineFogImplementation() throws Exception {
+        String comment="// #import <missing:commented-fog.glsl>\nconst int FOG_SHAPE_SPHERICAL = 0;\n";
+        assertEquals(comment,expand(null,comment),"Native ShaderLoadingParser expands only lines starting with #import");
+    }
     @Test void actualFinalBlitPreservesMinecraftDepthAndForegroundForPublishedRelease() throws Exception {
         assertTrue(glfwInit());
         glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
@@ -140,7 +144,9 @@ class PredictionNormalDepthBridgeGpuTest {
         return dev.xantha.vss.testutil.VoxyShaderResources.read(jar, id);
     }
     private static String expand(ZipFile jar, String source) throws Exception {
-        var matcher = Pattern.compile("#import <([^>]+)>").matcher(source);
+        // Native ShaderLoadingParser tests line.startsWith("#import"). A fork
+        // intentionally comments out Sodium fog and supplies its own helpers.
+        var matcher = Pattern.compile("(?m)^#import <([^>]+)>[ \t]*$").matcher(source);
         var result = new StringBuilder();
         int previous = 0;
         while (matcher.find()) {
