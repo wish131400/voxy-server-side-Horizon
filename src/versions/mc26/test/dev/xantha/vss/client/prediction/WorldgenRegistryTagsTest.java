@@ -62,8 +62,8 @@ class WorldgenRegistryTagsTest {
         dependent.register(regionId, tag(config, ordered), RegistrationInfo.BUILT_IN);
         dependent.freeze();
         List<RegistryDataLoader.RegistryData<?>> codecs = List.of(
-                new RegistryDataLoader.RegistryData<>(dependentKey, sets, false),
-                new RegistryDataLoader.RegistryData<>(configKey, Codec.INT, false));
+                new RegistryDataLoader.RegistryData<>(dependentKey, sets, RegistryValidator.none()),
+                new RegistryDataLoader.RegistryData<>(configKey, Codec.INT, RegistryValidator.none()));
         var dependencies = new WorldgenRegistryDependencies(
                 new RegistryAccess.ImmutableRegistryAccess(List.of(dependent, config)), codecs);
         dependencies.require(dependentKey.identifier());
@@ -95,7 +95,7 @@ class WorldgenRegistryTagsTest {
         var custom = new MappedRegistry<HolderSet<StructureProcessorList>>(customKey, Lifecycle.stable());
         var configId = ResourceKey.create(customKey, Identifier.parse("example:pool"));
         custom.register(configId, tag(processors, processorsTag), RegistrationInfo.BUILT_IN); custom.freeze();
-        List<RegistryDataLoader.RegistryData<?>> codecs = List.of(new RegistryDataLoader.RegistryData<>(customKey, lists, false));
+        List<RegistryDataLoader.RegistryData<?>> codecs = List.of(new RegistryDataLoader.RegistryData<>(customKey, lists, RegistryValidator.none()));
         var dependencies = new WorldgenRegistryDependencies(
                 new RegistryAccess.ImmutableRegistryAccess(List.of(custom, processors)), codecs);
         dependencies.require(customKey.identifier());
@@ -117,7 +117,7 @@ class WorldgenRegistryTagsTest {
         var registry = new MappedRegistry<Integer>(key, Lifecycle.stable());
         var empty = TagKey.create(key, Identifier.parse("other:empty_tag"));
         bind(registry, Map.of(empty, List.of())); registry.freeze();
-        List<RegistryDataLoader.RegistryData<?>> codecs = List.of(new RegistryDataLoader.RegistryData<>(key, Codec.INT, false));
+        List<RegistryDataLoader.RegistryData<?>> codecs = List.of(new RegistryDataLoader.RegistryData<>(key, Codec.INT, RegistryValidator.none()));
         var dependencies = new WorldgenRegistryDependencies(new RegistryAccess.ImmutableRegistryAccess(List.of(registry)), codecs);
         dependencies.require(key.identifier());
         var client = ClientWorldgenRegistries.decode(snapshot(dependencies), RegistryAccess.EMPTY, codecs);
@@ -129,7 +129,7 @@ class WorldgenRegistryTagsTest {
         var id = ResourceKey.create(key, Identifier.parse("example:value"));
         var registry = new MappedRegistry<Integer>(key, Lifecycle.stable());
         registry.register(id, 871, RegistrationInfo.BUILT_IN); registry.freeze();
-        List<RegistryDataLoader.RegistryData<?>> codecs = List.of(new RegistryDataLoader.RegistryData<>(key, Codec.INT, false));
+        List<RegistryDataLoader.RegistryData<?>> codecs = List.of(new RegistryDataLoader.RegistryData<>(key, Codec.INT, RegistryValidator.none()));
         var dependencies = new WorldgenRegistryDependencies(new RegistryAccess.ImmutableRegistryAccess(List.of(registry)), codecs);
         dependencies.require(key.identifier());
         var root = snapshot(dependencies); root.remove("registry_tags");
@@ -142,7 +142,7 @@ class WorldgenRegistryTagsTest {
     @Test void missingTagMembersAreRejectedInsteadOfBecomingAnEmptyNamedSet() {
         var key = ResourceKey.<Integer>createRegistryKey(Identifier.parse("example:strict_tag"));
         var registry = new MappedRegistry<Integer>(key, Lifecycle.stable()); registry.freeze();
-        List<RegistryDataLoader.RegistryData<?>> codecs = List.of(new RegistryDataLoader.RegistryData<>(key, Codec.INT, false));
+        List<RegistryDataLoader.RegistryData<?>> codecs = List.of(new RegistryDataLoader.RegistryData<>(key, Codec.INT, RegistryValidator.none()));
         var dependencies = new WorldgenRegistryDependencies(new RegistryAccess.ImmutableRegistryAccess(List.of(registry)), codecs);
         dependencies.require(key.identifier());
         var root = snapshot(dependencies);
@@ -160,7 +160,7 @@ class WorldgenRegistryTagsTest {
         var captured = new MappedRegistry<Integer>(key, Lifecycle.stable());
         var snapshotHolder = captured.register(id, 1091, RegistrationInfo.BUILT_IN);
         bind(captured, Map.of(activeTag, List.of(snapshotHolder))); captured.freeze();
-        List<RegistryDataLoader.RegistryData<?>> codecs = List.of(new RegistryDataLoader.RegistryData<>(key, Codec.INT, false));
+        List<RegistryDataLoader.RegistryData<?>> codecs = List.of(new RegistryDataLoader.RegistryData<>(key, Codec.INT, RegistryValidator.none()));
         var dependencies = new WorldgenRegistryDependencies(new RegistryAccess.ImmutableRegistryAccess(List.of(captured)), codecs);
         dependencies.require(key.identifier());
         var root = snapshot(dependencies);

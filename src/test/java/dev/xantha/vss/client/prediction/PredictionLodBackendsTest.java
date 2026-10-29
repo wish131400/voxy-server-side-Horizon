@@ -153,7 +153,7 @@ class PredictionLodBackendsTest {
         var snapshot = TerrainPredictionFixtures.emptyRegistries();
         TerrainPredictionFixtures.sourceLookup().lookupOrThrow(net.minecraft.core.registries.Registries.NOISE)
                 .listElements().forEach(holder -> snapshot.getAsJsonObject("noises").add(holder.key().identifier().toString(),
-                        net.minecraft.world.level.levelgen.synth.NormalNoise.NoiseParameters.DIRECT_CODEC
+                        dev.xantha.vss.testutil.NoiseCodecFixtures.CODEC
                                 .encodeStart(ops, holder.value()).result().orElseThrow()));
         return new PredictionLodContext(profile(root), TerrainPredictionPlan.read(root), root,
                 ClientWorldgenRegistries.decode(snapshot, access), access);

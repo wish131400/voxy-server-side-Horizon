@@ -13,7 +13,6 @@ import net.minecraft.resources.RegistryOps;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.BiomeSource;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
-import net.minecraft.world.level.levelgen.synth.NormalNoise;
 import org.junit.jupiter.api.*;
 
 class TerraBlenderRequiredRoutingTest {
@@ -37,7 +36,7 @@ class TerraBlenderRequiredRoutingTest {
         var snapshot = TerrainPredictionFixtures.emptyRegistries();
         var noises = snapshot.getAsJsonObject("noises");
         TerrainPredictionFixtures.sourceLookup().lookupOrThrow(Registries.NOISE).listElements().forEach(holder ->
-                noises.add(holder.key().identifier().toString(), NormalNoise.NoiseParameters.DIRECT_CODEC
+                noises.add(holder.key().identifier().toString(), dev.xantha.vss.testutil.NoiseCodecFixtures.CODEC
                         .encodeStart(ops, holder.value()).result().orElseThrow()));
         byte[] registries = snapshot.toString().getBytes(StandardCharsets.UTF_8);
         var payload = new WorldgenProfileS2CPayload(WorldgenProfileS2CPayload.FORMAT_VERSION, 42, 1,
