@@ -15,19 +15,28 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.biome.Biomes;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class TerraBlenderEndSnapshotTest {
     @BeforeAll static void bootstrap() { TerrainPredictionFixtures.bootstrap(); }
     private static <T> String biomeName(Registry<T> registry, int id) {
         return registry.getKey(registry.byId(id)).toString();
     }
-    @Test void actualInitializedAreaChainMatchesItsCapturedReplay() throws Exception {
+    @Test void actualInitializedAreaChainMatchesItsCapturedReplay(@TempDir Path temporaryDirectory) throws Exception {
         String jar = System.getProperty("vss.terrablenderJar", "");
         assumeTrue(!jar.isBlank(), "Pass a version-matching Mojmap TerraBlender JAR");
         try (var loader = new URLClassLoader(new java.net.URL[]{Path.of(jar).toUri().toURL()}, getClass().getClassLoader())) {
             Class<?> endRegistry;
             try { endRegistry = loader.loadClass("terrablender.api.EndBiomeRegistry"); }
             catch (ClassNotFoundException absentOn120) { assumeTrue(false, "This release has no End biome API"); return; }
+            // Use the real released config parser and defaults. EndBiomeRegistry's
+            // static initializer consumes CONFIG, exactly after loader setup in-game.
+            Class<?> configType = loader.loadClass("terrablender.config.TerraBlenderConfig");
+            Path configFile = temporaryDirectory.resolve("terrablender.toml");
+            Object config = configType.getConstructor(Path.class).newInstance(configFile);
+            loader.loadClass("terrablender.core.TerraBlender").getMethod("setConfig", configType)
+                    .invoke(null, config);
+            assertTrue(java.nio.file.Files.isRegularFile(configFile), "real config must stay in the isolated fixture");
             var register = endRegistry.getMethod("registerHighlandsBiome", ResourceKey.class, int.class);
             register.invoke(null, Biomes.PLAINS, 7); register.invoke(null, Biomes.DESERT, 3);
             register.invoke(null, Biomes.PLAINS, 5); // repeated biome IDs participate in zoom mode equality.

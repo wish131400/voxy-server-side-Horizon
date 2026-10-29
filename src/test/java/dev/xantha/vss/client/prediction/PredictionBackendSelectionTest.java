@@ -5,9 +5,15 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionProfile;
 import net.minecraft.resources.Identifier;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 class PredictionBackendSelectionTest {
+    @BeforeAll static void bootstrapMinecraft() {
+        net.minecraft.SharedConstants.tryDetectVersion();
+        net.minecraft.server.Bootstrap.bootStrap();
+    }
+
     private static ClientTerrainSampler sampler() {
         return ClientTerrainSampler.custom(42, new DimensionProfile(Identifier.withDefaultNamespace("overworld"),
                 42, -64, 384, "noise", "minecraft:overworld", 0), (x, z) -> 64);

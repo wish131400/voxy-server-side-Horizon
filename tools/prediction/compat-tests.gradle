@@ -1,4 +1,26 @@
 allprojects {
+    // Fabric Loader normally exposes a mod's nested libraries. Offline JUnit
+    // loads TerraBlender through its own URLClassLoader, so supply those exact
+    // bundled libraries on the worker parent classpath. The mod itself stays
+    // behind the optional test hook and cannot alter unrelated test fixtures.
+    def terraBlenderJar = providers.gradleProperty('vssTerraBlenderJar')
+    if (terraBlenderJar.isPresent()) {
+        def nestedDirectory = layout.buildDirectory.dir('worldgen-test-dependencies/terrablender')
+        def extractNested = tasks.register('extractTerraBlenderTestDependencies', Sync) {
+            inputs.file(providers.provider { file(terraBlenderJar.get()) })
+                    .withPropertyName('terraBlenderJar')
+            from({ zipTree(file(terraBlenderJar.get())) }) {
+                include 'META-INF/jars/*.jar'
+            }
+            into nestedDirectory
+        }
+        def nestedClasspath = files({
+            fileTree(nestedDirectory.get().asFile) { include '**/*.jar' }
+        }).builtBy(extractNested)
+        // Custom Test tasks also use sourceSets.test.runtimeClasspath; add the
+        // extracted files through the runtime configuration so they see them.
+        dependencies.add('testRuntimeOnly', nestedClasspath)
+    }
     tasks.withType(Test).configureEach {
         if (providers.gradleProperty('vssSodiumJar').isPresent()) {
             systemProperty 'vss.sodiumJar', providers.gradleProperty('vssSodiumJar').get()
