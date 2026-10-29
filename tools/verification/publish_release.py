@@ -37,6 +37,7 @@ def publish(source, build_id, targets):
             output.write(staging / "manifest.json", "manifest.json")
             output.write(staging / "source-snapshot.json", "source-snapshot.json")
             output.write(source / "LICENSE", "LICENSE")
+            output.write(source / "README.md", "README.md")
         import shutil
         for path in [*jars, bundle, staging / "manifest.json", staging / "source-snapshot.json"]:
             shutil.copy2(path, archive_dir / path.name)
