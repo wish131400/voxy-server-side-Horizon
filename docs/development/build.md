@@ -1,0 +1,50 @@
+# 构建与源码组织
+
+[文档目录](../README.md)
+
+## 构建
+
+1.21.11 使用 Java 21；1.21.1 同样使用 Java 21，并显式指定目标：
+
+```text
+gradlew remapJar
+gradlew remapJar -PmcTarget=1.21.1
+```
+
+1.20.1 的生产代码使用 Java 17。使用 Java 21 启动 Gradle，并安装 Java 17 工具链：
+
+```text
+gradlew remapJar -PmcTarget=1.20.1
+```
+
+26.x 使用 Java 25，并指定目标，例如：
+
+```text
+gradlew jar -PmcTarget=26.1.2
+```
+
+标准产物位于 `lib`，例如 `vss-0.3.6-fabric-1.21.11.jar`。文件名不追加临时修复后缀，构建标识和源码摘要写入 JAR 清单。
+
+## 标准产物
+
+当前八目标候选包的构建标识为 `voxy-update-20261029`，均已通过生产构建和包内源码、版本与原生库校验。包内生产源码 SHA-256 为 `f9135b29a891076b0bcbd6bb4baba9bf957462eb50c3120440b79d21bd1bc2dc`；该摘要使用构建脚本约定的生产输入集合计算，不等同于 Git 提交号。`lib/SHA256SUMS.txt` 按目标列出各标准 JAR 和合包的校验值。
+
+`lib/vss-0.3.6.zip` 按 Minecraft 版本分目录收纳构建，附带构建清单和源码摘要。该合包只包含本仓库的 Fabric 版本。
+
+## 源码组织
+
+- `src/main`：共享调度、网络、缓存、预测核心，以及 1.21.11 实现。
+- `src/versions/mc120`：1.20.1 的网络通道、世界生成与渲染接口适配。
+- `src/versions/mc121`：1.21.1 的世界生成、载荷与渲染接口适配。
+- `src/versions/mc26`：26.1 系列及后续版本的差异实现。
+- `src/versions/mc262`：26.2 开始的差异实现。
+- `src/versions/mc263`：26.3 的世界生成与渲染差异实现。
+- `tools/rust/vss-native-core`：共用的 Rust 原生计算与 JNI 接口。
+
+构建时，同一路径的类只选择一个实现，优先使用更具体的版本目录。不能用扩大元数据版本范围的方式跳过接口验证。
+
+## 构建与验收边界
+
+每个目标分别执行生产编译、模块与迁移回归、实际依赖接口检查、专用服务器启动和缓存验证。客户端启动、GPU 小场景与实际游戏画面分别记录；缺少外部输入的可选测试显式记为跳过。工具入口见仓库的 `build.gradle`、`.github/workflows/` 和 `tools/verification/`，不要用扩大版本声明代替目标验证。
+
+Rust 由 [原生工具目录](../../tools/rust/README.md)维护；第三方输入遵守上游分发要求，不纳入源码仓库。构建身份和源码摘要放入 JAR 清单，标准文件名不追加临时后缀。固定构建的历史验证见 [阶段记录](../history/validation.md)。

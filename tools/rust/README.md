@@ -1,8 +1,10 @@
 # VSS source-built Rust worldgen core
 
+[文档目录](../../docs/README.md) · [版本与依赖](../../docs/compatibility/README.md) · [构建](../../docs/development/build.md)
+
 Horizon Fabric 0.3.6. The shared core originated in the VSS NeoForge project.
 Minecraft-specific schema and algorithm changes are verified per target; see the
-version status in the repository README rather than assuming all versions match.
+version status in the [developer guide](../../docs/development/build.md) rather than assuming all versions match.
 
 The implementation follows the mapped Minecraft classes and effective runtime
 registries. Offline oracles call the actual Minecraft methods. Saved-world
@@ -16,6 +18,10 @@ The worldgen interface is JNI ABI **6** (`RustWorldgenBackend`); the noise-only
 probe keeps ABI 1 for validation. The release packages the same core for
 **Windows x86_64, Linux x86_64/aarch64, macOS x86_64/aarch64**.
 Unknown targets use the Java sampler. The only production native backend is this core.
+
+## ABI evolution
+
+The following entries record features introduced in earlier ABI revisions; the current interface is ABI 6.
 
 ABI 3 adds `previewPoints`: grids below the full terrain axis use raw density
 at 16-block vertical intervals and refine the detected crossing to 4 blocks.
