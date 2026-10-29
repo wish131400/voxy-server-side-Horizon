@@ -11,7 +11,8 @@ tasks.register('fabricContractTest', Test) {
      'VoxyPredictionMixinApplicationTest', 'VoxyIngestMixinApplicationTest',
      'VoxyIngestBytecodeTest', 'VoxyIngestContractTest',
      'VoxyRenderPipelineMixinApplicationTest', 'VoxyNeighborVariantMixinTest',
-     'VoxyFluidBakeCompatibilityTest', 'PredictionNormalDepthBridgeTest'].each { include "**/${it}.class" }
+     'VoxyFluidBakeCompatibilityTest', 'PredictionNormalDepthBridgeTest',
+     'PredictionAtlasTest'].each { include "**/${it}.class" }
     maxHeapSize = '2G'
     maxParallelForks = 1
     forkEvery = 1

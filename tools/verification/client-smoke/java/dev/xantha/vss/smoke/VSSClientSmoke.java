@@ -46,6 +46,7 @@ public final class VSSClientSmoke implements ClientModInitializer {
     private volatile int titleTicks;
     private long titleStartedNanos;
     private volatile String lastScreen = "unobserved";
+    private boolean predictionResourceAtlasValidated;
 
     @Override
     public void onInitializeClient() {
@@ -94,6 +95,14 @@ public final class VSSClientSmoke implements ClientModInitializer {
             titleTicks++;
             if (titleTicks >= REQUIRED_TITLE_TICKS
                     && System.nanoTime() - titleStartedNanos >= REQUIRED_TITLE_NANOS) {
+                // Exercise the same loaded-resource lookup used after a worldgen
+                // profile arrives, even while this bounded probe stays at title.
+                var probe = dev.xantha.vss.client.prediction.ClientPredictionState.class
+                        .getDeclaredMethod("currentResourceAtlasToken", Minecraft.class);
+                probe.setAccessible(true);
+                if (probe.invoke(null, client) == null)
+                    throw new IllegalStateException("Prediction block atlas returned no resource sprite");
+                predictionResourceAtlasValidated = true;
                 finish(true, "title_screen_initialized", null, true);
             }
         } catch (ReflectiveOperationException | RuntimeException failure) {
@@ -110,6 +119,7 @@ public final class VSSClientSmoke implements ClientModInitializer {
         report.addProperty("reason", reason);
         report.addProperty("validation", "client_initialization_and_title_screen");
         report.addProperty("gameplayValidated", false);
+        report.addProperty("predictionResourceAtlasValidated", predictionResourceAtlasValidated);
         report.addProperty("startedAt", startedAt);
         report.addProperty("finishedAt", Instant.now().toString());
         report.addProperty("elapsedSeconds", (System.nanoTime() - startedNanos) / 1_000_000_000.0);

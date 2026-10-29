@@ -329,9 +329,7 @@ public final class ClientPredictionState {
         if (level == null || player == null || player.isRemoved()) {
             return;
         }
-        var blockAtlas = Minecraft.getInstance().getAtlasManager()
-                .getAtlasOrThrow(net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS);
-        Object atlasToken = blockAtlas.getSprite(net.minecraft.resources.Identifier.tryParse("minecraft:block/stone"));
+        Object atlasToken = currentResourceAtlasToken(minecraft);
         if (resourceAtlasToken != atlasToken) {
             resourceAtlasToken = atlasToken;
             resourcesChanged();
@@ -369,6 +367,12 @@ public final class ClientPredictionState {
                 requestTimes.remove(key, started);
             }
         });
+    }
+
+    /** AtlasManager indexes definition IDs; texture file locations are a different namespace. */
+    static Object currentResourceAtlasToken(Minecraft minecraft) {
+        return minecraft.getAtlasManager().getAtlasOrThrow(net.minecraft.data.AtlasIds.BLOCKS)
+                .getSprite(net.minecraft.resources.Identifier.withDefaultNamespace("block/stone"));
     }
 
     static void publishWorkView(ResourceKey<Level> dimension, PredictionWorkView view, boolean detailLoading) {
