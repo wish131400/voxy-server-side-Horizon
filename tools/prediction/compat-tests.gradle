@@ -1,5 +1,8 @@
 allprojects {
     tasks.withType(Test).configureEach {
+        if (providers.gradleProperty('vssSodiumJar').isPresent()) {
+            systemProperty 'vss.sodiumJar', providers.gradleProperty('vssSodiumJar').get()
+        }
         if (providers.gradleProperty('vssIrisJar').isPresent()) {
             systemProperty 'vss.irisJar', providers.gradleProperty('vssIrisJar').get()
         }

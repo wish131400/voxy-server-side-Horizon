@@ -1,7 +1,7 @@
 """Check the final release JAR for integrated fixes, not just its source tree.
 
 This is an artifact presence/reference check, not a substitute for regression
-tests or a live game run. Run after remapJar (1.21.11) or jar (26.x).
+tests or a live game run. Run after remapJar (1.x) or jar (26.x).
 """
 import argparse
 import hashlib
@@ -140,6 +140,22 @@ def verify_version_paths(read_class, names, minecraft):
                    if method is None or declared == method for entry in entries):
             raise ValueError(f"Missing implementation call: {cls}.{method or '*'} -> {owner}.{name}")
 
+    # Check executed instructions in the helper used by tick, rather than an
+    # unused constant-pool entry left over from an earlier implementation.
+    state = "ClientPredictionState"
+    calls(state, "tick", prefix + state, "currentResourceAtlasToken")
+    if minecraft in ("1.20.1", "1.21.1"):
+        calls(state, "currentResourceAtlasToken", "net/minecraft/class_310", "method_1549",
+              "(Lnet/minecraft/class_2960;)Ljava/util/function/Function;")
+        calls(state, "currentResourceAtlasToken", "net/minecraft/class_1059", "field_5275")
+        calls(state, "currentResourceAtlasToken", "java/util/function/Function", "apply")
+    elif minecraft == "1.21.11":
+        calls(state, "currentResourceAtlasToken", "net/minecraft/class_310", "method_72703")
+        calls(state, "currentResourceAtlasToken", "net/minecraft/class_10725", "field_56382")
+    else:
+        calls(state, "currentResourceAtlasToken", "net/minecraft/client/Minecraft", "getAtlasManager")
+        calls(state, "currentResourceAtlasToken", "net/minecraft/data/AtlasIds", "BLOCKS")
+
     if minecraft == "26.3":
         retired = ("DensityMemo", "DensityGraphCompiler", "DensityCompilerSupport", "DensityCompilation",
                    "PredictionRawDensity", "PredictionVanillaDensity", "PredictionDensityOrder")
@@ -170,12 +186,12 @@ def verify_version_paths(read_class, names, minecraft):
     calls(cls, "sourceZeroToOne", "org/lwjgl/opengl/GL11", "glGetInteger", "(I)I")
     calls(cls, "bind", "org/lwjgl/opengl/GL20", "glUniform2f", "(IFF)V")
     calls("PredictionFogBridge", "patch", prefix + cls, "patch")
-    if minecraft == "1.21.11":
+    if minecraft.startswith("1."):
         bridge = read_class(cls)
         if b"VssDestinationDepthTransform" in bridge:
-            raise ValueError("1.21.11 must retain its actual forward [-1,1] destination projection")
+            raise ValueError(minecraft + " must retain its actual forward [-1,1] destination projection")
         if b"clamp(depth * 0.5 + 0.5, 0.0, 1.0 - 1.0 / 16777215.0)" not in bridge:
-            raise ValueError("Missing 1.21.11 destination depth shader mapping")
+            raise ValueError("Missing " + minecraft + " destination depth shader mapping")
     else:
         calls(cls, "bind", "com/mojang/blaze3d/systems/RenderSystem", "getDevice")
         calls(cls, "bind", "org/lwjgl/opengl/GL20", "glUniform4f", "(IFFFF)V")
@@ -196,7 +212,7 @@ def verify_version_paths(read_class, names, minecraft):
 def source_files(root):
     paths = [p for p in (root / "src/main").rglob("*") if p.is_file()]
     paths += [p for p in (root / "src/versions").rglob("*") if p.is_file()]
-    paths += [root / p for p in ("build.gradle", "fabric-next.gradle", "settings.gradle", "gradle.properties",
+    paths += [root / p for p in ("build.gradle", "fabric-next.gradle", "fabric-legacy.gradle", "settings.gradle", "gradle.properties",
                                "gradle/minecraft-targets.gradle")]
     return sorted(paths, key=lambda p: p.relative_to(root).as_posix())
 
@@ -219,6 +235,12 @@ def verify(jar, platform, build_id, source, minecraft=None):
     with zipfile.ZipFile(jar) as archive:
         require(archive.testzip() is None, "Corrupt JAR")
         names = set(archive.namelist())
+        require(not any(n.endswith(".class") and "/me/cortex/voxy/" in "/" + n for n in names),
+                "External Voxy classes packaged")
+        # VSS resolves Java dependencies from the loader rather than embedding
+        # other mods. Its own five platform native libraries are checked below.
+        require(not any(n.lower().endswith(".jar") for n in names),
+                "External nested dependency JAR packaged")
         manifest = manifest_attributes(archive.read("META-INF/MANIFEST.MF"))
         require(manifest.get("VSS-Build-Id") == build_id, "Wrong build ID")
         properties = dict(re.findall(r"(?m)^([a-z_]+)=(.+)$", (source / "gradle.properties").read_text()))
@@ -228,10 +250,11 @@ def verify(jar, platform, build_id, source, minecraft=None):
         require(jar.name == "vss-" + version + ".jar", "Wrong standard JAR name")
         require(manifest.get("Implementation-Version") == version, "Wrong implementation version")
         metadata = json.loads(archive.read("fabric.mod.json"))
+        require(not metadata.get("jars"), "External nested dependency declared in Fabric metadata")
         require(metadata["id"] == "vss" and metadata["version"] == version, "Wrong Fabric metadata")
         require(metadata["depends"]["minecraft"] == minecraft, "Wrong Minecraft target")
         require(manifest.get("VSS-Minecraft") == minecraft, "Wrong Minecraft build identity")
-        target_index = ["1.21.11", "26.1", "26.1.1", "26.1.2", "26.2", "26.3"].index(minecraft)
+        target_index = ["1.21.11", "26.1", "26.1.1", "26.1.2", "26.2", "26.3", "1.21.1", "1.20.1"].index(minecraft)
         require(manifest.get("VSS-Protocol") == str(54 + target_index), "Wrong target protocol")
         require(manifest.get("VSS-Column-Schema") == str(6 + target_index), "Wrong target column schema")
         require(not any(n in names for n in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml")), "Old loader metadata packaged")
@@ -239,7 +262,11 @@ def verify(jar, platform, build_id, source, minecraft=None):
             for entry in entries:
                 require(entry.replace(".", "/") + ".class" in names, "Missing Fabric entrypoint: " + entry)
         require(metadata["accessWidener"] in names, "Missing access widener")
-        major = 44 + (21 if minecraft == "1.21.11" else 25)
+        major = 44 + (17 if minecraft == "1.20.1" else 21 if minecraft.startswith("1.") else 25)
+        for name in names:
+            if name.endswith(".class"):
+                require(int.from_bytes(archive.read(name)[6:8], "big") == major,
+                        "Wrong packaged Java version: " + name)
 
         def check_class(name, *symbols):
             data = archive.read("dev/xantha/vss/" + name + ".class")
@@ -248,11 +275,35 @@ def verify(jar, platform, build_id, source, minecraft=None):
                 require(symbol.encode() in data, "Missing reference: " + name + ": " + symbol)
             return data
 
+        feature_snapshot = class_references(check_class("common/worldgen/VanillaFeatureSnapshot"))
+        cherry_owner = ("net/minecraft/class_8178" if minecraft.startswith("1.") else
+                        "net/minecraft/world/level/levelgen/feature/foliageplacers/CherryFoliagePlacer")
+        cherry_field = "field_42844" if minecraft.startswith("1.") else "cornerHoleChance"
+        require(any((cherry_owner, cherry_field, "F") in entries
+                    for (method, _), entries in feature_snapshot.items() if method == "correct"),
+                "Cherry foliage snapshot does not read the target's actual remapped field")
         verify_version_paths(lambda name: check_class("client/prediction/" + name), names, minecraft)
         check_class("client/prediction/PredictionClimateSampler", "FabricBiomeCompat", "copyClimateContext")
         check_class("client/prediction/FabricBiomeCompat", "net.fabricmc.fabric.impl.biome.MultiNoiseSamplerHooks", "fabric_getSeed", "fabric_setSeed")
         check_class("client/prediction/PredictionBiomeCache", "LookupFailure", "sample")
-        check_class("client/prediction/PredictionVegetation", "END_CLIMATE_SETTINGS_VERSION", "LookupFailure")
+        check_class("client/prediction/PredictionVegetation", "END_CLIMATE_SETTINGS_VERSION",
+                    "REGISTRY_CONTEXT_SETTINGS_VERSION", "LookupFailure")
+        registries = class_references(check_class("client/prediction/ClientWorldgenRegistries"))
+        builtin_owner = ("net/minecraft/class_7923" if minecraft.startswith("1.") else
+                         "net/minecraft/core/registries/BuiltInRegistries")
+        builtin_field = "field_41167" if minecraft.startswith("1.") else "REGISTRY"
+        require(any(owner == builtin_owner and member == builtin_field
+                    for (method, _), entries in registries.items() if method == "<init>"
+                    for owner, member, _ in entries),
+                "Static worldgen registry fallback is not prepared during codec initialization")
+        encoder = class_references(check_class("networking/server/session/WorldgenCodecSnapshot", "preferred_biomes"))
+        rings_owner = ("net/minecraft/class_6871" if minecraft.startswith("1.") else
+                       "net/minecraft/world/level/levelgen/structure/placement/ConcentricRingsStructurePlacement")
+        rings_method = "method_41631" if minecraft.startswith("1.") else "preferredBiomes"
+        require(any(owner == rings_owner and member == rings_method
+                    for (method, _), entries in encoder.items() if method == "encodeEntry"
+                    for owner, member, _ in entries),
+                "Stronghold biome preference is not read by the production snapshot encoder")
         check_class("client/prediction/PredictionSurfaceStructures", "LookupFailure")
         inset = check_class("compat/VoxySurfaceHeights", "patchShader", "// VSS world-space model inset")
         for retired in (b"vssSurfaceDrop", b"HEIGHT_BITS", b"org/lwjgl/system/MemoryUtil"):
@@ -273,6 +324,16 @@ def verify(jar, platform, build_id, source, minecraft=None):
         check_class("compat/VoxyCompat$LocalSectionIndex", "settledRegions")
         check_class("compat/VoxyIngestTracker", "realColumnSettled")
         check_class("compat/VoxyPredictionBridge$Context", "hasSkyLight")
+        check_class("compat/VoxyCapacityPlan", "initialCapacity", "capacity")
+        check_class("compat/VoxyTraversalCapacity", "getCurrentMaxNodeId", "beforeAdd", "beforeTraversal", "ensureRoots", "ensureQueues")
+        check_class("compat/VoxyTraversalCapacity$1", "glCopyNamedBufferSubData", "free")
+        traversal_shader = check_class("compat/VoxyTraversalShader", "// VSS bounded traversal queues", "nodeQueueSource.length()", "enqueueSelfForRender")
+        require(b"atomicCompSwap" not in traversal_shader, "Serial GPU reservation retry loop packaged")
+        check_class("mixin/voxy/VoxyTraversalCapacityMixin", "vss$initialRootArray", "vss$initialQueues", "beforeTraversal")
+        check_class("mixin/voxy/VoxyTraversalQueueShaderMixin", "VoxyTraversalShader")
+        capacity_mixins = json.loads(archive.read("vss.compat.mixins.json"))["client"]
+        require(all(name in capacity_mixins for name in ("voxy.VoxyTraversalCapacityMixin", "voxy.VoxyTraversalQueueShaderMixin")),
+                "Capacity mixins absent from runtime configuration")
         check_class("client/prediction/PredictionVoxySource", "lightingBuilds")
         check_class("client/prediction/PredictionTileManager", "invalidatedSurfaces")
         check_class("client/prediction/PredictionCaptureHandoff", "await", "committed", "blocked", "reindex", "retired")
@@ -403,7 +464,7 @@ def verify(jar, platform, build_id, source, minecraft=None):
         # 1.21.11 remapJar uses the pinned intermediary mapping for LiquidBlock;
         # 26.x artifacts retain Mojang names. Require the actual type instruction
         # in both admission paths, not a named string left in the constant pool.
-        liquid = "net/minecraft/class_2404" if minecraft == "1.21.11" else "net/minecraft/world/level/block/LiquidBlock"
+        liquid = "net/minecraft/class_2404" if minecraft.startswith("1.") else "net/minecraft/world/level/block/LiquidBlock"
         fluid_references = class_references(fluid)
         for method in ("body", "top"):
             require(any((liquid, "<instanceof>", None) in entries
@@ -425,6 +486,10 @@ def verify(jar, platform, build_id, source, minecraft=None):
         for name in names:
             if name.endswith(".mixins.json"):
                 config = json.loads(archive.read(name))
+                compatibility = config.get("compatibilityLevel", "JAVA_8")
+                require(re.fullmatch(r"JAVA_\d+", compatibility) is not None
+                        and int(compatibility.removeprefix("JAVA_")) <= major - 44,
+                        "Mixin requires a newer Java runtime than the target: " + name)
                 for cls in config.get("mixins", []) + config.get("client", []) + config.get("server", []):
                     path = config["package"].replace(".", "/") + "/" + cls.replace(".", "/") + ".class"
                     require(path in names, "Missing configured mixin: " + path)
@@ -465,7 +530,7 @@ def verify(jar, platform, build_id, source, minecraft=None):
     return {"jar": jar.name, "platform": platform, "buildId": build_id,
             "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
             "bytes": jar.stat().st_size, "nativeSha256": natives,
-            "integratedFixes": ["two-phase-dirty-capture-handoff", "bounded-capture-retry", "dirty-retention-buffer-fetch", "retired-refresh-barrier", "seeded-fabric-end-biomes", "failed-biome-surface-rejection", "end-decoration-cache-repair", "compact-column-pages", "contributing-feature-query", "native-owner-publication",
+            "integratedFixes": ["static-worldgen-codec-context", "inline-stronghold-biome-preference", "registry-context-surface-cache", "versioned-resource-atlas-token", "horizon-planned-root-capacity", "resident-node-traversal-capacity", "non-spinning-gpu-queue-bounds", "two-phase-dirty-capture-handoff", "bounded-capture-retry", "dirty-retention-buffer-fetch", "retired-refresh-barrier", "seeded-fabric-end-biomes", "failed-biome-surface-rejection", "end-decoration-cache-repair", "compact-column-pages", "contributing-feature-query", "native-owner-publication",
                                 "layout-plan-domain-reset", "partial-vegetation-retention", "terrain-only-parent-proof",
                                 "retained-deferred-detail-demand", "view-priority-readmission", "completion-driven-detail-refill", "dimension-write-bounds", "reverse-coarse-column-coverage", "second-chance-column-cache", "incremental-candidate-union", "exact-display-biome-reuse", "prediction-display-withdrawal", "warm-toggle-reactivation", "concurrent-real-generation", "atomic-generation-admission", "auxiliary-viewport-observer-guard", "native-detail-demand", "authoritative-viewport", "spatial-bootstrap-only", "liquid-surface-remainders", "native-liquid-transition-walls", "native-lod-topology", "world-space-model-inset", "nether-lighting",
                                 "end-floating-columns", "empty-node-sample-readmission",

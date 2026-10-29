@@ -6,6 +6,9 @@ pluginManagement {
 }
 
 rootProject.name = 'voxy-server-side-horizon'
-if (providers.gradleProperty('mcTarget').getOrElse('1.21.11') != '1.21.11') {
+def minecraftTarget = providers.gradleProperty('mcTarget').getOrElse('1.21.11')
+if (minecraftTarget in ['1.20.1', '1.21.1']) {
+    rootProject.buildFileName = 'fabric-legacy.gradle'
+} else if (minecraftTarget != '1.21.11') {
     rootProject.buildFileName = 'fabric-next.gradle'
 }

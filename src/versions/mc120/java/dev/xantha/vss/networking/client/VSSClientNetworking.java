@@ -1,0 +1,740 @@
+package dev.xantha.vss.networking.client;
+
+import dev.xantha.vss.api.VSSApi;
+import dev.xantha.vss.api.VoxelColumnData;
+import dev.xantha.vss.client.prediction.ClientPredictionState;
+import dev.xantha.vss.client.prediction.PredictionRenderer;
+import dev.xantha.vss.networking.client.ClientColumnTransferAssembler.AssembledColumn;
+import dev.xantha.vss.common.VSSConstants;
+import dev.xantha.vss.common.VSSLogger;
+import dev.xantha.vss.common.PositionUtil;
+import dev.xantha.vss.common.processing.LodByteCompression;
+import dev.xantha.vss.compat.ModCompat;
+import dev.xantha.vss.config.VSSClientConfig;
+import dev.xantha.vss.networking.VSSNetworking;
+import dev.xantha.vss.networking.payloads.BandwidthUpdateC2SPayload;
+import dev.xantha.vss.networking.payloads.BatchResponseS2CPayload;
+import dev.xantha.vss.networking.payloads.BatchChunkRequestC2SPayload;
+import dev.xantha.vss.networking.payloads.CancelRequestC2SPayload;
+import dev.xantha.vss.networking.payloads.DirtyColumnsS2CPayload;
+import dev.xantha.vss.networking.payloads.HandshakeC2SPayload;
+import dev.xantha.vss.networking.payloads.HandshakeRequestS2CPayload;
+import dev.xantha.vss.networking.payloads.RegionPresenceC2SPayload;
+import dev.xantha.vss.networking.payloads.SessionConfigS2CPayload;
+import dev.xantha.vss.networking.payloads.VoxelColumnS2CPayload;
+import dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload;
+import java.util.concurrent.atomic.AtomicLong;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.level.Level;
+
+/**
+ * 客户端连接状态与网络事件入口，是握手、协商距离和当前请求管理器的唯一状态来源。
+ * <p>启动时安装 ClientLodSessionAdapter，让 API/预测/兼容层查询同一会话。
+ * 网络消息按平台约定交回客户端线程；异步列处理必须复核连接和维度身份。
+ * 断线清理请求、分片与导入状态，不能依靠渲染器另存一份在线标记。
+ */
+public final class VSSClientNetworking {
+    private static volatile boolean serverEnabled;
+    private static volatile int serverLodDistance;
+    private static volatile int serverCapabilities;
+    private static volatile long sessionConfigRevision;
+    private static volatile boolean waitingForHandshake;
+    private static volatile boolean handshakeSent;
+    private static int handshakeRetryTicks;
+    private static boolean predictionOptionKnown;
+    private static boolean lastPredictionActive;
+    private static final PredictionCapabilitySync PREDICTION_CAPABILITY_SYNC = new PredictionCapabilitySync();
+    private static volatile LodRequestManager requestManager;
+    private static final ClientColumnProcessor COLUMN_PROCESSOR = new ClientColumnProcessor();
+    private static final AtomicLong columnsReceived = new AtomicLong();
+    private static final AtomicLong bytesReceived = new AtomicLong();
+    private static final int HANDSHAKE_RETRY_INTERVAL_TICKS = 5;
+    private static final int HANDSHAKE_FAILED_RETRY_INTERVAL_TICKS = 5;
+    private static final long COLUMN_RECEIVE_DIAGNOSTIC_INTERVAL_NANOS = 5_000_000_000L;
+    private static volatile long lastColumnReceiveDiagnosticNanos;
+
+    private VSSClientNetworking() {
+    }
+
+    public static boolean isServerEnabled() {
+        return serverEnabled;
+    }
+
+    public static boolean shouldApplyStrictLodOrder() {
+        // A section-scoped policy cannot complete an authoritative full-column
+        // frontier. Keep ordinary near-first scheduling without that barrier.
+        if (!ClientConnectionIdentity.columnFilterKey().isEmpty()) return false;
+        if (serverEnabled) return true;
+        if (!waitingForHandshake || !VSSClientConfig.CONFIG.receiveServerLods) return false;
+        var connection = Minecraft.getInstance().getConnection();
+        return connection != null && net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.canSend(HandshakeC2SPayload.TYPE.id());
+    }
+
+    public static boolean strictColumnReady(int cx, int cz) {
+        LodRequestManager manager = requestManager;
+        return manager != null && manager.strictColumnReady(cx, cz);
+    }
+
+    public static boolean strictColumnRenderReady(int cx, int cz, java.util.function.IntPredicate ready) {
+        LodRequestManager manager = requestManager;
+        return manager != null && manager.strictColumnRenderReady(cx, cz, ready);
+    }
+
+    public static boolean isClientLodSessionActive() {
+        return serverEnabled && COLUMN_PROCESSOR.isActive() && isClientWorldReady();
+    }
+
+    public static int getServerLodDistance() {
+        return serverLodDistance;
+    }
+
+    /** Returns the VSS request radius; Voxy's own render distance is independent. */
+    public static int getEffectiveLodDistanceChunks() {
+        LodRequestManager manager = requestManager;
+        if (manager != null) {
+            return manager.effectiveLodDistanceChunks();
+        }
+        if (!serverEnabled || serverLodDistance <= 0) {
+            return 0;
+        }
+        int clientDistance = VSSClientConfig.CONFIG.lodDistanceChunks;
+        int hardClientLimit = VSSClientConfig.MAX_LOD_DISTANCE_CHUNKS;
+        if (clientDistance > 0) {
+            return Math.min(Math.min(clientDistance, serverLodDistance), hardClientLimit);
+        }
+        return Math.min(serverLodDistance, hardClientLimit);
+    }
+
+    public static int getServerCapabilities() {
+        return serverCapabilities;
+    }
+
+    public static boolean isPredictionActive() {
+        return (getServerCapabilities() & VSSConstants.CAPABILITY_PREDICTIVE_WORLDGEN) != 0
+                && VSSClientConfig.CONFIG.enablePrediction;
+    }
+
+    static int getQueuedColumnCount() {
+        return COLUMN_PROCESSOR.getQueuedCount();
+    }
+
+    static boolean hasPendingColumnWork() {
+        return COLUMN_PROCESSOR.hasPendingWork();
+    }
+
+    public static long getColumnsReceived() {
+        return columnsReceived.get();
+    }
+
+    public static long getBytesReceived() {
+        return bytesReceived.get();
+    }
+
+    public static long getColumnsDropped() {
+        return COLUMN_PROCESSOR.getColumnsDropped();
+    }
+
+    public static String diagnostics() {
+        return "session=" + isClientLodSessionActive()
+                + ",serverDistance=" + serverLodDistance
+                + ",effectiveDistance=" + getEffectiveLodDistanceChunks()
+                + ",predictionCapability=" + ((serverCapabilities & VSSConstants.CAPABILITY_PREDICTIVE_WORLDGEN) != 0)
+                + ",prediction=" + ClientPredictionState.diagnostics()
+                + ",columns=" + columnsReceived.get()
+                + ",columnBytes=" + bytesReceived.get()
+                + ",queuedColumns=" + COLUMN_PROCESSOR.getQueuedCount();
+    }
+
+    public static void handleSessionConfig(SessionConfigS2CPayload payload) {
+        if (!isClientWorldReady()) {
+            discardSession();
+            return;
+        }
+        if (payload.protocolVersion() != VSSConstants.PROTOCOL_VERSION) {
+            VSSLogger.warn("Server has incompatible VSS protocol " + payload.protocolVersion());
+            discardSession();
+            return;
+        }
+        if (payload.enabled() && (payload.serverCapabilities() & VSSConstants.CAPABILITY_VOXEL_COLUMNS) == 0) {
+            VSSLogger.warn("VSS LOD session rejected: server does not advertise voxel column support");
+            discardSession();
+            return;
+        }
+
+        WORLDGEN_ASSEMBLY.clear();
+        boolean wasEnabled = serverEnabled;
+        waitingForHandshake = false;
+        handshakeSent = true;
+        handshakeRetryTicks = 0;
+        serverEnabled = payload.enabled();
+        serverLodDistance = payload.lodDistanceChunks();
+        serverCapabilities = payload.serverCapabilities();
+        sessionConfigRevision = payload.configRevision();
+        if (!payload.enabled()
+                || (payload.serverCapabilities() & VSSConstants.CAPABILITY_PREDICTIVE_WORLDGEN) == 0) {
+            dev.xantha.vss.client.prediction.PredictionTemplateRepository.reset();
+            ClientPredictionState.clear();
+        }
+        if (payload.enabled()) {
+            LodRequestManager manager = requestManager;
+            boolean newSession = manager == null || !wasEnabled;
+            if (newSession) {
+                COLUMN_PROCESSOR.beginSession();
+                manager = new LodRequestManager(
+                        ClientLodPresenceCache.currentScope(),
+                        new ClientRequestTracker(),
+                        COLUMN_PROCESSOR::clearPendingTransfers,
+                        !ClientConnectionIdentity.columnFilterKey().isEmpty());
+            }
+            boolean requestStateReset = manager.onSessionConfig(payload);
+            if (requestStateReset && !newSession) {
+                COLUMN_PROCESSOR.beginSession();
+            }
+            requestManager = manager;
+            if (newSession) {
+                predictionOptionKnown = true;
+                lastPredictionActive = isPredictionActive();
+            } else {
+                syncPredictionOption(manager);
+            }
+            sendBandwidthPreference();
+
+            boolean hasConsumers = VSSApi.hasVoxelConsumers();
+            if (!hasConsumers) {
+                VSSLogger.warn("VSS LOD session started but no voxel consumers registered! LOD data will not be processed.");
+                VSSLogger.warn("Make sure Voxy mod is loaded or register a custom consumer via VSSApi.registerColumnConsumer()");
+            }
+
+            VSSLogger.info("VSS LOD session ready: distance=" + payload.lodDistanceChunks()
+                    + " chunks, generation=" + (payload.generationEnabled() ? "enabled" : "disabled")
+                    + ", revision=" + payload.configRevision()
+                    + ", reset=" + requestStateReset
+                    + ", consumers=" + hasConsumers);
+        } else {
+            predictionOptionKnown = false;
+            lastPredictionActive = false;
+            ModCompat.onDisconnect();
+            LodRequestManager manager = requestManager;
+            requestManager = null;
+            if (manager != null) {
+                manager.disconnect();
+            }
+            FarPlayerClientRenderer.clear();
+            COLUMN_PROCESSOR.shutdown();
+        }
+    }
+
+    public static void handleHandshakeRequest(HandshakeRequestS2CPayload payload) {
+        if (!VSSClientConfig.CONFIG.receiveServerLods || requestManager != null || serverEnabled) {
+            return;
+        }
+        waitingForHandshake = true;
+        handshakeSent = false;
+        handshakeRetryTicks = 0;
+    }
+
+    public static void handleBatchResponse(BatchResponseS2CPayload payload) {
+        if (!serverEnabled || !isClientWorldReady()) {
+            return;
+        }
+        LodRequestManager manager = requestManager;
+        if (manager == null) {
+            return;
+        }
+        for (int i = 0; i < payload.count(); i++) {
+            int requestId = payload.requestIds()[i];
+            switch (payload.responseTypes()[i]) {
+                case VSSConstants.RESPONSE_RATE_LIMITED -> manager.onRateLimited(requestId);
+                case VSSConstants.RESPONSE_BACKPRESSURE -> manager.onBackpressured(requestId);
+                case VSSConstants.RESPONSE_UP_TO_DATE -> manager.onColumnUpToDate(requestId);
+                case VSSConstants.RESPONSE_NOT_GENERATED -> manager.onColumnNotGenerated(requestId);
+                case VSSConstants.RESPONSE_GENERATION_QUEUED -> manager.onGenerationQueued(requestId);
+                case VSSConstants.RESPONSE_COLUMN_QUEUED -> {
+                    manager.onColumnQueued(requestId);
+                    COLUMN_PROCESSOR.onColumnQueued(requestId);
+                }
+                default -> VSSLogger.warn("Unknown batch response type: " + payload.responseTypes()[i]);
+            }
+        }
+    }
+
+    static LodRequestManager currentPregenManager() { return requestManager; }
+
+    public static boolean isLocalPregenServer(net.minecraft.server.MinecraftServer server) {
+        return IntegratedPregenImporter.supports(server);
+    }
+
+    public static boolean tryImportLocalPregen(net.minecraft.server.MinecraftServer server,
+            net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dimension,
+            dev.xantha.vss.common.processing.EncodedColumnData data,
+            java.util.function.BooleanSupplier valid, java.util.function.Consumer<Boolean> completed) {
+        return IntegratedPregenImporter.offer(server, dimension, data, requestManager, valid, completed);
+    }
+
+    public static void handleDirtyColumns(DirtyColumnsS2CPayload payload) {
+        if (!serverEnabled || !isClientWorldReady()) {
+            return;
+        }
+        LodRequestManager manager = requestManager;
+        if (manager != null) {
+            synchronized (manager) {
+                long[] changed = manager.onDirtyColumns(payload.dirtyPositions(), payload.dirtyTimestamps());
+                ClientLevel level = Minecraft.getInstance().level;
+                if (level != null && changed.length > 0) {
+                    COLUMN_PROCESSOR.invalidatePositions(level.dimension(), changed);
+                    long[] timestamps = new long[changed.length];
+                    for (int i = 0; i < changed.length; i++) timestamps[i] = manager.dirtyColumnTimestamp(changed[i]);
+                    // Filtered columns cannot enter complete-terrain capture; retain their existing refresh path.
+                    ClientPredictionState.onDirtyColumns(level.dimension(), changed,
+                            manager.expectsAuthoritativeColumns() ? timestamps : null);
+                }
+            }
+        }
+    }
+
+    public static void handleVoxelColumn(VoxelColumnS2CPayload payload) {
+        if (!payload.coverage().filterKey().equals(ClientConnectionIdentity.columnFilterKey())) {
+            onColumnTransferFailed(payload.requestId(), payload.transferId(), payload.dimension(), payload.chunkX(), payload.chunkZ());
+            return;
+        }
+        if (!isClientLodSessionActive()) {
+            return;
+        }
+        columnsReceived.incrementAndGet();
+        bytesReceived.addAndGet(payload.estimatedBytes());
+        logColumnReceive(payload);
+        LodRequestManager manager = requestManager;
+        if (manager == null) {
+            return;
+        }
+        LodRequestManager.ColumnReceiveResult receiveResult = manager.onColumnTransferPart(
+                payload.requestId(),
+                payload.dimension(),
+                payload.chunkX(),
+                payload.chunkZ(),
+                payload.columnTimestamp());
+        if (!receiveResult.knownRequest()) {
+            if (receiveResult.packedPosition() != Long.MIN_VALUE) {
+                manager.onColumnTransferFailed(
+                        payload.requestId(),
+                        payload.transferId(),
+                        payload.dimension(),
+                        payload.chunkX(),
+                        payload.chunkZ());
+            }
+            return;
+        }
+        boolean replaceMissingSections = shouldReplaceMissingSections(receiveResult, payload);
+        COLUMN_PROCESSOR.offer(
+                payload,
+                receiveResult.priority(),
+                replaceMissingSections);
+    }
+
+    static boolean shouldReplaceMissingSections(
+            LodRequestManager.ColumnReceiveResult receiveResult,
+            VoxelColumnS2CPayload payload) {
+        return receiveResult.knownRequest()
+                && receiveResult.replaceExistingColumn()
+                && payload.completeColumn();
+    }
+
+    static void processAssembledColumn(
+            ClientLevel level,
+            AssembledColumn column,
+            VoxelColumnData columnData) {
+        LodRequestManager manager = requestManager;
+        if (manager == null) {
+            return;
+        }
+        manager.processColumnIfCurrent(
+                column.requestId(),
+                column.dimension(),
+                column.chunkX(),
+                column.chunkZ(),
+                column.columnTimestamp(),
+                columnData.replacementSectionYs(),
+                () -> {
+                    boolean accepted = VSSApi.dispatchColumnAndReport(
+                            level,
+                            column.dimension(),
+                            column.chunkX(),
+                            column.chunkZ(),
+                            columnData);
+                    if (accepted) {
+                        manager.recordStrictSections(column.chunkX(), column.chunkZ(), columnData);
+                        if (columnData.authoritative()) {
+                            accepted = ClientPredictionState.onExactColumn(column.dimension(), column.chunkX(), column.chunkZ(), columnData);
+                        }
+                    }
+                    return accepted;
+                });
+    }
+
+    private static final WorldgenProfileAssembly WORLDGEN_ASSEMBLY = new WorldgenProfileAssembly();
+
+    public static void handleWorldgenFragment(dev.xantha.vss.networking.payloads.WorldgenProfileFragmentS2CPayload part) {
+        if (!isClientWorldReady() || !serverEnabled
+                || (serverCapabilities & VSSConstants.CAPABILITY_PREDICTIVE_WORLDGEN) == 0) {
+            WORLDGEN_ASSEMBLY.clear();
+            return;
+        }
+        WorldgenProfileS2CPayload profile;
+        try {
+            profile = WORLDGEN_ASSEMBLY.accept(part);
+        } catch (RuntimeException exception) {
+            WORLDGEN_ASSEMBLY.clear();
+            VSSLogger.warn("VSS discarded an invalid worldgen profile transfer; keeping the connection alive", exception);
+            return;
+        }
+        if (profile != null) handleWorldgenProfile(profile);
+    }
+
+    public static void handleWorldgenProfile(WorldgenProfileS2CPayload payload) {
+        WORLDGEN_ASSEMBLY.clear();
+        if (!isClientWorldReady() || !serverEnabled
+                || (serverCapabilities & VSSConstants.CAPABILITY_PREDICTIVE_WORLDGEN) == 0) {
+            return;
+        }
+        if (payload.revision() < sessionConfigRevision) {
+            VSSLogger.debug("Ignoring stale VSS prediction profile revision " + payload.revision()
+                    + " (current " + sessionConfigRevision + ")");
+            return;
+        }
+        ClientPredictionState.accept(payload);
+    }
+
+    public static void onColumnTransferFailed(
+            int requestId,
+            long transferId,
+            ResourceKey<Level> dimension,
+            int cx,
+            int cz) {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (!minecraft.isSameThread()) {
+            minecraft.execute(() -> onColumnTransferFailed(requestId, transferId, dimension, cx, cz));
+            return;
+        }
+        LodRequestManager manager = requestManager;
+        ClientPredictionState.releaseRequested(dimension, cx, cz);
+        if (manager != null) {
+            manager.onColumnTransferFailed(requestId, transferId, dimension, cx, cz);
+        }
+    }
+
+    public static void forceLodResync(String reason) {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (!minecraft.isSameThread()) {
+            minecraft.execute(() -> forceLodResync(reason));
+            return;
+        }
+        LodRequestManager manager = requestManager;
+        if (!serverEnabled || manager == null || !isClientWorldReady()) {
+            return;
+        }
+        manager.forceResync();
+        COLUMN_PROCESSOR.beginSession();
+        VSSLogger.info("VSS LOD resync requested: " + reason);
+    }
+
+    public static int reloadXaeroMapData() {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (!minecraft.isSameThread()) {
+            minecraft.execute(VSSClientNetworking::reloadXaeroMapData);
+            return -1;
+        }
+        ClientLevel level = minecraft.level;
+        LodRequestManager manager = requestManager;
+        if (!serverEnabled || manager == null || level == null
+                || !ModCompat.isXaeroMapBridgeActive()) {
+            return -1;
+        }
+        ClientLodPresenceCache.ScopeClearResult cleared = ClientLodPresenceCache.clearScopeWithDimensions(
+                ClientLodPresenceCache.currentScope());
+        // Xaero replay is a side-channel and must not disable VSS generation.
+        manager.forceResync();
+        COLUMN_PROCESSOR.beginSession();
+        ClientLodPresenceCache.flush();
+        VSSLogger.info("Xaero map reload requested for current server: cleared " + cleared.columns()
+                + " cached column(s) across " + cleared.dimensions().size()
+                + " known dimension(s); cache-only replay started");
+        return cleared.columns();
+    }
+
+    public static int setXaeroMapBridge(boolean enabled) {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (!minecraft.isSameThread()) {
+            minecraft.execute(() -> setXaeroMapBridge(enabled));
+            return -1;
+        }
+        VSSClientConfig.CONFIG.enableXaeroMapBridge = enabled;
+        VSSClientConfig.CONFIG.normalizeAndSave();
+        return enabled ? 1 : 0;
+    }
+
+    public static void onClientLogin() {
+        // PLAY can be recreated during reconfiguration without a physical
+        // disconnect; retire its old request manager and worker generation too.
+        stopClientSession(false);
+        if (!VSSClientConfig.CONFIG.receiveServerLods) {
+            return;
+        }
+        waitingForHandshake = true;
+        handshakeRetryTicks = 0;
+    }
+
+    public static void onClientLogout() {
+        stopClientSessionForWorldShutdown();
+        ClientConnectionIdentity.endSession();
+    }
+
+    public static void onClientLevelUnload(ClientLevel level) {
+        COLUMN_PROCESSOR.clearPendingTransfers();
+        FarPlayerClientRenderer.clear();
+        ClientPredictionState.onLevelUnload(level);
+    }
+
+    public static void onTagsUpdated() {
+            Minecraft.getInstance().execute(ClientPredictionState::tagsChanged);
+    }
+
+    public static void onClientTick() {
+        if (WORLDGEN_ASSEMBLY.expire()) {
+            VSSLogger.warn("VSS worldgen profile transfer timed out; discarded incomplete snapshot");
+        }
+        ModCompat.init();
+        ensureHandshakePending();
+        tryPendingHandshake();
+        PREDICTION_CAPABILITY_SYNC.tick(
+                serverEnabled && !waitingForHandshake && VSSClientConfig.CONFIG.receiveServerLods
+                        && Minecraft.getInstance().getConnection() != null && isClientWorldReady(),
+                VSSClientConfig.CONFIG.enablePrediction,
+                () -> sendHandshake("Prediction capability update failed: "));
+        LodRequestManager manager = requestManager;
+        if (manager != null && serverEnabled) {
+            syncPredictionOption(manager);
+            manager.tick();
+        }
+        ClientPredictionState.tick();
+        COLUMN_PROCESSOR.scheduleProcessing(serverEnabled);
+        ModCompat.clientTick();
+    }
+
+    public static void onRenderFrame() {
+        // PredictionRenderer is called through this registered subscriber.
+        // Its per-frame budget and retired GPU resources need the same route.
+        PredictionRenderer.onRenderFrame();
+    }
+
+    public static void onPerformanceHud(net.minecraft.client.gui.GuiGraphics graphics) {
+        dev.xantha.vss.client.prediction.PredictionPerformanceMonitor.renderHud(graphics);
+    }
+
+    public static void onRenderLevel(org.joml.Matrix4f modelView, org.joml.Matrix4f projection,
+            net.minecraft.world.phys.Vec3 camera) {
+        PredictionRenderer.onRenderLevel(modelView, projection, camera);
+    }
+
+    public static void onAfterEntities() {
+        ModCompat.renderFrame();
+        PredictionRenderer.onAfterEntities();
+    }
+
+    public static void onAfterLevel() {
+        PredictionRenderer.onAfterLevel();
+    }
+
+    public static void sendBandwidthPreference() {
+        if (!serverEnabled) {
+            return;
+        }
+        long desiredRate = VSSClientConfig.CONFIG.desiredBandwidthKbps > 0
+                ? (long) VSSClientConfig.CONFIG.desiredBandwidthKbps * 1000L / 8L
+                : 0L;
+        sendBandwidthUpdate(new BandwidthUpdateC2SPayload(desiredRate));
+    }
+
+    public static void stopClientSessionForWorldShutdown() {
+        stopClientSession(true);
+    }
+
+    static void sendBatchRequest(BatchChunkRequestC2SPayload payload) {
+        VSSNetworking.sendToServer(payload);
+    }
+
+    static void sendCancelRequest(CancelRequestC2SPayload payload) {
+        VSSNetworking.sendToServer(payload);
+    }
+
+    static void sendRegionPresence(RegionPresenceC2SPayload payload) {
+        VSSNetworking.sendToServer(payload);
+    }
+
+    private static void sendBandwidthUpdate(BandwidthUpdateC2SPayload payload) {
+        try {
+            VSSNetworking.sendToServer(payload);
+        } catch (Exception e) {
+            VSSLogger.debug("Bandwidth preference send failed: " + e.getMessage());
+        }
+    }
+
+    private static void tryPendingHandshake() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.getConnection() == null || !shouldAttemptHandshake(
+                waitingForHandshake,
+                requestManager != null,
+                VSSClientConfig.CONFIG.receiveServerLods,
+                isClientWorldReady(),
+                VSSApi.hasVoxelConsumers())) {
+            return;
+        }
+
+        if (handshakeRetryTicks > 0) {
+            handshakeRetryTicks--;
+            return;
+        }
+
+        boolean sent = sendHandshake("Handshake send failed: ");
+        if (sent) {
+            if (!handshakeSent) {
+                VSSLogger.debug("VSS handshake sent; waiting for session config");
+            }
+            handshakeSent = true;
+            handshakeRetryTicks = HANDSHAKE_RETRY_INTERVAL_TICKS;
+        } else {
+            handshakeRetryTicks = HANDSHAKE_FAILED_RETRY_INTERVAL_TICKS;
+        }
+    }
+
+    private static void ensureHandshakePending() {
+        if (waitingForHandshake || handshakeSent || requestManager != null || serverEnabled || !VSSClientConfig.CONFIG.receiveServerLods) {
+            return;
+        }
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.getConnection() != null && isClientWorldReady()) {
+            waitingForHandshake = true;
+            handshakeRetryTicks = 0;
+        }
+    }
+
+    private static boolean sendHandshake(String failurePrefix) {
+        // Fabric send() accepts registered local payloads even when the remote
+        // server has no receiver. Wait for negotiated channel registration.
+        if (!net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.canSend(HandshakeC2SPayload.TYPE.id())) {
+            return false;
+        }
+        try {
+            int capabilities = clientCapabilities();
+            VSSNetworking.sendToServer(new HandshakeC2SPayload(VSSConstants.PROTOCOL_VERSION, capabilities));
+            PREDICTION_CAPABILITY_SYNC.sent(capabilities);
+            return true;
+        } catch (Exception e) {
+            VSSLogger.debug(failurePrefix + e.getMessage());
+            return false;
+        }
+    }
+
+    private static int clientCapabilities() {
+        int clientCaps = VSSApi.hasVoxelConsumers() ? VSSConstants.CAPABILITY_VOXEL_COLUMNS : 0;
+        clientCaps |= VSSConstants.CAPABILITY_QUEUED_ACKNOWLEDGEMENTS;
+        if (ModCompat.isVoxyLoaded()) clientCaps |= VSSConstants.CAPABILITY_STRICT_LOD_ORDER;
+        if (VSSClientConfig.CONFIG.enablePrediction) {
+            clientCaps |= VSSConstants.CAPABILITY_PREDICTIVE_WORLDGEN;
+        }
+        if (LodByteCompression.isZstdAvailable()) {
+            clientCaps |= VSSConstants.CAPABILITY_ZSTD_COLUMNS;
+        }
+        return clientCaps;
+    }
+
+    static boolean shouldAttemptHandshake(
+            boolean waiting,
+            boolean requestManagerPresent,
+            boolean receiveServerLods,
+            boolean worldReady,
+            boolean hasVoxelConsumers) {
+        return waiting
+                && !requestManagerPresent
+                && receiveServerLods
+                && worldReady
+                && hasVoxelConsumers;
+    }
+
+    private static boolean isClientWorldReady() {
+        Minecraft mc = Minecraft.getInstance();
+        ClientLevel level = mc.level;
+        LocalPlayer player = mc.player;
+        return level != null && player != null && !player.isRemoved();
+    }
+
+    private static void discardSession() {
+        stopClientSession(false);
+    }
+
+    private static void stopClientSession(boolean resetStats) {
+        dev.xantha.vss.client.prediction.PredictionTemplateRepository.reset();
+        WORLDGEN_ASSEMBLY.clear();
+        PREDICTION_CAPABILITY_SYNC.reset();
+        predictionOptionKnown = false;
+        lastPredictionActive = false;
+        dev.xantha.vss.compat.StrictLodVisibility.reset();
+        ClientPredictionState.clear();
+        ModCompat.onDisconnect();
+        LodRequestManager manager = requestManager;
+        requestManager = null;
+        serverEnabled = false;
+        serverLodDistance = 0;
+        serverCapabilities = 0;
+        sessionConfigRevision = 0L;
+        waitingForHandshake = false;
+        handshakeSent = false;
+        handshakeRetryTicks = 0;
+        if (manager != null) {
+            manager.disconnect();
+        }
+        ClientLodPresenceCache.flush();
+        FarPlayerClientRenderer.clear();
+        COLUMN_PROCESSOR.shutdown();
+        if (resetStats) {
+            COLUMN_PROCESSOR.resetStats();
+            columnsReceived.set(0);
+            bytesReceived.set(0);
+            lastColumnReceiveDiagnosticNanos = 0L;
+        }
+    }
+
+    private static void syncPredictionOption(LodRequestManager manager) {
+        boolean active = isPredictionActive();
+        if (!predictionOptionKnown) {
+            predictionOptionKnown = true;
+            lastPredictionActive = active;
+            return;
+        }
+        if (active == lastPredictionActive) {
+            return;
+        }
+        lastPredictionActive = active;
+        manager.onPredictionOptionChanged(active);
+        VSSLogger.debug("VSS prediction option changed at runtime: "
+                + (active ? "enabled; generation priority reset" : "disabled; near generation resumed"));
+    }
+
+    private static void logColumnReceive(VoxelColumnS2CPayload payload) {
+        if (!VSSLogger.isDebugEnabled()) {
+            return;
+        }
+        long now = System.nanoTime();
+        if (now - lastColumnReceiveDiagnosticNanos < COLUMN_RECEIVE_DIAGNOSTIC_INTERVAL_NANOS) {
+            return;
+        }
+        lastColumnReceiveDiagnosticNanos = now;
+        VSSLogger.debug("LOD columns received: total=" + columnsReceived.get()
+                + ", bytes=" + bytesReceived.get()
+                + ", queued=" + COLUMN_PROCESSOR.getQueuedCount()
+                + ", last=" + payload.chunkX() + "," + payload.chunkZ()
+                + ", sectionsBytes=" + payload.rawSectionBytesLength());
+    }
+}

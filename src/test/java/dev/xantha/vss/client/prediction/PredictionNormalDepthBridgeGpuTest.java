@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.lwjgl.glfw.GLFW.*;
 import static org.lwjgl.opengl.GL45C.*;
 
-import java.nio.charset.StandardCharsets;
 import java.util.regex.Pattern;
 import java.util.zip.ZipFile;
 import org.joml.Matrix4f;
@@ -138,10 +137,7 @@ class PredictionNormalDepthBridgeGpuTest {
         return texture;
     }
     private static String read(ZipFile jar, String id) throws Exception {
-        String[] parts = id.split(":", 2);
-        var entry = jar.getEntry("assets/" + parts[0] + "/shaders/" + parts[1]);
-        assertNotNull(entry, id);
-        return new String(jar.getInputStream(entry).readAllBytes(), StandardCharsets.UTF_8).replace("\r\n", "\n");
+        return dev.xantha.vss.testutil.VoxyShaderResources.read(jar, id);
     }
     private static String expand(ZipFile jar, String source) throws Exception {
         var matcher = Pattern.compile("#import <([^>]+)>").matcher(source);

@@ -1,0 +1,7 @@
+// Applied only to the pinned external Voxy source build, never to VSS itself.
+allprojects {
+    tasks.withType(AbstractArchiveTask).configureEach {
+        preserveFileTimestamps = false
+        reproducibleFileOrder = true
+    }
+}

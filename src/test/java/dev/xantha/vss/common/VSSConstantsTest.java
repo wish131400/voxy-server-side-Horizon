@@ -18,6 +18,8 @@ class VSSConstantsTest {
             case "26.1.2" -> 57;
             case "26.2" -> 58;
             case "26.3" -> 59;
+            case "1.21.1" -> 60;
+            case "1.20.1" -> 61;
             default -> throw new AssertionError("Unverified Minecraft target: " + target);
         };
         assertEquals(expectedProtocol, VSSConstants.PROTOCOL_VERSION);

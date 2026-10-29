@@ -84,6 +84,6 @@ if __name__ == "__main__":
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--timeout", type=int, default=240)
     parser.add_argument("--minecraft", default="1.21.11",
-                        choices=["1.21.11", "26.1", "26.1.1", "26.1.2", "26.2", "26.3"])
+                        choices=["1.21.11", "26.1", "26.1.1", "26.1.2", "26.2", "26.3", "1.21.1", "1.20.1"])
     options = parser.parse_args()
     run(options.root.resolve(), options.timeout, options.minecraft)

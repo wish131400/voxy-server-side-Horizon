@@ -24,6 +24,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - minecraft: '1.20.1'
+            java: '21'
+            package_task: remapJar
+          - minecraft: '1.21.1'
+            java: '21'
+            package_task: remapJar
           - minecraft: '1.21.11'
             java: '21'
             package_task: remapJar
@@ -45,6 +51,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
+        if: matrix.minecraft == '1.20.1'
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
@@ -52,6 +63,13 @@ jobs:
         with:
           python-version: '3.12'
       - uses: gradle/actions/setup-gradle@v4
+      - name: Expose both Java runtimes to Gradle toolchains
+        if: matrix.minecraft == '1.20.1'
+        run: |
+          test -x "$JAVA_HOME_17_X64/bin/java"
+          test -x "$JAVA_HOME/bin/java"
+          mkdir -p "${GRADLE_USER_HOME:-$HOME/.gradle}"
+          printf '%s\n' 'org.gradle.java.installations.fromEnv=JAVA_HOME_17_X64,JAVA_HOME' >> "${GRADLE_USER_HOME:-$HOME/.gradle}/gradle.properties"
       - name: Download pinned bytecode contract inputs
         id: mods
         run: python tools/verification/fetch_compat_mods.py --minecraft '${{ matrix.minecraft }}' --github-output

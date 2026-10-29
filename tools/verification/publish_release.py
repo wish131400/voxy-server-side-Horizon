@@ -38,10 +38,17 @@ def publish(source, build_id, targets):
             output.write(staging / "source-snapshot.json", "source-snapshot.json")
             output.write(source / "LICENSE", "LICENSE")
             output.write(source / "README.md", "README.md")
+        # List the selected targets in their requested order, followed by the
+        # completed ZIP. Keep this table outside the ZIP to avoid self-reference.
+        checksums = staging / "SHA256SUMS.txt"
+        checksums.write_text("".join(
+            hashlib.sha256(path.read_bytes()).hexdigest() + "  " + path.name + "\n"
+            for path in [*jars, bundle]), encoding="utf-8")
         import shutil
-        for path in [*jars, bundle, staging / "manifest.json", staging / "source-snapshot.json"]:
+        for path in [*jars, bundle, checksums, staging / "manifest.json", staging / "source-snapshot.json"]:
             shutil.copy2(path, archive_dir / path.name)
         bundle.replace(source / "lib" / bundle.name)
+        checksums.replace(source / "lib" / checksums.name)
         (staging / "manifest.json").replace(source / "lib" / "manifest.json")
         (staging / "source-snapshot.json").replace(source / "lib" / "source-snapshot.json")
     print(json.dumps(manifest, indent=2))
@@ -51,7 +58,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--build-id", required=True)
-    parser.add_argument("--minecraft", action="append", choices=["1.21.11", "26.1", "26.1.1", "26.1.2", "26.2", "26.3"])
+    parser.add_argument("--minecraft", action="append", choices=["1.21.11", "26.1", "26.1.1", "26.1.2", "26.2", "26.3", "1.21.1", "1.20.1"])
     args = parser.parse_args()
     if not args.build_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for c in args.build_id):
         parser.error("Build ID must be a simple directory name")

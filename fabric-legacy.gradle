@@ -1,0 +1,176 @@
+plugins {
+    id 'fabric-loom' version '1.16.3'
+    id 'maven-publish'
+}
+
+apply from: 'gradle/minecraft-targets.gradle'
+ext.minecraft_version = selectedMinecraft
+ext.java_version = selectedTarget.java.toString()
+ext.fabric_version = selectedTarget.api
+if (selectedMinecraft == '1.20.1') {
+    // Preserve Minecraft 1.20.1's LWJGL 3.3.1 Java/native pair. Loom otherwise
+    // upgrades it for the Gradle JVM, which Sodium 0.5.13 correctly rejects.
+    // The community Voxy client still launches on Java 21 below; this setting
+    // controls library compatibility and leaves Sodium's runtime checks intact.
+    ext['fabric.loom.runtimeJavaCompatibilityVersion'] = selectedTarget.java
+}
+layout.buildDirectory = layout.projectDirectory.dir('build/' + selectedMinecraft)
+version = "${vss_version}-fabric-${selectedMinecraft}"
+group = mod_group_id
+base { archivesName = 'vss' }
+
+repositories {
+    mavenCentral()
+    exclusiveContent {
+        forRepository { maven { name = 'Modrinth'; url = 'https://api.modrinth.com/maven' } }
+        filter { includeGroup 'maven.modrinth' }
+    }
+}
+
+// Legacy Fabric targets use their own Mojang-to-intermediary production mapping.
+dependencies {
+    minecraft "com.mojang:minecraft:${selectedMinecraft}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${selectedTarget.api}"
+    modCompileOnly "maven.modrinth:modmenu:${selectedTarget.menu}"
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testImplementation 'org.mockito:mockito-core:5.23.0'
+    testImplementation 'com.tngtech.archunit:archunit:1.4.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+}
+
+def overlays = selectedTarget.overlays.collect { file('src/versions/' + it) }.reverse()
+def wireSources = layout.buildDirectory.dir('generated/wire-format')
+def generateWireFormat = tasks.register('generateWireFormat') {
+    def template = file('src/main/java/dev/xantha/vss/common/VSSWireFormat.java')
+    inputs.file(template)
+    inputs.properties(protocol: selectedTarget.protocol, columnSchema: selectedTarget.columnSchema)
+    outputs.dir(wireSources)
+    doLast {
+        def output = wireSources.get().file('dev/xantha/vss/common/VSSWireFormat.java').asFile
+        output.parentFile.mkdirs()
+        output.setText(template.getText('UTF-8')
+                .replace('PROTOCOL_VERSION = 54', 'PROTOCOL_VERSION = ' + selectedTarget.protocol)
+                .replace('COLUMN_SCHEMA = 6', 'COLUMN_SCHEMA = ' + selectedTarget.columnSchema), 'UTF-8')
+    }
+}
+def activeWidener = (overlays.collect { new File(it, 'resources/vss.accesswidener') }
+        + [file('src/main/resources/vss.accesswidener')]).find { it.isFile() }
+loom {
+    accessWidenerPath = activeWidener
+    runs {
+        client { client(); runDir 'run/client-' + selectedMinecraft }
+        server { server(); runDir providers.gradleProperty('serverRunDir').getOrElse('run/server-' + selectedMinecraft); programArgs '--nogui' }
+    }
+}
+
+// Select one complete implementation per class, with the most specific version first.
+['main': 'java', 'test': 'test'].each { setName, overlayDirectory ->
+    def excluded = overlays.collect { new File(it, 'excluded-' + setName + '.txt') }
+            .findAll { it.isFile() }.collectMany { it.readLines('UTF-8') }
+            .collect { it.trim() }.findAll { it && !it.startsWith('#') }
+    def destination = layout.buildDirectory.dir('generated/sources/' + setName)
+    def assemble = tasks.register('assemble' + setName.capitalize() + 'Sources', Sync) {
+        if (setName == 'main') {
+            dependsOn generateWireFormat
+            from(wireSources)
+        }
+        overlays.each { from(new File(it, overlayDirectory)) { exclude excluded } }
+        from('src/' + setName + '/java') { exclude excluded }
+        into(destination)
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+        // A class rename only; semantic API changes remain explicit version implementations.
+        filteringCharset = 'UTF-8'
+        filter { line ->
+            def mapped = line.replaceAll('\\bIdentifier\\b', 'ResourceLocation')
+                .replace('.identifier()', '.location()')
+                .replace('getGameProfile().name()', 'getGameProfile().getName()')
+                .replace('getMinSectionY()', 'getMinSection()')
+                .replace('readIdentifier(', 'readResourceLocation(')
+                .replace('writeIdentifier(', 'writeResourceLocation(')
+            if (selectedMinecraft == '1.20.1') mapped = mapped
+                .replace('net.minecraft.resources.ResourceLocation.parse(', 'new net.minecraft.resources.ResourceLocation(')
+                .replace('net.minecraft.resources.ResourceLocation.withDefaultNamespace(', 'new net.minecraft.resources.ResourceLocation(')
+                .replace('net.minecraft.resources.ResourceLocation.fromNamespaceAndPath(', 'new net.minecraft.resources.ResourceLocation(')
+                .replace('ResourceLocation.parse(', 'new ResourceLocation(')
+                .replace('ResourceLocation.withDefaultNamespace(', 'new ResourceLocation(')
+                .replace('ResourceLocation.fromNamespaceAndPath(', 'new ResourceLocation(')
+            mapped
+        }
+    }
+    sourceSets[setName].java.setSrcDirs([destination])
+    tasks.named(setName == 'main' ? 'compileJava' : 'compileTestJava').configure { dependsOn assemble }
+}
+
+sourceSets.main.resources.setSrcDirs(overlays.collect { new File(it, 'resources') } + [file('src/main/resources')])
+tasks.named('processResources', ProcessResources).configure {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    inputs.properties(version: project.version, minecraft_version: selectedMinecraft,
+            loader_version: loader_version, fabric_version: selectedTarget.api, java_version: java_version)
+    filesMatching('fabric.mod.json') {
+        expand(version: project.version, minecraft_version: selectedMinecraft,
+                loader_version: loader_version, fabric_version: selectedTarget.api, java_version: java_version)
+    }
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(selectedTarget.java)
+    withSourcesJar()
+}
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = selectedTarget.java
+    options.compilerArgs += ['-Xmaxerrs', '1500']
+}
+tasks.named('jar', Jar).configure {
+    from('LICENSE') { rename { 'LICENSE_vss' } }
+    def productionInputs = files(fileTree('src/main'), fileTree('src/versions'),
+            'build.gradle', 'fabric-next.gradle', 'fabric-legacy.gradle', 'settings.gradle', 'gradle.properties', 'gradle/minecraft-targets.gradle')
+    inputs.files(productionInputs)
+    doFirst {
+        def digest = java.security.MessageDigest.getInstance('SHA-256')
+        productionInputs.files.findAll { it.isFile() }.sort { a, b ->
+            relativePath(a).replace('\\', '/') <=> relativePath(b).replace('\\', '/')
+        }.each { input ->
+            digest.update(relativePath(input).replace('\\', '/').getBytes('UTF-8'))
+            digest.update((byte) 0)
+            digest.update(input.bytes)
+            digest.update((byte) 0)
+        }
+        manifest.attributes('VSS-Source-SHA256': java.util.HexFormat.of().formatHex(digest.digest()))
+    }
+    manifest.attributes('Specification-Title': 'vss', 'Specification-Vendor': 'Xantha',
+            'Implementation-Title': project.name, 'Implementation-Version': project.version,
+            'VSS-Build-Id': providers.gradleProperty('vssBuildId').getOrElse('dev'),
+            'VSS-Source-Baseline': '9fc910393ad5b1fac35d69393adab26ffdf77e74',
+            'VSS-Platform': 'fabric', 'VSS-Minecraft': selectedMinecraft,
+            'VSS-Protocol': selectedTarget.protocol,
+            'VSS-Column-Schema': selectedTarget.columnSchema)
+}
+tasks.named('remapJar').configure {
+    destinationDirectory = layout.projectDirectory.dir('lib')
+}
+
+tasks.withType(Test).configureEach {
+    // The pinned community Voxy 1.20.1 dependency itself uses Java 21.
+    // VSS production classes and the dedicated server remain Java 17.
+    if (selectedMinecraft == '1.20.1') {
+        javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(21) }
+    }
+    systemProperty 'vss.minecraftTarget', selectedMinecraft
+    useJUnitPlatform()
+    testLogging { events 'failed', 'skipped'; exceptionFormat 'full' }
+}
+
+tasks.withType(JavaExec).matching { it.name in ['runClient', 'runClientSmoke'] }.configureEach {
+    if (selectedMinecraft == '1.20.1') {
+        javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(21) }
+    }
+}
+tasks.named('runServer', JavaExec).configure { standardInput = System.in }
+apply from: 'tools/prediction/compat-tests.gradle'
+apply from: 'tools/verification/modules.gradle'
+apply from: 'tools/verification/fabric-contracts.gradle'
+apply from: 'tools/verification/client-smoke.gradle'

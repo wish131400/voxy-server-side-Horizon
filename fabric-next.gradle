@@ -110,7 +110,7 @@ tasks.named('jar', Jar).configure {
     destinationDirectory = layout.projectDirectory.dir('lib')
     from('LICENSE') { rename { 'LICENSE_vss' } }
     def productionInputs = files(fileTree('src/main'), fileTree('src/versions'),
-            'build.gradle', 'fabric-next.gradle', 'settings.gradle', 'gradle.properties', 'gradle/minecraft-targets.gradle')
+            'build.gradle', 'fabric-next.gradle', 'fabric-legacy.gradle', 'settings.gradle', 'gradle.properties', 'gradle/minecraft-targets.gradle')
     inputs.files(productionInputs)
     doFirst {
         def digest = java.security.MessageDigest.getInstance('SHA-256')

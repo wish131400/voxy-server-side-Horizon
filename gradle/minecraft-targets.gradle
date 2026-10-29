@@ -4,7 +4,9 @@ ext.minecraftTargets = [
     '26.1.1':  [java: 25, api: '0.145.4+26.1.1', menu: '18.0.2', overlays: ['mc26']],
     '26.1.2':  [java: 25, api: '0.155.3+26.1.2', menu: '18.0.2', overlays: ['mc26']],
     '26.2':    [java: 25, api: '0.161.0+26.2', menu: '20.0.3', overlays: ['mc26', 'mc262']],
-    '26.3':    [java: 25, api: '0.165.0+26.3', menu: '21.0.0', overlays: ['mc26', 'mc262', 'mc263']]
+    '26.3':    [java: 25, api: '0.165.0+26.3', menu: '21.0.0', overlays: ['mc26', 'mc262', 'mc263']],
+    '1.21.1':  [java: 21, api: '0.116.17+1.21.1', menu: '11.0.3', overlays: ['mc121']],
+    '1.20.1':  [java: 17, api: '0.92.12+1.20.1', menu: '7.2.2', overlays: ['mc120']]
 ]
 ext.selectedMinecraft = providers.gradleProperty('mcTarget').getOrElse('1.21.11')
 if (!minecraftTargets.containsKey(selectedMinecraft)) {

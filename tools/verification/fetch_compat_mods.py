@@ -5,9 +5,12 @@ import json
 import os
 from pathlib import Path
 from urllib.request import Request, urlopen
+import zipfile
 
 
 RELEASES = {
+    "1.20.1": {"iris": "s5eFLITc", "sodium": "OihdIimA"},
+    "1.21.1": {"iris": "zsoi0dso", "sodium": "u1OEbNKx"},
     "1.21.11": {"voxy": "H3w2nVdU", "iris": "ka9PDlsN", "sodium": "NFkjnzWE"},
     "26.1": {"voxy": "tIs0IXaN", "iris": "MwcLS51S", "sodium": "uGvVQBnw"},
     "26.1.1": {"voxy": "tIs0IXaN", "iris": "MwcLS51S", "sodium": "uGvVQBnw"},
@@ -16,10 +19,49 @@ RELEASES = {
     "26.3": {"voxy": "iIrM8ZKQ", "iris": "vTN4NRGW", "sodium": "g6ju16VJ"},
 }
 
+LEGACY_VOXY = {
+    "filename": "voxy-0.2.14-alpha-1.20.1.jar",
+    "url": "https://api.github.com/repos/DA-57EVE/voxy-1.20.1-Fabric/releases/assets/454557570",
+    "sha256": "0ba8f7d29195146d70a3373271b53f68a94803d2d8c31ca9e64ca2b305b5638b",
+    "release": "https://github.com/DA-57EVE/voxy-1.20.1-Fabric/releases/tag/mod",
+    "commit": "69b19feebf377dd2b6024398f66a6b36cc2515cc",
+}
+
+
+def fetch_legacy_voxy(destination):
+    path = destination / LEGACY_VOXY["filename"]
+    expected = LEGACY_VOXY["sha256"]
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        request = Request(LEGACY_VOXY["url"], headers={
+            "User-Agent": "VSS-Horizon/Fabric-validation", "Accept": "application/octet-stream"})
+        with urlopen(request, timeout=120) as response:
+            data = response.read()
+        if hashlib.sha256(data).hexdigest() != expected:
+            raise ValueError("Pinned Fabric 1.20.1 Voxy checksum mismatch")
+        path.write_bytes(data)
+    with zipfile.ZipFile(path) as jar:
+        metadata = json.loads(jar.read("fabric.mod.json"))
+        if metadata.get("id") != "voxy" or metadata.get("depends", {}).get("minecraft") != ["1.20.1"]:
+            raise ValueError("Pinned community Voxy has the wrong Minecraft target")
+        if metadata.get("custom", {}).get("commit") != LEGACY_VOXY["commit"]:
+            raise ValueError("Pinned community Voxy has the wrong source commit")
+        major = int.from_bytes(jar.read("me/cortex/voxy/client/core/VoxyRenderSystem.class")[6:8], "big")
+        if major != 65:
+            raise ValueError("Pinned community Voxy has the wrong Java class version")
+    return dict(LEGACY_VOXY, kind="github-release", java=21, published=True,
+                sha512=hashlib.sha512(path.read_bytes()).hexdigest())
+
 
 def fetch(minecraft, destination, github_output=False):
     destination.mkdir(parents=True, exist_ok=True)
     result = {}
+    if minecraft == "1.20.1":
+        result["voxy"] = fetch_legacy_voxy(destination)
+        print("voxy: " + str(destination / result["voxy"]["filename"]))
+    elif minecraft == "1.21.1":
+        from build_legacy_voxy import build
+        result["voxy"] = build(destination)
+        print("voxy: " + str(destination / result["voxy"]["filename"]))
     for mod, release in RELEASES[minecraft].items():
         request = Request("https://api.modrinth.com/v2/version/" + release,
                           headers={"User-Agent": "VSS-Horizon/Fabric-validation"})
