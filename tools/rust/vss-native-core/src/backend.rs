@@ -232,6 +232,12 @@ pub struct World {
     work: [std::sync::atomic::AtomicU64; 2],
 }
 impl World {
+    /// The vanilla placement context clamps the level and chunk-generator
+    /// bounds without shrinking the level's feature edit space.
+    pub(crate) fn generation_bounds(&self) -> (i32, i32) {
+        (self.decoration_min_y.max(self.terrain.min_y),
+            self.decoration_height.min(self.terrain.height))
+    }
     /// Whether biome selection replays TerraBlender positional regions. The
     /// JNI describe() reports this so the Java side only trusts native
     /// surface materials when the routing was actually compiled in.
@@ -400,6 +406,8 @@ impl World {
             ],
             self.palette.clone(),
         )?;
+        world.generation_bounds = self.generation_bounds();
+        world.generator_depth = t.height;
         // All base columns precede the surface pass. This preserves the height
         // context and avoids a feature querying partially generated neighbours.
         for cx in 0..side {
@@ -1313,6 +1321,8 @@ impl World {
             [cx * 16 + 32, self.decoration_min_y + self.decoration_height, cz * 16 + 32],
         ));
         volume.proxy_base_bounds(t.min_y, t.height);
+        volume.generation_bounds = self.generation_bounds();
+        volume.generator_depth = t.height;
         volume.write_budget = 65536;
         Ok(volume)
     }
@@ -1335,6 +1345,8 @@ impl World {
             [cx * 16 + 32, self.decoration_min_y + self.decoration_height, cz * 16 + 32],
         ));
         volume.proxy_base_bounds(t.min_y, t.height);
+        volume.generation_bounds = self.generation_bounds();
+        volume.generator_depth = t.height;
         volume.write_budget = 65536;
         Ok(volume)
     }
@@ -1360,6 +1372,8 @@ impl World {
         volume.write_bounds = Some(([cx*16-16,self.decoration_min_y,cz*16-16],
             [cx*16+32,self.decoration_min_y+self.decoration_height,cz*16+32]));
         volume.proxy_base_bounds(t.min_y, t.height);
+        volume.generation_bounds = self.generation_bounds();
+        volume.generator_depth = t.height;
         volume.write_budget = 65536;
         Ok(volume)
     }

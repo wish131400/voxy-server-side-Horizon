@@ -666,6 +666,8 @@ pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend
             [width as usize, height as usize, depth as usize],
             owner.palette.clone(),
         )?;
+        volume.generation_bounds = owner.generation_bounds();
+        volume.generator_depth = owner.terrain.height;
         let bytes = volume.blocks.len() * 4;
         let ptr = buffer(&mut e, &blocks, bytes, false)?;
         let input = unsafe { std::slice::from_raw_parts(ptr, bytes) };

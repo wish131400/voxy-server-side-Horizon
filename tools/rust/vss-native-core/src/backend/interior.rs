@@ -110,6 +110,8 @@ impl World {
             [cx * 16 + 32, self.decoration_min_y + self.decoration_height, cz * 16 + 32],
         ));
         v.proxy_base_bounds(t.min_y, t.height);
+        v.generation_bounds = self.generation_bounds();
+        v.generator_depth = t.height;
         v.write_budget = 65536;
         Ok(v)
     }

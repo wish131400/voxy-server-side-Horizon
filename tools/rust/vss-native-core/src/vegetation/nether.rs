@@ -21,8 +21,8 @@ impl Anchor {
     fn resolve(&self, w: &Volume) -> i32 {
         match *self {
             Self::Absolute(y) => y,
-            Self::Bottom(y) => w.origin[1] + y,
-            Self::Top(y) => w.origin[1] + w.size[1] as i32 - 1 - y,
+            Self::Bottom(y) => w.generation_bounds.0 + y,
+            Self::Top(y) => w.generation_bounds.0 + w.generation_bounds.1 - 1 - y,
         }
     }
 }
@@ -226,7 +226,7 @@ impl NetherFeature {
                 if r.next_bounded(12) == 0 {
                     height *= 2;
                 }
-                if !planted && p[1] + height + 1 >= w.size[1] as i32 {
+                if !planted && p[1] + height + 1 >= w.generator_depth {
                     return Ok(false);
                 }
                 let huge = !*planted && r.next_float() < 0.06;

@@ -134,3 +134,89 @@ fn dimension_write_height_is_independent_of_noise_height() {
     assert_eq!(air,surface.get([1,-1,1]));assert_eq!(air,surface.get([1,160,1]));
     surface.set([1,160,1],rock);assert_eq!(rock,surface.get([1,160,1]));
 }
+
+#[test]
+fn placement_anchors_follow_generator_context_without_clipping_dimension_edits() {
+    use vss_native_core::{random::Random, vegetation::{Placed, PlacementContext}};
+    // WorldGenerationContext uses max(minY) and min(height), rather than
+    // either the noise-column range or the dimension's full build range.
+    for (dimension_min, dimension_height, gen_min, gen_height) in
+        [(-16,288,0,128), (32,64,32,64)] {
+        let mut doc=document();
+        // Legacy golden metadata predates the unconditional survival field;
+        // stone has no contextual canSurvive override in the target game.
+        doc["block_definitions"]["minecraft:stone"]["survival"]=json!("none");
+        doc["vss_dimension_bounds"]=json!({"min_y":dimension_min,"height":dimension_height});
+        let world=Arc::new(World::new(42,0,doc).unwrap());
+        let mut volume=world.interior_proxy(0,0).unwrap();
+        assert_eq!(volume.generation_bounds,(gen_min,gen_height));
+        assert_eq!(volume.generator_depth,128);
+        assert_eq!(world.decoration_proxy(0,0,false).unwrap().generation_bounds,(gen_min,gen_height));
+        assert_eq!(world.lazy_surface_proxy(0,0).unwrap().generation_bounds,(gen_min,gen_height));
+        for (anchor, expected) in [
+            (json!({"above_bottom":4}), gen_min+4),
+            (json!({"below_top":4}), gen_min+gen_height-5),
+            (json!({"absolute":dimension_min+dimension_height-8}),dimension_min+dimension_height-8),
+        ] {
+            let placed=Placed::compile(&json!({
+                "feature":{"type":"minecraft:simple_block","config":{
+                    "to_place":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:stone"}}}},
+                "placement":[{"type":"minecraft:height_range","height":{"type":"minecraft:constant","value":anchor}}]
+            }),&world.document,&mut volume.palette).unwrap();
+            let mut allow=|_: &str,_|true;
+            let mut context=PlacementContext::new("anchor-test",&mut allow);
+            placed.place_transaction(&mut volume,&mut Random::new(42,3),[0,0,0],&mut context).unwrap();
+            let state=volume.get([0,expected,0]);
+            assert!(volume.palette.is(state,"minecraft:stone"),"anchor={anchor} expected Y={expected}");
+        }
+        assert!(!volume.incomplete);
+    }
+}
+
+#[test]
+fn huge_fungus_uses_raw_generator_depth_and_preserves_rejected_random_continuation() {
+    use vss_native_core::{random::Random, vegetation::{Feature, PlacementContext}};
+    let mut doc=document();doc["vss_dimension_bounds"]=json!({"min_y":-16,"height":288});
+    let world=Arc::new(World::new(42,0,doc).unwrap());
+    let mut volume=world.interior_proxy(0,0).unwrap();
+    let feature=Feature::compile(&json!({"type":"minecraft:huge_fungus","config":{
+        "valid_base_block":{"Name":"minecraft:crimson_nylium"},
+        "stem_state":{"Name":"minecraft:crimson_stem"},
+        "hat_state":{"Name":"minecraft:nether_wart_block"},
+        "decor_state":{"Name":"minecraft:shroomlight"},
+        "planted":false,
+        "replaceable_blocks":{"type":"minecraft:matching_blocks","blocks":["minecraft:air"]}
+    }}),&world.document,&mut volume.palette).unwrap();
+    let base=volume.palette.named("minecraft:crimson_nylium").unwrap();
+    volume.set([0,124,0],base);
+    for seed in 0..32 {
+        let mut random=Random::new(seed,3);let mut oracle=random.clone();
+        oracle.next_bounded(10);oracle.next_bounded(12);
+        let mut allow=|_: &str,_|true;let mut context=PlacementContext::new("fungus-ceiling",&mut allow);
+        assert!(!feature.place_transaction(&mut volume,&mut random,[0,125,0],&mut context).unwrap());
+        assert_eq!(random.next_long(),oracle.next_long(),"seed={seed}");
+    }
+}
+
+#[test]
+fn nether_uniform_anchor_preserves_height_and_random_continuation_in_a_taller_dimension() {
+    use vss_native_core::{random::Random, vegetation::{Placed, PlacementContext}};
+    let mut doc=document();doc["vss_dimension_bounds"]=json!({"min_y":0,"height":256});
+    doc["block_definitions"]["minecraft:stone"]["survival"]=json!("none");
+    let world=Arc::new(World::new(42,0,doc).unwrap());
+    let mut volume=world.interior_proxy(0,0).unwrap();
+    let placed=Placed::compile(&json!({
+        "feature":{"type":"minecraft:simple_block","config":{
+            "to_place":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:stone"}}}},
+        "placement":[{"type":"minecraft:height_range","height":{"type":"minecraft:uniform",
+            "min_inclusive":{"above_bottom":0},"max_inclusive":{"below_top":0}}}]
+    }),&world.document,&mut volume.palette).unwrap();
+    for seed in 0..64 {
+        let mut random=Random::new(seed,3);let mut oracle=random.clone();
+        let y=oracle.next_bounded(128);
+        let mut allow=|_: &str,_|true;let mut context=PlacementContext::new("glowstone-height",&mut allow);
+        placed.place_transaction(&mut volume,&mut random,[0,0,0],&mut context).unwrap();
+        let state=volume.get([0,y,0]);assert!(volume.palette.is(state,"minecraft:stone"));
+        assert_eq!(random.next_long(),oracle.next_long(),"seed={seed}");
+    }
+}

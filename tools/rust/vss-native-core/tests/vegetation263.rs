@@ -22,6 +22,13 @@ fn rows(name: &str) -> Vec<Value> {
 }
 #[test]
 fn actual_modern_provider_states_nulls_and_random_continuation() {
+    provider_golden(false);
+}
+#[test]
+fn pre_modern_rule_based_provider_alias_matches_states_nulls_and_random_continuation() {
+    provider_golden(true);
+}
+fn provider_golden(legacy_alias: bool) {
     let doc = read("features.json");
     let states = read("vegetation-states.json");
     let mut palette = Palette::from_json(&doc["block_definitions"]).unwrap();
@@ -32,7 +39,8 @@ fn actual_modern_provider_states_nulls_and_random_continuation() {
         .map(|v| palette.intern(v).unwrap())
         .collect();
     let mut count = 0;
-    for row in rows("providers.jsonl") {
+    for mut row in rows("providers.jsonl") {
+        if legacy_alias { legacy_provider_types(&mut row["provider"]); }
         let provider =
             StateProvider::parse_with_registries(&row["provider"], &doc, &mut palette).unwrap();
         let seed: i64 = row["seed"].as_str().unwrap().parse().unwrap();
@@ -72,6 +80,16 @@ fn actual_modern_provider_states_nulls_and_random_continuation() {
         count += 1;
     }
     assert_eq!(count, 960);
+}
+fn legacy_provider_types(value: &mut Value) {
+    if value.get("type").and_then(Value::as_str) == Some("minecraft:rule_based") {
+        value["type"] = Value::String("minecraft:rule_based_state_provider".into());
+    }
+    match value {
+        Value::Object(fields) => fields.values_mut().for_each(legacy_provider_types),
+        Value::Array(values) => values.iter_mut().for_each(legacy_provider_types),
+        _ => {}
+    }
 }
 #[test]
 fn actual_modern_nether_features_match_voxels_and_random_continuation() {

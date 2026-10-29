@@ -263,7 +263,7 @@ impl StateProvider {
                 p,
                 depth + 1,
             )?)),
-            "rule_based" => {
+            "rule_based" | "rule_based_state_provider" => {
                 let rules = v["rules"]
                     .as_array()
                     .ok_or("missing state provider rules")?

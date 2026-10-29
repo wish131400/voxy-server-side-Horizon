@@ -416,6 +416,11 @@ impl ProxyBase {
 pub struct Volume {
     pub origin: Pos,
     pub size: [usize; 3],
+    /// WorldGenerationContext bounds, independent of the level's writable
+    /// volume and the immutable noise-column range (Nether: 128 vs 256).
+    pub generation_bounds: (i32, i32),
+    /// Raw ChunkGenerator.getGenDepth(), which huge fungi query directly.
+    pub generator_depth: i32,
     /// Dense storage. Empty while `proxy` is set; call `materialize` before any
     /// path that reads this field directly.
     pub blocks: Vec<StateId>,
@@ -461,6 +466,8 @@ impl Volume {
         Ok(Self {
             origin,
             size,
+            generation_bounds: (origin[1], size[1] as i32),
+            generator_depth: size[1] as i32,
             blocks: vec![palette.air; cells],
             palette,
             incomplete: false,
@@ -515,6 +522,8 @@ impl Volume {
         let mut volume = Self {
             origin,
             size,
+            generation_bounds: (origin[1], size[1] as i32),
+            generator_depth: size[1] as i32,
             blocks: Vec::new(),
             palette,
             incomplete: false,

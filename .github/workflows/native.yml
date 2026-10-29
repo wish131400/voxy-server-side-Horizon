@@ -50,8 +50,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify native algorithms
         run: cargo test --locked --release --lib
-      - name: Compare legacy and modern vegetation against Minecraft references
-        run: cargo test --locked --release --test vegetation --test vegetation263
+      - name: Verify decoration bounds and compare vegetation against Minecraft references
+        run: cargo test --locked --release --test interior --test vegetation --test vegetation263
       - name: Build production library
         if: runner.os != 'Linux'
         run: cargo build --locked --release --lib
