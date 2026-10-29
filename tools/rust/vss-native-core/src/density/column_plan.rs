@@ -42,6 +42,7 @@ impl ColumnPlan {
                 Node::Shifted(_, _, scale, shifts) | Node::FastNoise(_, _, scale, shifts) => {
                     *scale != 0. || shifts.iter().any(|n| dependent[*n])
                 }
+                Node::TectonicNoise { shifts, .. } => shifts.iter().any(|n| dependent[*n]),
                 Node::Unary(_, n) | Node::Clamp(n, _, _) | Node::FtfUnit(n, _) => dependent[*n],
                 Node::Binary(_, a, b) => dependent[*a] || dependent[*b],
                 Node::Range(a, _, _, b, c) | Node::Mix(a, b, c) => {

@@ -84,6 +84,14 @@ enum Node {
     Noise(usize, f64, f64),
     Shift(usize, u8),
     Shifted(usize, f64, f64, [Id; 3]),
+    TectonicNoise {
+        noise: usize,
+        shifts: [Id; 2],
+        scale: f64,
+        multiplier: f64,
+        offset: f64,
+        smoother: bool,
+    },
     Weird(usize, Id, bool),
     Blended(Box<BlendedNoise>),
     End(Box<SimplexNoise>),
@@ -517,6 +525,7 @@ impl Graph {
                 Node::Shifted(_, _, scale, shifts) => {
                     *scale != 0. || shifts.iter().any(|id| dependencies[*id])
                 }
+                Node::TectonicNoise { shifts, .. } => shifts.iter().any(|id| dependencies[*id]),
                 Node::Unary(_, id) | Node::Clamp(id, _, _) => dependencies[*id],
                 Node::Binary(_, a, b) => dependencies[*a] || dependencies[*b],
                 Node::Range(input, _, _, yes, no) => {
@@ -1351,6 +1360,28 @@ impl Graph {
                 y as f64 * b + ev(shifts[1], s),
                 z as f64 * a + ev(shifts[2], s),
             ),
+            Node::TectonicNoise {
+                noise,
+                shifts,
+                scale,
+                multiplier,
+                offset,
+                smoother,
+            } => {
+                let shift_x = ev(shifts[0], s);
+                let nx = if *smoother {
+                    (x as f64 + shift_x) * scale
+                } else {
+                    x as f64 * scale + shift_x
+                };
+                let shift_z = ev(shifts[1], s);
+                let nz = if *smoother {
+                    (z as f64 + shift_z) * scale
+                } else {
+                    z as f64 * scale + shift_z
+                };
+                self.noise(*noise, nx, 0., nz) * multiplier + offset
+            }
             Node::Weird(n, input, two) => {
                 let v = ev(*input, s);
                 let r = if *two {
@@ -1836,6 +1867,17 @@ impl Builder<'_> {
                 "tectonic:invert" | "invert" => {
                     Node::Unary(Unary::Reciprocal, self.parse(&v["argument"])?)
                 }
+                "vss:tectonic_config_noise" => Node::TectonicNoise {
+                    noise: self.graph.registered_noise(string(v, "noise")?, self.doc)?,
+                    shifts: [self.parse(&v["shift_x"])?, self.parse(&v["shift_z"])?],
+                    scale: number(v, "scale")?,
+                    multiplier: number(v, "multiplier")?,
+                    offset: number(v, "offset")?,
+                    smoother: v
+                        .get("smoother_scaling")
+                        .and_then(Value::as_bool)
+                        .ok_or("missing smoother_scaling flag")?,
+                },
                 "lithostitched:sin"
                 | "lithostitched:cos"
                 | "lithostitched:sqrt"
@@ -2238,6 +2280,58 @@ mod reciprocal_tests {
                 (1.0 / value).to_bits(),
                 unary(Unary::Reciprocal, value).to_bits()
             );
+        }
+    }
+}
+#[cfg(test)]
+mod tectonic_config_tests {
+    use super::*;
+
+    #[test]
+    fn applied_config_retains_shift_then_scale_with_vertical_dependencies() {
+        for smoother in [false, true] {
+            let document = serde_json::json!({"noises":{"vss:test":{"firstOctave":-3,"amplitudes":[1.,0.25,0.5]}},
+            "settings":{"legacy_random_source":false,"noise_router":{"final_density":{
+                "type":"vss:tectonic_config_noise","noise":"vss:test",
+                "shift_x":{"type":"minecraft:y_clamped_gradient","from_y":-16,"to_y":16,"from_value":-1.,"to_value":1.},
+                "shift_z":-0.375,"scale":0.13,"multiplier":-1.25,"offset":0.375,"smoother_scaling":smoother
+            }}}});
+            let graph = Graph::from_document(731, &document).unwrap();
+            let root = graph.root("final_density").unwrap();
+            assert_eq!(
+                graph.column_plan.slots[root],
+                column_plan::NONE,
+                "Y-dependent shifts must not be cached as one horizontal value"
+            );
+            let mut random = graph.random.from_hash("vss:test");
+            let noise = NormalNoise::new(&mut random, -3, &[1., 0.25, 0.5], false).unwrap();
+            let points: Vec<_> = [-29_999_999, -17, 0, 1, 29_999_999]
+                .into_iter()
+                .flat_map(|x| [-16, -1, 0, 1, 16].into_iter().map(move |y| [x, y, -x]))
+                .collect();
+            let mut scratch = graph.scratch(-32, 0, 4, 8).unwrap();
+            let batch = graph.fill_array(root, &points, Mode::Cell, &mut scratch);
+            for (point, actual) in points.iter().zip(batch) {
+                let [x, y, z] = *point;
+                let shift = (y as f64 / 16.).clamp(-1., 1.);
+                let (nx, nz) = if smoother {
+                    ((x as f64 + shift) * 0.13, (z as f64 - 0.375) * 0.13)
+                } else {
+                    (x as f64 * 0.13 + shift, z as f64 * 0.13 - 0.375)
+                };
+                let expected = noise.sample(nx, 0., nz) * -1.25 + 0.375;
+                assert_eq!(
+                    expected.to_bits(),
+                    actual.to_bits(),
+                    "smoother={smoother} p={point:?}"
+                );
+                assert_eq!(
+                    expected.to_bits(),
+                    graph
+                        .compute(root, *point, Mode::Single, &mut scratch)
+                        .to_bits()
+                );
+            }
         }
     }
 }

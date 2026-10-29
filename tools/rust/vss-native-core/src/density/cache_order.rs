@@ -49,6 +49,7 @@ fn dependencies(g: &Graph, vertical: &[bool]) -> Vec<bool> {
             Node::Shifted(_, _, _, shifts) | Node::FastNoise(_, _, _, shifts) => {
                 shifts.iter().any(|n| e[*n])
             }
+            Node::TectonicNoise { shifts, .. } => shifts.iter().any(|n| e[*n]),
             // A coordinate transform may leave a FlatCache's covered lattice.
             Node::CoordinateShift(..) => true,
             _ => false,

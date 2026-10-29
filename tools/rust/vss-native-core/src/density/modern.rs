@@ -54,6 +54,14 @@ pub enum Node {
         y: f64,
         shifts: Option<[Id; 3]>,
     },
+    TectonicNoise {
+        noise: usize,
+        shifts: [Id; 2],
+        scale: f32,
+        multiplier: f32,
+        offset: f32,
+        smoother: bool,
+    },
     Shift(usize, u8),
     CoordinateShift(Id, [Id; 3]),
     FastNoise(
@@ -125,6 +133,7 @@ impl Node {
             Self::Noise { y, shifts, .. } => {
                 *y != 0. || shifts.is_some_and(|s| s.iter().any(|n| d[*n]))
             }
+            Self::TectonicNoise { shifts, .. } => shifts.iter().any(|n| d[*n]),
             Self::Shift(_, kind) => *kind == 0,
             Self::CoordinateShift(input, shifts) => d[*input] || shifts.iter().any(|n| d[*n]),
             Self::FastNoise(_, _, y, shifts) => {
@@ -268,6 +277,45 @@ impl Node {
                     is_volume(mode),
                 ) as f32
                     * 4.
+            }
+            Self::TectonicNoise {
+                noise,
+                shifts,
+                scale,
+                multiplier,
+                offset,
+                smoother,
+            } => {
+                let shift_x = ev(shifts[0], s);
+                let shift_z = ev(shifts[1], s);
+                // Tectonic 3.0.32 has distinct released scalar/volume contracts.
+                // Scalar ignores smootherScaling and rounds both coordinates in float.
+                let volume = is_volume(mode);
+                let coordinate = |p: i32, shift: f32| {
+                    if volume {
+                        if *smoother {
+                            (p as f64 + shift as f64) * *scale as f64
+                        } else {
+                            p as f64 * *scale as f64 + shift as f64
+                        }
+                    } else {
+                        (p as f32 * scale + shift) as f64
+                    }
+                };
+                let value = g.noise_for_volume(
+                    *noise,
+                    coordinate(p[0], shift_x),
+                    0.,
+                    coordinate(p[2], shift_z),
+                    false,
+                ) as f32
+                    * multiplier;
+                // SmoothSampler.sampleVolume in this release omits the offset.
+                if volume && *smoother {
+                    value
+                } else {
+                    value + offset
+                }
             }
             Self::Range(n, a, b, yes, no) => {
                 let v = ev(*n, s);
@@ -603,6 +651,19 @@ impl Builder<'_> {
         if let Some(t) = t.strip_prefix("lithostitched:") {
             return self.parse_lithostitched_modern(t, v);
         }
+        if t == "vss:tectonic_config_noise" {
+            return Ok(Node::TectonicNoise {
+                noise: self.graph.register_modern_noise(&v["noise"], self.doc)?,
+                shifts: [self.parse(&v["shift_x"])?, self.parse(&v["shift_z"])?],
+                scale: number(v, "scale")? as f32,
+                multiplier: number(v, "multiplier")? as f32,
+                offset: number(v, "offset")? as f32,
+                smoother: v
+                    .get("smoother_scaling")
+                    .and_then(Value::as_bool)
+                    .ok_or("missing smoother_scaling flag")?,
+            });
+        }
         let t = t
             .strip_prefix("minecraft:")
             .ok_or_else(|| format!("unsupported modern density {t}"))?;
@@ -916,6 +977,119 @@ impl Builder<'_> {
 #[cfg(test)]
 mod reference_tests {
     use super::*;
+
+    #[test]
+    fn tectonic_applied_noise_keeps_released_scalar_volume_contracts_and_separate_memos() {
+        let declaration = serde_json::json!({"base_octave":-3,"octave_count":3,
+            "amplitude_modifiers":[1.,0.25,0.5]});
+        let mut differences = 0;
+        for smoother in [false, true] {
+            for vertical in [false, true] {
+                let shift = if vertical {
+                    serde_json::json!({"type":"minecraft:gradient","axis":"y","from_coordinate":-16,
+                        "to_coordinate":16,"from_value":-1.,"to_value":1.})
+                } else {
+                    serde_json::json!(0.625)
+                };
+                let doc = serde_json::json!({"vss_density_semantics":"float-26.3",
+                    "noises":{"vss:test":declaration},"settings":{"legacy_random_source":false,
+                    "noise_router":{"final_density":{"type":"vss:tectonic_config_noise","noise":"vss:test",
+                        "shift_x":shift,"shift_z":-0.375,"scale":0.13,"multiplier":-1.25,
+                        "offset":0.375,"smoother_scaling":smoother}}}});
+                for seed in [0, 731, i64::MIN, i64::MAX] {
+                    let graph = Graph::from_document(seed, &doc).unwrap();
+                    let root = graph.root("final_density").unwrap();
+                    assert_eq!(
+                        graph.column_plan.slots[root] == super::super::column_plan::NONE,
+                        vertical
+                    );
+                    let mut random = graph.random.from_hash("vss:test");
+                    let noise =
+                        crate::noise::modern::Noise::from_declaration(&mut random, &declaration)
+                            .unwrap();
+                    let points: Vec<_> = [-29_999_999, -17, 0, 1, 29_999_999]
+                        .into_iter()
+                        .flat_map(|x| [-16, -1, 0, 1, 16].into_iter().map(move |y| [x, y, -x]))
+                        .collect();
+                    let expected = |p: [i32; 3], mode| {
+                        let shift_x = if vertical {
+                            (p[1] as f32 + 16.) * (2. / 32.) - 1.
+                        } else {
+                            0.625
+                        };
+                        let coordinate = |value: i32, shift: f32| {
+                            if is_volume(mode) {
+                                if smoother {
+                                    (value as f64 + shift as f64) * 0.13f32 as f64
+                                } else {
+                                    value as f64 * 0.13f32 as f64 + shift as f64
+                                }
+                            } else {
+                                (value as f32 * 0.13f32 + shift) as f64
+                            }
+                        };
+                        let value = noise.sample(
+                            coordinate(p[0], shift_x),
+                            0.,
+                            coordinate(p[2], -0.375),
+                            false,
+                        ) * -1.25;
+                        if is_volume(mode) && smoother {
+                            value
+                        } else {
+                            value + 0.375
+                        }
+                    };
+                    for first_volume in [false, true] {
+                        let mut scratch = graph.scratch(-32, 0, 4, 8).unwrap();
+                        for &point in &points {
+                            let modes = if first_volume {
+                                [
+                                    Mode::Block,
+                                    Mode::Single,
+                                    Mode::Cell,
+                                    Mode::Raw,
+                                    Mode::Slice,
+                                    Mode::Single,
+                                ]
+                            } else {
+                                [
+                                    Mode::Single,
+                                    Mode::Block,
+                                    Mode::Raw,
+                                    Mode::Cell,
+                                    Mode::Single,
+                                    Mode::Slice,
+                                ]
+                            };
+                            for mode in modes {
+                                assert_eq!((graph.compute(root,point,mode,&mut scratch) as f32).to_bits(),
+                                    expected(point,mode).to_bits(), "smoother={smoother} vertical={vertical} seed={seed} p={point:?} mode={mode:?}");
+                            }
+                            differences += usize::from(
+                                expected(point, Mode::Single).to_bits()
+                                    != expected(point, Mode::Block).to_bits(),
+                            );
+                        }
+                        for mode in [Mode::Single, Mode::Block, Mode::Cell, Mode::Slice] {
+                            let batch = graph.fill_array(root, &points, mode, &mut scratch);
+                            for (&point, actual) in points.iter().zip(batch) {
+                                assert_eq!(
+                                    (actual as f32).to_bits(),
+                                    expected(point, mode).to_bits()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            differences > 0,
+            "the fixture must expose scalar/volume differences"
+        );
+    }
+
     #[test]
     fn lithostitched_modern_operators_use_float_inputs_and_scalar_shifted_sampling() {
         let slope = serde_json::json!({"type":"minecraft:gradient","axis":"y","from_coordinate":-100,"to_coordinate":100,"from_value":-3.3,"to_value":3.3});
