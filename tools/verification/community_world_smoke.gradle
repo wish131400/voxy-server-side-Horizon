@@ -65,10 +65,27 @@ gradle.projectsEvaluated {
         doLast {
             def report = project.layout.buildDirectory.file('community-world-smoke/artifacts.json').get().asFile
             report.parentFile.mkdirs()
+            // Freeze both inputs by content so later remapJar/export tasks cannot replace a running probe.
+            def digest = { byte[] bytes -> java.util.HexFormat.of().formatHex(
+                java.security.MessageDigest.getInstance('SHA-256').digest(bytes)) }
+            def snapshot = { File source ->
+                byte[] bytes = source.bytes
+                def sha256 = digest(bytes)
+                def target = new File(report.parentFile, 'artifacts/' + sha256 + '/' + source.name)
+                target.parentFile.mkdirs()
+                if (!target.exists()) target.bytes = bytes
+                if (digest(target.bytes) != sha256)
+                    throw new GradleException('World smoke snapshot checksum mismatch: ' + target)
+                [path: target.absolutePath, sha256: sha256]
+            }
+            def vss = snapshot(project.tasks.named('remapJar').get().archiveFile.get().asFile)
+            def smoke = snapshot(remapped.get().archiveFile.get().asFile)
             report.setText(groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson([
                 minecraft: targetVersion,
-                vssJar: project.tasks.named('remapJar').get().archiveFile.get().asFile.absolutePath,
-                probeJar: remapped.get().archiveFile.get().asFile.absolutePath,
+                vssJar: vss.path,
+                vssSha256: vss.sha256,
+                probeJar: smoke.path,
+                probeSha256: smoke.sha256,
                 validation: 'isolated_real_server_client_network_native_ingest_prediction_lifecycle'
             ])) + '\n', 'UTF-8')
             project.logger.lifecycle('Community world smoke artifacts: ' + report)

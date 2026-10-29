@@ -508,7 +508,7 @@ def verify(jar, platform, build_id, source, minecraft=None):
             for mixin in ("VoxyServerLodClientMixin", "VoxyServerLodServerMixin", "VoxyServerLodPlayerStateMixin"):
                 require("dev/xantha/vss/mixin/voxy/" + mixin + ".class" in enabled,
                         "Native server LOD arbitration is not configured: " + mixin)
-            check_class("compat/VoxyServerLodClientCompat", "beginNativeColumn", "ingestNativeSection")
+            check_class("compat/VoxyServerLodClientCompat", "beginNativeColumn", "ingestNativeSection", "nativeColumnVersionCurrent")
             check_class("compat/VoxyServerLodServerCompat", "reconcile", "releaseOutgoing")
         require(not any(n.endswith("Test.class") or n.startswith("xaero/") for n in names),
                 "Test or foreign fixture classes packaged")

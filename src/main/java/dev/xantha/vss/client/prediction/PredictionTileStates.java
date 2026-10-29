@@ -184,6 +184,9 @@ final class PredictionTileStates<K> {
         public int size(){return counts.get(flagCount+column);}
         public boolean containsKey(Object key){return present(index.get(key),flagCount+column);}
         public Long get(Object key){return value(key,column);}
+        // Null is never a stored timestamp. A second containsKey lookup can see a
+        // recreated field after get returned null and incorrectly return null.
+        public Long getOrDefault(Object key,Long fallback){Long current=value(key,column);return current==null?fallback:current;}
         public Long put(K key,Long value){return PredictionTileStates.this.put(key,column,Objects.requireNonNull(value));}
         public Long remove(Object key){synchronized(PredictionTileStates.this) {Long old=get(key);if(old!=null)PredictionTileStates.this.remove(key,flagCount+column,null);return old;}}
         public boolean remove(Object key,Object value){synchronized(PredictionTileStates.this) {Long old=get(key);if(old==null || !old.equals(value))return false;remove(key);return true;}}

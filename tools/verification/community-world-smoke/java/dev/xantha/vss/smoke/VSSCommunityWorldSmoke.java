@@ -222,8 +222,9 @@ public final class VSSCommunityWorldSmoke implements ClientModInitializer {
             progress.addProperty("markerX", markerX); progress.addProperty("markerY", markerY);
             progress.addProperty("markerZ", markerZ);
             progress.addProperty("markerBlock", sessionNumber == 2 ? "minecraft:emerald_block" : "minecraft:diamond_block");
-            Path path = reportPath.resolveSibling("progress.json");
-            Path temporary = path.resolveSibling("progress.json.tmp");
+            // Each event is immutable. Replacing a shared file races Windows readers' delete-sharing mode.
+            Path path = reportPath.resolveSibling("progress-" + sessionNumber + "-" + value + ".json");
+            Path temporary = path.resolveSibling(path.getFileName() + ".tmp");
             Files.createDirectories(path.getParent());
             Files.writeString(temporary, new GsonBuilder().create().toJson(progress), StandardCharsets.UTF_8);
             Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING);
@@ -291,7 +292,11 @@ public final class VSSCommunityWorldSmoke implements ClientModInitializer {
         if (sessionReport != null) report.add("currentSession", sessionReport);
         report.addProperty("markerNative", markerNative); report.addProperty("markerAuthoritative", markerAuthoritative);
         report.addProperty("markerOutsideVanilla", markerOutsideVanilla); report.addProperty("profileReady", profileReady);
-        if (failure != null) report.addProperty("error", failure.toString());
+        if (failure != null) {
+            report.addProperty("error", failure.toString());
+            if (failure.getCause() != null) report.addProperty("cause", failure.getCause().toString());
+            LOG.error("World probe failed at " + stage, failure);
+        }
         try {
             report.add("bridge", gson.toJsonTree(VoxyPredictionBridge.diagnostics()));
             report.addProperty("prediction", ClientPredictionState.diagnostics());

@@ -9,6 +9,8 @@ import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.*;
 import org.objectweb.asm.tree.analysis.Analyzer;
 import org.objectweb.asm.tree.analysis.BasicVerifier;
+import org.objectweb.asm.tree.analysis.SourceInterpreter;
+import org.objectweb.asm.tree.analysis.SourceValue;
 
 class VoxyPredictionMixinApplicationTest {
     @Test void coordinatesAndChildOctantsMatchExecutableMethodsFromTheInstalledVoxyJar() throws Exception {
@@ -88,7 +90,17 @@ class VoxyPredictionMixinApplicationTest {
                 assertTrue(node.methods.stream().flatMap(m -> java.util.stream.StreamSupport.stream(m.instructions.spliterator(), false))
                         .anyMatch(i -> i instanceof MethodInsnNode call && call.owner.equals("dev/xantha/vss/compat/VoxyPredictionBridge")
                                 && call.name.equals("farPlane")), "Actual renderer projection must expand beyond the 48000-block legacy clip");
-                for (MethodNode projection : node.methods) if (projection.name.equals("computeProjectionMat")
+                boolean viewportArguments=node.methods.stream().anyMatch(m->m.name.contains("vss$viewportFarPlane"));
+                if(viewportArguments) {
+                    // 26.3 expands the two call-site arguments together so matrix and viewport metadata agree.
+                    ClassNode original=harness.getClassNode(target);
+                    assertExpandedFarArgument(original,node,target.replace('.','/'),"computeProjectionMat",
+                            "(Lme/cortex/voxy/client/core/RenderProperties;Lorg/joml/Matrix4fc;FF)Lorg/joml/Matrix4f;",
+                            "vss$projectionFarPlane");
+                    assertExpandedFarArgument(original,node,"me/cortex/voxy/client/core/rendering/Viewport","setProjection",
+                            "(Lorg/joml/Matrix4f;FF)Lme/cortex/voxy/client/core/rendering/Viewport;","vss$viewportFarPlane");
+                }
+                for (MethodNode projection : node.methods) if (!viewportArguments && projection.name.equals("computeProjectionMat")
                         && (projection.desc.endsWith(";F)Lorg/joml/Matrix4f;")
                             || projection.desc.endsWith(";FF)Lorg/joml/Matrix4f;"))) {
                     // @ModifyVariable must rewrite the far argument, preserving tkettela's near-plane input.
@@ -127,6 +139,50 @@ class VoxyPredictionMixinApplicationTest {
             }
             for(MethodNode method:node.methods) new Analyzer<>(new BasicVerifier()).analyze(node.name,method);
         }
+    }
+
+    private static void assertExpandedFarArgument(ClassNode original,ClassNode transformed,String owner,
+                                                  String name,String descriptor,String handlerName) throws Exception {
+        MethodNode raw=original.methods.stream().filter(m->m.name.equals("setupViewport")).findFirst().orElseThrow();
+        MethodNode patched=transformed.methods.stream().filter(m->m.name.equals("setupViewport")).findFirst().orElseThrow();
+        var rawFrames=new Analyzer<>(new SourceInterpreter()).analyze(original.name,raw);
+        var patchedFrames=new Analyzer<>(new SourceInterpreter()).analyze(transformed.name,patched);
+        var originals=java.util.stream.StreamSupport.stream(raw.instructions.spliterator(),false)
+                .filter(i->i instanceof MethodInsnNode c && c.owner.equals(owner) && c.name.equals(name) && c.desc.equals(descriptor))
+                .map(i->(MethodInsnNode)i).toList();
+        var calls=java.util.stream.StreamSupport.stream(patched.instructions.spliterator(),false)
+                .filter(i->i instanceof MethodInsnNode c && c.owner.equals(owner) && c.name.equals(name) && c.desc.equals(descriptor))
+                .map(i->(MethodInsnNode)i).toList();
+        assertEquals(1,originals.size(),"Audited native clip call");assertEquals(1,calls.size(),"Patched clip call");
+        var rawFrame=rawFrames[raw.instructions.indexOf(originals.get(0))];
+        var patchedFrame=patchedFrames[patched.instructions.indexOf(calls.get(0))];
+        int far=singleFloatVariable(rawFrame.getStack(rawFrame.getStackSize()-1),Opcodes.FLOAD);
+        int near=singleFloatVariable(rawFrame.getStack(rawFrame.getStackSize()-2),Opcodes.FLOAD);
+        assertEquals(near,singleFloatVariable(patchedFrame.getStack(patchedFrame.getStackSize()-2),Opcodes.FLOAD),
+                "The native near-plane argument must remain unchanged");
+        var expansion=assertInstanceOf(MethodInsnNode.class,singleSource(patchedFrame.getStack(patchedFrame.getStackSize()-1)));
+        assertEquals(transformed.name,expansion.owner);assertTrue(expansion.name.contains(handlerName));assertEquals("(F)F",expansion.desc);
+        var expansionFrame=patchedFrames[patched.instructions.indexOf(expansion)];
+        int temporary=singleFloatVariable(expansionFrame.getStack(expansionFrame.getStackSize()-1),Opcodes.FLOAD);
+        var saved=singleSource(expansionFrame.getLocal(temporary));
+        assertEquals(temporary,singleFloatVariable(expansionFrame.getLocal(temporary),Opcodes.FSTORE));
+        var savedFrame=patchedFrames[patched.instructions.indexOf(saved)];
+        assertEquals(far,singleFloatVariable(savedFrame.getStack(savedFrame.getStackSize()-1),Opcodes.FLOAD),
+                "The expansion must receive the native far argument, never the near argument");
+        var handler=transformed.methods.stream().filter(m->m.name.equals(expansion.name) && m.desc.equals(expansion.desc)).findFirst().orElseThrow();
+        var body=java.util.stream.StreamSupport.stream(handler.instructions.spliterator(),false).filter(i->i.getOpcode()>=0).toList();
+        assertEquals(3,body.size());
+        var input=assertInstanceOf(VarInsnNode.class,body.get(0));assertEquals(Opcodes.FLOAD,input.getOpcode());assertEquals(1,input.var);
+        var bridge=assertInstanceOf(MethodInsnNode.class,body.get(1));assertEquals(Opcodes.INVOKESTATIC,bridge.getOpcode());
+        assertEquals("dev/xantha/vss/compat/VoxyPredictionBridge",bridge.owner);assertEquals("farPlane",bridge.name);assertEquals("(F)F",bridge.desc);
+        assertEquals(Opcodes.FRETURN,body.get(2).getOpcode());
+    }
+
+    private static AbstractInsnNode singleSource(SourceValue value) {
+        assertNotNull(value);assertEquals(1,value.insns.size());return value.insns.iterator().next();
+    }
+    private static int singleFloatVariable(SourceValue value,int opcode) {
+        var variable=assertInstanceOf(VarInsnNode.class,singleSource(value));assertEquals(opcode,variable.getOpcode());return variable.var;
     }
     @Test void shaderWaitGuardChangesOnlyRequestSubmissionAndLeavesNativeCleanerSemanticsIntact() throws Exception {
         try(var jar=new java.util.zip.ZipFile(System.getProperty("vss.voxyJar"))) {

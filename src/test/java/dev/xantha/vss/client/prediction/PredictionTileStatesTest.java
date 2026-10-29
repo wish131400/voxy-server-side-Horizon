@@ -6,6 +6,44 @@ import java.util.concurrent.*;
 import org.junit.jupiter.api.Test;
 
 class PredictionTileStatesTest {
+    @Test void timestampDefaultLookupDoesNotCheckMembershipAgainAfterAnAbsentValue() {
+        var states=new PredictionTileStates<Object>(1,1);var values=states.values(0);
+        // A stable hash with a one-shot callback models the timestamp reappearing
+        // between the default Map implementation's get and containsKey lookups.
+        class Key {
+            int lookups;
+            Runnable onRepeatedLookup;
+            @Override public int hashCode() {
+                if(++lookups==2 && onRepeatedLookup!=null) {
+                    Runnable mutation=onRepeatedLookup;onRepeatedLookup=null;mutation.run();
+                }
+                return 17;
+            }
+        }
+        var key=new Key();states.flag(0).add(key);
+        key.lookups=0;key.onRepeatedLookup=()->values.put(key,42L);
+        long epoch=values.getOrDefault(key,0L);
+        assertEquals(0L,epoch,"An absent read returns its default even if a later lookup could observe a new field");
+        key.onRepeatedLookup=null;
+        assertNull(values.get(key));
+        values.put(key,42L);
+        assertEquals(42L,values.getOrDefault(key,0L));
+    }
+
+    @Test void timestampDefaultsRespectIndependentFieldsClearingAndRecycledSlots() {
+        var states=new PredictionTileStates<String>(1,2);var values=states.values(0);var other=states.values(1);
+        states.flag(0).add("tile");other.put("tile",77L);
+        assertEquals(-1L,values.getOrDefault("tile",-1L));
+        assertNull(values.getOrDefault("tile",null));
+        values.put("tile",0L);assertEquals(0L,values.getOrDefault("tile",-1L));
+        values.put("tile",Long.MIN_VALUE);assertEquals(Long.MIN_VALUE,values.getOrDefault("tile",-1L));
+        values.remove("tile");assertEquals(-1L,values.getOrDefault("tile",-1L));
+        assertEquals(77L,other.getOrDefault("tile",-1L));
+        states.flag(0).clear();other.clear();values.put("reused",42L);
+        assertEquals(-1L,values.getOrDefault("tile",-1L));
+        assertEquals(42L,values.getOrDefault("reused",-1L));
+    }
+
     @Test void iteratorPrefetchCannotRemoveTheNextOrRecycledIdentity() {
         var store=new PredictionTileStates<Integer>(0,1);var values=store.values(0);
         values.put(1,1L);values.put(2,2L);var it=values.entrySet().iterator();var first=it.next();

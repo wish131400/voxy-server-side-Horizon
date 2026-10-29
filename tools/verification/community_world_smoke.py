@@ -20,7 +20,7 @@ import time
 import uuid
 import zipfile
 
-from production_client_smoke import digest, obtain, os_name, prepare_runtime, read_inputs
+from production_client_smoke import digest, obtain, os_name, prepare_runtime, read_inputs, validate_remapped_vss
 
 
 def prepare_server_runtime(minecraft, runtime_directory, client_runtime):
@@ -57,15 +57,20 @@ def prepare_server_runtime(minecraft, runtime_directory, client_runtime):
     return classpath
 
 
-def install_mod(source, destination, expected):
+def install_mod(source, destination, expected, expected_sha256=None):
     source = Path(source).resolve()
+    source_sha256 = digest(source)
+    if expected_sha256 and source_sha256 != expected_sha256:
+        raise ValueError("Exported world-smoke artifact was replaced: " + expected)
     with zipfile.ZipFile(source) as archive:
         metadata = json.loads(archive.read("fabric.mod.json"))
     if metadata.get("id") != expected:
         raise ValueError("Wrong isolated mod identity: expected " + expected)
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination)
-    return {"filename": source.name, "sha256": digest(source), "version": metadata["version"]}
+    if digest(destination) != source_sha256:
+        raise ValueError("World-smoke mod changed while being copied: " + expected)
+    return {"filename": source.name, "sha256": source_sha256, "version": metadata["version"]}
 
 
 def java_argfile(path, arguments):
@@ -108,6 +113,11 @@ def run(options):
     artifacts = json.loads(options.artifacts.read_text())
     if artifacts["minecraft"] != minecraft:
         raise ValueError("World probe artifact target mismatch")
+    if not artifacts.get("vssSha256") or not artifacts.get("probeSha256"):
+        raise ValueError("World probe needs checksum-bearing artifacts; re-export with community_world_smoke.gradle")
+    validate_remapped_vss(artifacts["vssJar"], minecraft, artifacts["vssSha256"])
+    if digest(artifacts["probeJar"]) != artifacts["probeSha256"]:
+        raise ValueError("Exported world-smoke probe was replaced after validation")
     runtime_directory = options.runtime_directory.resolve()
     runtime = prepare_runtime(minecraft, runtime_directory, options.gradle_user_home)
     server_classpath = prepare_server_runtime(minecraft, runtime_directory, runtime)
@@ -121,9 +131,9 @@ def run(options):
         (game / "config").mkdir()
     identities = {}
     for game in (server, client):
-        identities[game.name + ":vss"] = install_mod(artifacts["vssJar"], game / "mods/vss.jar", "vss")
+        identities[game.name + ":vss"] = install_mod(artifacts["vssJar"], game / "mods/vss.jar", "vss", artifacts["vssSha256"])
         install_mod(runtime["fabricApi"], game / "mods/fabric-api.jar", "fabric-api")
-    identities["client:probe"] = install_mod(artifacts["probeJar"], client / "mods/vss-world-smoke.jar", "vss_world_smoke")
+    identities["client:probe"] = install_mod(artifacts["probeJar"], client / "mods/vss-world-smoke.jar", "vss_world_smoke", artifacts["probeSha256"])
     for key, source in read_inputs(options.inputs).items():
         if key == "vssIrisJar" and options.without_iris:
             continue
@@ -221,7 +231,7 @@ def run(options):
                 client_process = subprocess.Popen(client_command, cwd=client, stdout=client_log, stderr=subprocess.STDOUT,
                                                   creationflags=creationflags)
                 client_started = now
-            progress_path = directory / "progress.json"
+            progress_path = directory / "progress-2-warming.json"
             if client_process is not None and not second_marker_changed and progress_path.exists():
                 try: progress = json.loads(progress_path.read_text())
                 except (OSError, ValueError): progress = {}
@@ -244,13 +254,18 @@ def run(options):
         server_log.close(); client_log.close()
     if report_path.exists():
         report = json.loads(report_path.read_text())
+    client_errors = [line.strip() for line in (directory / "client.log").read_text(
+        encoding="utf-8", errors="replace").splitlines()
+        if "VSS prediction tile build failed" in line or "Mixin apply failed" in line]
     result = {**launch, "directory": str(directory), "serverStarted": ready, "firstMarkerChanged": marker_changed,
               "initialColumnGenerationCompleted": generated, "secondMarkerChanged": second_marker_changed,
               "serverExitCode": server_process.returncode if server_process else None,
               "clientExitCode": client_process.returncode if client_process else None,
               "elapsedSeconds": round(time.monotonic() - started, 2), "probe": report}
     if error: result["error"] = error
-    result["passed"] = bool(not error and generated and second_marker_changed and report
+    if client_errors:
+        result["clientErrors"] = client_errors
+    result["passed"] = bool(not error and not client_errors and generated and second_marker_changed and report
                             and report["status"] == "passed" and result["clientExitCode"] == 0
                             and result["serverExitCode"] == 0)
     (directory / "result.json").write_text(json.dumps(result, indent=2) + "\n")
