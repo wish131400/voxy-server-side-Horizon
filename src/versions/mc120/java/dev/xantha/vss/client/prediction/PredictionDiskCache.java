@@ -241,10 +241,6 @@ final class PredictionDiskCache implements AutoCloseable {
         VoxelWrite observed;
         synchronized(shared){observed=voxelWrites.get(lease.key);}
         var data = read(lease, (input, version) -> PredictionVoxelCache.read(input,key,settings,identity,templateIdentity,this,version));
-        if(data!=null) {
-            var digest=PredictionVoxelCache.contentIdentity(data,0,new byte[32],null,this);
-            data=new PredictionVoxelCache.Data(data.voxels(),data.heights(),data.groundHeights(),data.samples(),data.bounds(),digest);
-        }
         synchronized (shared) {
             if(!lease.valid())return null;
             if (data != null) {

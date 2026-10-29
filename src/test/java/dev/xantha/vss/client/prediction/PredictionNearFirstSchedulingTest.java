@@ -52,7 +52,7 @@ class PredictionNearFirstSchedulingTest {
     @Test @SuppressWarnings("unchecked")
     void coldNearRegionSelectsItsNecessaryParentBeforeUnrelatedDistantRoot() throws Exception {
         var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var calls=new AtomicInteger();
-        var cpu=new PredictionCpuBudget(()->4,()->.99,()->.99,System::nanoTime,false);
+        var cpu=new PredictionCpuBudget(()->1, System::nanoTime);
         try(var manager=manager(sampler(calls,entered,release),null,cpu)) {
             set(manager,"unifiedVoxy",true);
             var near=key(1,0); int top=manager.layout().levelCount()-1;
@@ -84,7 +84,7 @@ class PredictionNearFirstSchedulingTest {
 
     @Test @SuppressWarnings("unchecked")
     void generationPreservesOrderAfterCpuRefusalAndGivesEveryFourthAdmissionAFairLaneTurn() throws Exception {
-        var cpu=new PredictionCpuBudget(()->4,()->.99,()->.99,System::nanoTime,false);
+        var cpu=new PredictionCpuBudget(()->1, System::nanoTime);
         var held=cpu.tryAcquire(true);assertNotNull(held);
         var order=new CopyOnWriteArrayList<Integer>();var priorities=new CopyOnWriteArrayList<Integer>();
         var nearTerrain=new CopyOnWriteArrayList<Integer>();var fairTerrain=new CopyOnWriteArrayList<Integer>();
@@ -197,7 +197,7 @@ class PredictionNearFirstSchedulingTest {
     @Test @SuppressWarnings("unchecked")
     void cacheUsesThreeNearbyAdmissionsThenOneDistantTurnWithoutCpuOrParent() throws Exception {
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var calls=new AtomicInteger();
-        var cpu=new PredictionCpuBudget(()->4,()->.99,()->.99,System::nanoTime,false);
+        var cpu=new PredictionCpuBudget(()->1, System::nanoTime);
         try(var held=cpu.tryAcquire(true);var cache=new PredictionDiskCache(directory,PROFILE.fingerprint());
             var manager=manager(sampler(calls,null,null),cache,cpu)) {
             assertNotNull(held); set(manager,"unifiedVoxy",true);

@@ -4,12 +4,16 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
-import dev.xantha.vss.config.JsonConfig;
+import com.google.gson.JsonParser;
 import dev.xantha.vss.config.VSSServerConfig;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class ChunkyQueueLimitConfigTest {
+    @TempDir Path directory;
     @BeforeAll
     static void initializeConfigDirectory() {
 
@@ -30,9 +34,16 @@ class ChunkyQueueLimitConfigTest {
         validate.setAccessible(true);
         validate.invoke(config);
         assertEquals(32, config.chunkyQueueLimit);
-        var serialize = JsonConfig.class.getDeclaredMethod("configWithHelp");
-        serialize.setAccessible(true);
-        var saved = (JsonObject) serialize.invoke(config);
+        String previousDirectory = System.getProperty("vss.configDir");
+        JsonObject saved;
+        try {
+            System.setProperty("vss.configDir", directory.toString());
+            config.save();
+            saved = JsonParser.parseString(Files.readString(directory.resolve("vss-server-config.json"))).getAsJsonObject();
+        } finally {
+            if (previousDirectory == null) System.clearProperty("vss.configDir");
+            else System.setProperty("vss.configDir", previousDirectory);
+        }
         assertEquals(32, saved.get("chunkyQueueLimit").getAsInt());
         assertTrue(saved.getAsJsonObject("_help").get("chunkyQueueLimit").getAsString().contains("默认 0"));
         assertEquals(32, new Gson().fromJson(saved, VSSServerConfig.class).chunkyQueueLimit);

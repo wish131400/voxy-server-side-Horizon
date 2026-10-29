@@ -3,12 +3,16 @@ package dev.xantha.vss.networking.server.generation;
 import static org.junit.jupiter.api.Assertions.*;
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
-import dev.xantha.vss.config.JsonConfig;
 import dev.xantha.vss.config.VSSServerConfig;
+import com.google.gson.JsonParser;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class GenerationBudgetConfigTest {
+    @TempDir Path directory;
     @BeforeAll
     static void initializeConfigDirectory() {
 
@@ -33,9 +37,16 @@ class GenerationBudgetConfigTest {
         assertEquals(6, config.generationSnapshotsPerTickLimit);
         assertEquals(3, config.generationSnapshotBudgetMillis);
         assertEquals(45, config.generationPauseAboveMspt);
-        var serialize = JsonConfig.class.getDeclaredMethod("configWithHelp");
-        serialize.setAccessible(true);
-        var saved = (JsonObject) serialize.invoke(config);
+        String previousDirectory = System.getProperty("vss.configDir");
+        JsonObject saved;
+        try {
+            System.setProperty("vss.configDir", directory.toString());
+            config.save();
+            saved = JsonParser.parseString(Files.readString(directory.resolve("vss-server-config.json"))).getAsJsonObject();
+        } finally {
+            if (previousDirectory == null) System.clearProperty("vss.configDir");
+            else System.setProperty("vss.configDir", previousDirectory);
+        }
         assertFalse(saved.has("generationStartsPerTickLimit"));
         assertFalse(saved.getAsJsonObject("_help").has("generationStartsPerTickLimit"));
         assertEquals(6, saved.get("generationSnapshotsPerTickLimit").getAsInt());

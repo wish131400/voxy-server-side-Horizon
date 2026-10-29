@@ -18,8 +18,11 @@ def publish(source, build_id, targets):
     targets = targets or [properties["minecraft_version"]]
     jars = [source / "lib" / ("vss-" + version + "-fabric-" + target + ".jar") for target in targets]
     artifacts = [verify(jar, "fabric", build_id, source, target) for jar, target in zip(jars, targets)]
+    # Keep the established production digest, and archive the complete source
+    # and regression fixtures so the release can be checked against the checkout.
+    snapshot_paths = set(source_files(source)) | {p for p in (source / "src").rglob("*") if p.is_file()}
     snapshot = {p.relative_to(source).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
-                for p in source_files(source)}
+                for p in sorted(snapshot_paths)}
     manifest = {"version": version, "buildId": build_id, "minecraft": targets,
                 "sourceSha256": source_digest(source),
                 "createdAtUtc": datetime.now(timezone.utc).isoformat(), "artifacts": artifacts}

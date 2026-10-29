@@ -242,7 +242,11 @@ def verify_worldgen_interface_paths(read_class, minecraft):
     calls(snapshot, "withRuntimeBiomeSource", prefix + end_snapshot, "capture")
     read_class(snapshot, "vss_terrablender_end", "Required TerraBlender End routing could not be captured")
     read_class(end_snapshot, "terrablender.worldgen.IExtendedTheEndBiomeSource", "tbInitialized", "density_coordinates")
-    calls(decoder, "decodeJavaSampler", prefix + end_source, "<init>")
+    # Cache-first initialization shares biome decoding with full sampler setup.
+    # Verify the complete call chain rather than the pre-extraction call site.
+    calls(decoder, "decodeJavaSampler", prefix + decoder, "decodeBiomeSource")
+    calls(decoder + "$Session", "decode", prefix + decoder, "decodeBiomeSource")
+    calls(decoder, "decodeBiomeSource", prefix + end_source, "<init>")
     calls("client/prediction/TerraBlenderBackend", "open", prefix + end_source, "<init>")
     calls(end_source, "<init>", prefix + end_routing, "<init>")
     # 26.3 samples in a resolver lambda; older targets implement getNoiseBiome.
@@ -256,7 +260,7 @@ def verify_worldgen_interface_paths(read_class, minecraft):
           prefix + "client/prediction/ClientTerrainSampler", "captureBiomeIndex")
 
     read_class(decoder, "Required TerraBlender region routing unavailable", "vss_terrablender_end")
-    calls(decoder, "decodeJavaSampler", prefix + "client/prediction/TerraBlenderBackend", "buildRoutingSource")
+    calls(decoder, "decodeBiomeSource", prefix + "client/prediction/TerraBlenderBackend", "buildRoutingSource")
     native = "client/prediction/RustTerrainSampler"
     read_class(native, "Native library lacks required TerraBlender routing", "vss_terrablender_end")
     calls(native, "open", prefix + native, "terrablenderRouting")
@@ -356,6 +360,14 @@ def verify(jar, platform, build_id, source, minecraft=None):
                 require(symbol.encode() in data, "Missing reference: " + name + ": " + symbol)
             return data
 
+        check_class("config/VSSServerConfig", "singleplayerGenerationConcurrencyLimit", "effectiveGenerationConcurrencyLimitPerPlayer")
+        check_class("networking/server/generation/ChunkGenerationService", "effectiveGenerationConcurrencyLimitPerPlayer")
+        check_class("networking/server/session/PlayerSessionManager", "effectiveGenerationConcurrencyLimitPerPlayer")
+        check_class("compat/ModCompat", "replayRealXaeroColumn")
+        check_class("compat/XaeroMapCompat", "replayRealColumn", "tryOfferReplay")
+        check_class("networking/client/IntegratedPregenImporter", "replayRealXaeroColumn")
+        check_class("networking/server/generation/ChunkyGenerationService", "retryImport")
+
         feature_snapshot = class_references(check_class("common/worldgen/VanillaFeatureSnapshot"))
         cherry_owner = ("net/minecraft/class_8178" if minecraft.startswith("1.") else
                         "net/minecraft/world/level/levelgen/feature/foliageplacers/CherryFoliagePlacer")
@@ -368,6 +380,34 @@ def verify(jar, platform, build_id, source, minecraft=None):
         check_class("client/prediction/PredictionClimateSampler", "FabricBiomeCompat", "copyClimateContext")
         check_class("client/prediction/FabricBiomeCompat", "net.fabricmc.fabric.impl.biome.MultiNoiseSamplerHooks", "fabric_getSeed", "fabric_setSeed")
         check_class("client/prediction/PredictionBiomeCache", "LookupFailure", "sample")
+        check_class("client/prediction/PredictionBiomeCache$Points", "xs", "ys", "zs", "values")
+        check_class("client/prediction/PredictionBiomeCache$Local", "PredictionBiomeCache$Points")
+        check_class("client/prediction/PredictionBiomeCache$Stripe", "referenced", "next", "get", "put")
+        check_class("compat/VoxyPendingSections", "poll", "promote", "priority", "view")
+        check_class("compat/VoxyPredictionBridge", "newSingleThreadScheduledExecutor", "updateBatches", "emptyWithdrawals")
+        check_class("compat/VoxyPredictionBridge$Context", "nextNotification", "meshBacklog", "mayHavePrediction")
+        check_class("compat/VoxyRenderAccess", "meshBacklog")
+        check_class("client/prediction/PredictionRetirementQueue", "submit", "drain", "Command", "active")
+        check_class("client/prediction/PredictionVoxySource", "removeLater", "mayHavePrediction", "pendingRetirements", "retiring")
+        check_class("client/prediction/PredictionTileManager", "removeLater", "reclaimAdmissionTarget")
+        check_class("compat/VoxySectionData", "contentIdentity", "faceIdentity")
+        check_class("compat/VoxySectionSignature", "compact")
+        check_class("compat/VoxySectionSignature", "face", "EMPTY_FACE")
+        check_class("compat/VoxyPredictionBridge$Delivered", "realFaces")
+        check_class("compat/VoxyPredictionBridge$Context", "realFaces", "face")
+        check_class("client/prediction/PredictionVoxySource", "protectedBytes", "trimProtected", "retainedBytes")
+        check_class("client/prediction/PredictionVegetation", "restoreForRendering")
+        check_class("client/prediction/PredictionVegetation$CachedTile", "complete", "tile")
+        check_class("client/prediction/PredictionTileManager", "surfaceCacheAttempts", "restoreForRendering")
+        bridge_context=check_class("compat/VoxyPredictionBridge$Context", "notificationIdentity", "earlyUnchangedNotifications", "revokeInput", "revokeNeighborInputs")
+        require(b"realRevision" not in bridge_context, "Global native revision still invalidates unrelated reuse")
+        check_class("client/prediction/PredictionVoxySource", "notificationIdentity", "cachedNotificationView", "NOT_CACHED", "readFace")
+        terrain_change=class_references(check_class("client/prediction/PredictionTerrainChange", "compare", "ordered"))
+        liquid_type="net/minecraft/class_2404" if minecraft.startswith("1.") else "net/minecraft/world/level/block/LiquidBlock"
+        require(any((liquid_type,"<instanceof>",None) in entries
+                    for (method,_),entries in terrain_change.items() if method=="compare"),
+                "Terrain interval comparison omitted liquid surface remainders")
+        check_class("client/prediction/PredictionVoxySource", "PredictionTerrainChange", "sameFeatureBiomes", "terrainRangeReductions")
         check_class("client/prediction/PredictionVegetation", "END_CLIMATE_SETTINGS_VERSION",
                     "REGISTRY_CONTEXT_SETTINGS_VERSION", "LookupFailure")
         registries = class_references(check_class("client/prediction/ClientWorldgenRegistries"))
@@ -402,6 +442,15 @@ def verify(jar, platform, build_id, source, minecraft=None):
         require(b"VoxySurfaceHeights" not in bridge, "Native mesh is still post-processed")
         check_class("mixin/voxy/PredictionVoxyTraversalShaderMixin", "VoxySurfaceHeights", "patchShader")
         check_class("client/prediction/ClientPredictionState", "LEVEL_GENERATION", "levelUnloaded")
+        check_class("client/prediction/ClientPredictionState", "retireUnusedSampler", "VSS prediction cache ready:", "VSS prediction generation ready:")
+        check_class("client/prediction/PredictionCacheSampler", "Cache context cannot generate terrain", "cacheBiomes", "templates", "floating")
+        check_class("client/prediction/PredictionCacheStorage", "openExisting")
+        if minecraft.startswith("1."):
+            check_class("client/prediction/PredictionCacheStorage", "prediction/minecraft-"+minecraft+"/surface-v1")
+        check_class("client/prediction/ClientWorldgenProfileDecoder$Session", "PredictionCacheSampler", "cacheContext")
+        check_class("client/prediction/PredictionTileManager", "generationReady", "acceptsGeneration", "enableGeneration")
+        check_class("client/prediction/PredictionResources", "retireUnusedSampler")
+        check_class("client/prediction/PredictionVoxelCache", "java/security/DigestInputStream", "voxel record has trailing data")
         check_class("networking/client/VSSClientNetworking", "onClientLevelUnload")
         check_class("compat/VoxyCompat$LocalSectionIndex", "settledRegions")
         check_class("compat/VoxyIngestTracker", "realColumnSettled")
@@ -536,7 +585,13 @@ def verify(jar, platform, build_id, source, minecraft=None):
                     and b"submitGeometryResult" in archive.read(n) and b"empty" in archive.read(n) for n in names),
                 "Missing native empty geometry adapter")
         check_class("client/prediction/ClientPredictionState", "updatePredictionState")
-        check_class("client/prediction/PredictionCpuBudget", "generationWaiting", "generationWaitAt")
+        cpu_budget = check_class("client/prediction/PredictionCpuBudget", "generationWaiting", "generationWaitAt", "mode=configured", "detailLimit")
+        require(not any(marker in cpu_budget for marker in (b"getCpuLoad", b"getProcessCpuLoad", b"METRIC_SAMPLER", b"DETAIL_TRICKLE_NANOS", b"RECOVERY_NANOS", b"pressure")),
+                "Machine-wide CPU throttling still packaged")
+        require("dev/xantha/vss/client/prediction/PredictionCpuBudget$ThrottleLevel.class" not in names,
+                "Stale CPU throttle class packaged")
+        require("dev/xantha/vss/client/prediction/PredictionCpuBudget$MetricSample.class" not in names,
+                "Stale CPU sampler class packaged")
         priority = check_class("networking/client/PredictionGenerationPriority", "shared-", "detail-ready")
         require(b"exclusive" not in priority and b"STALL" not in priority, "Exclusive prediction generation gate packaged")
         requests = check_class("networking/client/LodRequestManager", "reserveLocalGeneration")
@@ -625,7 +680,7 @@ def verify(jar, platform, build_id, source, minecraft=None):
             "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
             "bytes": jar.stat().st_size, "nativeSha256": natives,
             "worldgenInterfaceCheck": {"kind": "artifact-presence-reference", "gameplayValidated": False},
-            "integratedFixes": ["community-explicit-far-plane", "community-delegated-ingest-completion", "engine-scoped-real-column-settlement", "community-native-inset-preservation", "legacy-fluid-inset-normalization",
+            "integratedFixes": ["view-priority-background-notifications", "asynchronous-budgeted-retirement", "off-lock-snapshot-disposal", "native-empty-fast-withdrawal", "steady-state-lock-bypass", "configured-shared-cpu-admission", "two-stage-warm-cache-startup", "in-place-native-backend-promotion", "streamed-voxel-content-digest", "stale-prepared-backend-retirement", "native-border-consumer-evidence", "byte-bounded-section-admission", "independent-partial-surface-cache-restore", "early-identical-input-notification", "answer-budget-biome-cache", "terrain-interval-publication", "shared-quart-neighborhoods", "persistent-fair-generation-turn", "community-explicit-far-plane", "community-delegated-ingest-completion", "engine-scoped-real-column-settlement", "community-native-inset-preservation", "legacy-fluid-inset-normalization",
                                 *worldgen_interface_fixes,
                                 *(["native-server-stream-ownership", "native-column-success-receipts", "native-column-timestamp-order"] if minecraft == "1.20.1" else []),
                                 "static-worldgen-codec-context", "inline-stronghold-biome-preference", "registry-context-surface-cache", "versioned-resource-atlas-token", "horizon-planned-root-capacity", "resident-node-traversal-capacity", "non-spinning-gpu-queue-bounds", "two-phase-dirty-capture-handoff", "bounded-capture-retry", "dirty-retention-buffer-fetch", "retired-refresh-barrier", "seeded-fabric-end-biomes", "failed-biome-surface-rejection", "end-decoration-cache-repair", "compact-column-pages", "contributing-feature-query", "native-owner-publication",

@@ -11,7 +11,7 @@ final class PredictionBackendSelection {
         if (sampler instanceof PredictionLodSampler) return;
         TerrainPredictionPlan plan = generator == null ? TerrainPredictionPlan.noise("vss:legacy", 1, false)
                 : TerrainPredictionPlan.read(generator);
-        String executor = sampler instanceof RustTerrainSampler ? "rust"
+        String executor = sampler instanceof PredictionCacheSampler ? "cache" : sampler instanceof RustTerrainSampler ? "rust"
                 : sampler instanceof PredictionFlatTerrainSampler ? "constant-layers" : "java";
         String identity = null;
         String override = sampler.terrainBackendOverride();

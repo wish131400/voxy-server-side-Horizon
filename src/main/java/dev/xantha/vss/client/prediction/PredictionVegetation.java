@@ -190,6 +190,27 @@ final class PredictionVegetation {
         }
     }
 
+    record CachedTile(Tile tile,boolean complete) { }
+    /** Restore every available source without waiting for a missing or generating chunk. */
+    CachedTile restoreForRendering(int x,int z,int span,int spacing,boolean trees,
+            java.util.function.LongPredicate captured,java.util.function.BooleanSupplier current) {
+        requireCurrent(current);
+        if(spacing>8 || !available())return new CachedTile(Tile.EMPTY,true);
+        try(var build=displayCache.begin(x,z,span,spacing,trees)) {
+            var sources=new ArrayList<PredictionVegetationDisplayCache.Source>();boolean complete=true;
+            for(int cz=Math.floorDiv(z,16)-1;cz<=Math.floorDiv(z+span-1,16)+1;cz++)
+                for(int cx=Math.floorDiv(x,16)-1;cx<=Math.floorDiv(x+span-1,16)+1;cx++) {
+                    var cached=chunk(cx,cz,current,true);
+                    if(cached==null)complete=false;
+                    else sources.add(new PredictionVegetationDisplayCache.Source(
+                            PredictionVegetationDisplayCache.chunkKey(cx,cz),cached));
+                }
+            requireCurrent(current);
+            var tile=displayCache.tile(build,sources,captured);meshedBlocks.add(tile.voxelCount());
+            return new CachedTile(tile,complete);
+        }
+    }
+
     private List<PredictionVegetationDisplayCache.Source> generationSources(int x, int z, int span,
             java.util.function.BooleanSupplier current) {
         var sources = new ArrayList<PredictionVegetationDisplayCache.Source>();
@@ -265,6 +286,9 @@ final class PredictionVegetation {
     }
 
     private Map<BlockPos, BlockState> chunk(int x, int z, java.util.function.BooleanSupplier current) {
+        return chunk(x,z,current,false);
+    }
+    private Map<BlockPos, BlockState> chunk(int x,int z,java.util.function.BooleanSupplier current,boolean cacheOnly) {
         requireCurrent(current);
         long key = (long) x << 32 | z & 0xFFFFFFFFL;
         Generation job;
@@ -272,7 +296,10 @@ final class PredictionVegetation {
         synchronized (chunks) {
             var cached = chunks.get(key);
             if (cached != null) { memoryHits.increment(); return cached; }
-            if (generationJobs.containsKey(key)) throw new PredictionWorkDeferred();
+            if (generationJobs.containsKey(key)) {
+                if(cacheOnly)return null;
+                throw new PredictionWorkDeferred();
+            }
             job = new Generation();
             generationJobs.put(key, job);
         }
@@ -282,6 +309,8 @@ final class PredictionVegetation {
             Map<BlockPos, BlockState> result;
             try (var lease = diskCache == null ? null : diskCache.lease(PredictionDiskCache.Key.surface(x, z, settings))) {
                 var data = lease == null ? null : diskCache.readSurfaceData(lease);
+                // Legacy weather recovery invokes world generation and belongs to the generation lane.
+                if(cacheOnly && (data==null || !data.weatherChecked()))return null;
                 result = data == null ? null : data.blocks();
                 if (result != null) {
                     diskHits.increment();

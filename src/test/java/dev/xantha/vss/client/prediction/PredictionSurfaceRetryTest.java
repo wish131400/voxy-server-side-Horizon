@@ -51,7 +51,7 @@ class PredictionSurfaceRetryTest {
         var generation = new BiomeGenerationSettings.PlainBuilder()
                 .addFeature(GenerationStep.Decoration.RAW_GENERATION, Holder.direct(placed)).build();
         var biome = new Biome.BiomeBuilder().hasPrecipitation(true).temperature(.7F).downfall(.5F)
-                .specialEffects(new BiomeSpecialEffects.Builder().waterColor(0).build())
+                .specialEffects(PredictionTestBiomeEffects.empty())
                 .mobSpawnSettings(MobSpawnSettings.EMPTY).generationSettings(generation).build();
         var biomes = new FixedBiomeSource(Holder.direct(biome));
         var lookup = VanillaRegistries.createLookup();

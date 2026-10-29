@@ -18,7 +18,7 @@ class VSSChunkyLimitCommandsTest {
     @BeforeAll static void initialize() {
         if (System.getProperty("vss.configDir") == null)
             System.setProperty("vss.configDir", (java.nio.file.Path.of("build", "tmp", "chunky-limit-command-tests")).resolve("config").toString());
-        net.minecraft.SharedConstants.tryDetectVersion();
+        dev.xantha.vss.testutil.MinecraftTestBootstrap.initialize();
     }
 
     private static CommandDispatcher<CommandSourceStack> dispatcher() {

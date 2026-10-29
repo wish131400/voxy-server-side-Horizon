@@ -127,7 +127,8 @@ class PredictionCacheStorageTest {
         Path save = game.resolve("saves/世界 A");
         var storage = PredictionCacheStorage.forWorld(game, save, "vss:7k4m9pxa", "localhost:12345");
         var sampler = sampler();
-        assertTrue(storage.directory(sampler).startsWith(save.resolve(".vss/prediction/minecraft-1.21.11/surface-v1")));
+        String target=System.getProperty("vss.minecraftTarget","1.21.11");
+        assertTrue(storage.directory(sampler).startsWith(save.resolve(".vss/prediction/minecraft-"+target+"/surface-v1")));
         var key = PredictionDiskCache.Key.surface(0, 0, 1);
         var states = Map.of(new BlockPos(1, 72, 2), Blocks.BIRCH_LEAVES.defaultBlockState());
         try (var cache = storage.open(sampler); var lease = cache.lease(key)) { assertTrue(cache.writeSurface(lease, states)); }

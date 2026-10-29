@@ -44,7 +44,13 @@ public final class StrictVoxyIngestPlugin implements IMixinConfigPlugin {
                     || calls(enqueue, DEQUE, "add", "(" + OBJECT + ")Z").size() != 1) return false;
         } else {
             if (!type.desc.equals(task) || !calls(worker, MAP, "remove", REMOVE).isEmpty()) return false;
-            List<MethodNode> raw = node.methods.stream().filter(m -> m.name.equals("rawIngest0")).toList();
+            String submitDescriptor = "(L" + task + ";)Z";
+            // Some ports forward one raw overload to another. Select the actual
+            // publication, not the number of entry methods. Direct publication
+            // and one verified submit(task) delegation share the worker proof.
+            List<MethodNode> raw = node.methods.stream().filter(m -> m.name.equals("rawIngest0")
+                    && calls(m, DEQUE, "add", "(" + OBJECT + ")Z").size()
+                        + calls(m, node.name, "submit", submitDescriptor).size() == 1).toList();
             if (raw.size() != 1) return false;
             enqueue = raw.get(0);
             if (calls(enqueue, DEQUE, "add", "(" + OBJECT + ")Z").isEmpty()) {
