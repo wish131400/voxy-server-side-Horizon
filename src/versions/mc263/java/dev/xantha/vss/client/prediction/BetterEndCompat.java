@@ -6,6 +6,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import net.minecraft.world.level.biome.BiomeSource;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
+import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.NoiseSettings;
 
 /**
@@ -120,7 +121,7 @@ final class BetterEndCompat {
         return value instanceof Enum<?> enumValue ? enumValue.name() : String.valueOf(value);
     }
 
-    private static final class BetterEndSurface {
+    static final class BetterEndSurface {
         private final Method initNoise;
         private final Method fillTerrainDensity;
         private final int scaleXZ;
@@ -130,11 +131,11 @@ final class BetterEndCompat {
         private final ThreadLocal<double[]> buffers = new ThreadLocal<>();
 
         private BetterEndSurface(Method initNoise, Method fillTerrainDensity,
-                                 NoiseSettings settings) {
+                                 NoiseSettings settings, int[] cellSize) {
             this.initNoise = initNoise;
             this.fillTerrainDensity = fillTerrainDensity;
-            this.scaleXZ = 1;
-            this.scaleY = 1;
+            this.scaleXZ = cellSize[0];
+            this.scaleY = cellSize[1];
             this.maxHeight = settings.height();
             this.minY = settings.minY();
         }
@@ -142,15 +143,28 @@ final class BetterEndCompat {
         static BetterEndSurface open(ClientTerrainSampler base) throws ReflectiveOperationException {
             ClassLoader loader = BetterEndCompat.class.getClassLoader();
             Class<?> terrain = Class.forName(TERRAIN_GENERATOR, false, loader);
+            return open(terrain, base.generatorContext().generatorSettings().value());
+        }
+
+        static BetterEndSurface open(Class<?> terrain, NoiseGeneratorSettings generatorSettings)
+                throws ReflectiveOperationException {
             Method init = terrain.getMethod("initNoise", long.class, BiomeSource.class,
                     net.minecraft.world.level.biome.Climate.Sampler.class);
             Method fill = terrain.getMethod("fillTerrainDensity", double[].class,
                     int.class, int.class, int.class, int.class, int.class);
-            NoiseSettings settings = base.generatorContext().generatorSettings().value().noiseSettings();
+            NoiseSettings settings = generatorSettings.noiseSettings();
             if (settings.height() <= 0) {
                 return null;
             }
-            return new BetterEndSurface(init, fill, settings);
+            // 26.3 moved the interpolation grid out of NoiseSettings. BetterEnd
+            // resolves the actual grid from the final density graph, including
+            // custom End settings; unit cells change island coordinates/depth.
+            int[] cellSize = (int[]) terrain.getMethod("islandCellSize", NoiseGeneratorSettings.class)
+                    .invoke(null, generatorSettings);
+            if (cellSize == null || cellSize.length != 2 || cellSize[0] <= 0 || cellSize[1] <= 0) {
+                throw new IllegalStateException("BetterEnd returned an invalid island interpolation grid");
+            }
+            return new BetterEndSurface(init, fill, settings, cellSize);
         }
 
         void initialize(long seed, BiomeSource source,

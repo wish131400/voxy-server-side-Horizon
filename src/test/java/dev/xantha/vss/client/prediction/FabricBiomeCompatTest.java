@@ -17,7 +17,9 @@ class FabricBiomeCompatTest {
     void copiedSeedRestoresExactEndBiomeNoiseAcrossWorldSeeds() throws Exception {
         try (var loader = new URLClassLoader(new java.net.URL[]{
                 Path.of(System.getProperty("vss.fabricBiomeJar")).toUri().toURL()}, getClass().getClassLoader())) {
-            var type = loader.loadClass("net.fabricmc.fabric.mixin.biome.MultiNoiseUtilMultiNoiseSamplerMixin");
+            Class<?> type;
+            try { type = loader.loadClass("net.fabricmc.fabric.mixin.biome.ClimateSamplerMixin"); }
+            catch (ClassNotFoundException legacy) { type = loader.loadClass("net.fabricmc.fabric.mixin.biome.MultiNoiseUtilMultiNoiseSamplerMixin"); }
             var seed = type.getMethod("fabric_setSeed", long.class);
             var noise = type.getMethod("fabric_getEndBiomesSampler");
             for (long value : new long[]{0, 42, -1, Long.MAX_VALUE}) {
@@ -28,12 +30,16 @@ class FabricBiomeCompatTest {
                 assertTrue(unseeded.getCause().getMessage().contains("doesn't have a seed set"));
                 FabricBiomeCompat.copyClimateContext(source, target);
                 assertEquals(value, type.getMethod("fabric_getSeed").invoke(target));
-                var expected = (net.minecraft.world.level.levelgen.synth.ImprovedNoise) noise.invoke(source);
-                var actual = (net.minecraft.world.level.levelgen.synth.ImprovedNoise) noise.invoke(target);
+                Object expected = noise.invoke(source);
+                java.lang.reflect.Method sample = java.util.Arrays.stream(expected.getClass().getMethods())
+                        .filter(method -> java.util.List.of("noise", "getValue", "get").contains(method.getName())
+                                && java.util.Arrays.equals(method.getParameterTypes(), new Class<?>[]{double.class, double.class, double.class}))
+                        .findFirst().orElseThrow();
+                Object actual = noise.invoke(target);
                 assertSame(actual, noise.invoke(target), "The optional API retains its own lazy noise cache");
                 for (int i = -64; i < 64; i++)
-                    assertEquals(expected.noise(i * 3.75, i * .13, -i * 11.25),
-                            actual.noise(i * 3.75, i * .13, -i * 11.25));
+                    assertEquals(sample.invoke(expected, i * 3.75, i * .13, -i * 11.25),
+                            sample.invoke(actual, i * 3.75, i * .13, -i * 11.25));
             }
         }
     }

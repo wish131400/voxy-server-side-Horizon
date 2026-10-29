@@ -8,7 +8,20 @@ import net.minecraft.world.level.levelgen.densityfunction.*;
 public final class DensityFunctionSnapshot {
     private DensityFunctionSnapshot() { }
     public static DensityFunction applied(DensityFunction function) {
-        return DfRewriteRule.INLINE_REFERENCE.rewrite(function.rewriteChildren(DensityFunctionSnapshot::applied));
+        DensityFunction inlined = DfRewriteRule.INLINE_REFERENCE.rewrite(function);
+        if (inlined != function) return applied(inlined);
+        // Lithostitched's codec deliberately serializes the pre-modifier
+        // original graph. Its sampler executes full, including nested wrappers.
+        // Rewrite the executable graph before invoking any replay/source codec.
+        if (function.getClass().getName().equals(
+                "dev.worldgen.lithostitched.impl.worldgen.densityfunction.marker.MergedFunction")) {
+            try {
+                return applied((DensityFunction) function.getClass().getMethod("full").invoke(function));
+            } catch (ReflectiveOperationException failure) {
+                throw new IllegalStateException("Cannot capture applied Lithostitched density function", failure);
+            }
+        }
+        return function.rewriteChildren(DensityFunctionSnapshot::applied);
     }
     public static NoiseGeneratorSettings applied(NoiseGeneratorSettings s) {
         NoiseRouter r = s.noiseRouter();

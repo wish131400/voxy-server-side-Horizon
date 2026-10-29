@@ -39,6 +39,12 @@ allprojects {
         if (providers.gradleProperty('vssTectonicJar').isPresent()) {
             systemProperty 'vss.tectonicJar', providers.gradleProperty('vssTectonicJar').get()
         }
+        if (providers.gradleProperty('vssTerraBlenderJar').isPresent()) {
+            systemProperty 'vss.terrablenderJar', providers.gradleProperty('vssTerraBlenderJar').get()
+        }
+        if (providers.gradleProperty('vssBetterEndJar').isPresent()) {
+            systemProperty 'vss.betterendJar', providers.gradleProperty('vssBetterEndJar').get()
+        }
         if (providers.gradleProperty('vssVoxyJar').isPresent()) {
             systemProperty 'vss.voxyJar', providers.gradleProperty('vssVoxyJar').get()
         }

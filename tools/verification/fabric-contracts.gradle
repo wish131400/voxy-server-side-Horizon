@@ -43,12 +43,24 @@ tasks.register('fabricMigrationTest', Test) {
      'PredictionPlacementExecutorTest', 'PredictionVegetationTest',
      'PredictionNetherDecorationTest', 'PredictionNativeNetherFeatureTest',
      'RustVegetationDescriptorsTest'].each { include "**/${it}.class" }
+    ['FabricBiomeCompatTest', 'WorldgenRegistryDependenciesTest', 'WorldgenRegistryTagsTest',
+     'PredictionWorldgenCapabilitiesTest', 'PredictionLodBackendsTest', 'PredictionBackendSelectionTest',
+     'TerraBlenderRequiredRoutingTest', 'TerraBlenderEndRoutingTest', 'TerraBlenderEndSnapshotTest', 'TerraBlenderEndBiomeSourceTest',
+     'BetterEndCompatTest'].each { include "**/${it}.class" }
     if (minecraft_version == '26.3') {
         ['FloatDensityCompilerTest', 'FloatMaterialPipelineTest'].each { include "**/${it}.class" }
     }
     maxHeapSize = '3G'
     maxParallelForks = 1
     forkEvery = 1
+    doFirst {
+        // Use the biome API selected by Loom for this exact Minecraft target.
+        if (!providers.gradleProperty('vssFabricBiomeJar').isPresent()) {
+            def biomeApi = classpath.files.find { it.name.contains('fabric-biome-api-v1') && it.name.endsWith('.jar') }
+            if (biomeApi == null) throw new GradleException('Selected Fabric biome API is missing from the runtime classpath')
+            systemProperty 'vss.fabricBiomeJar', biomeApi.absolutePath
+        }
+    }
 }
 
 // Explicit GPU invocation keeps headless CI separate from real driver verification.

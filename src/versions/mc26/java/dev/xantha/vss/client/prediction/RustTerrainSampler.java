@@ -118,6 +118,8 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
             timing.finish();
             if (VSSClientConfig.CONFIG.debugLogging) VSSLogger.debug("VSS prediction backend=" + ALGORITHM + ", dimension=" + profile.dimension());
             return sampler;
+        } catch (java.util.concurrent.CancellationException cancelled) {
+            throw cancelled;
         } catch (Exception | LinkageError failure) {
             VSSLogger.warn("VSS native terrain snapshot rejected for " + profile.dimension()
                     + "; prediction keeps the Java sampler: " + failure);

@@ -209,6 +209,87 @@ def verify_version_paths(read_class, names, minecraft):
         calls(cls, "bind", compare + "CompareOp", "GREATER_THAN_OR_EQUAL")
 
 
+def verify_worldgen_interface_paths(read_class, minecraft):
+    """Check packaged worldgen call sites and markers, without asserting execution."""
+    prefix = "dev/xantha/vss/"
+
+    def calls(cls, method, owner, member):
+        references = class_references(read_class(cls))
+        if not any(owner == entry[0] and member == entry[1]
+                   for (declared, _), entries in references.items()
+                   if method is None or declared == method for entry in entries):
+            raise ValueError(f"Missing worldgen implementation reference: {cls}.{method or '*'} -> {owner}.{member}")
+
+    snapshot = "networking/server/session/WorldgenCodecSnapshot"
+    registries = "client/prediction/ClientWorldgenRegistries"
+    dependencies = "common/worldgen/WorldgenRegistryDependencies"
+    tags = "common/worldgen/WorldgenRegistryTags"
+    decoder = "client/prediction/ClientWorldgenProfileDecoder"
+    read_class(snapshot, "registry_tags")
+    read_class(registries, "registry_tags")
+    calls(snapshot, "encodeRegistries", prefix + dependencies, "encodeTags")
+    calls(dependencies, None, prefix + tags, "encode")
+    calls(registries, "decode", prefix + registries, "bindSnapshotTags")
+    calls(registries, "bindSnapshotTags", prefix + tags, "bind")
+    # Both ownership lookups must still be present at the binding call site.
+    calls(registries, "bindSnapshotTags", prefix + registries, "snapshotValues")
+    calls(registries, "bindSnapshotTags", prefix + registries, "snapshotRegistries")
+
+    end_snapshot = "networking/server/session/TerraBlenderEndSnapshot"
+    end_source = "client/prediction/TerraBlenderEndBiomeSource"
+    end_routing = "common/worldgen/TerraBlenderEndRouting"
+    calls("networking/server/session/WorldgenProfileBuilder", "build", prefix + snapshot, "withRuntimeBiomeSource")
+    calls(snapshot, "withRuntimeBiomeSource", prefix + end_snapshot, "capture")
+    read_class(snapshot, "vss_terrablender_end", "Required TerraBlender End routing could not be captured")
+    read_class(end_snapshot, "terrablender.worldgen.IExtendedTheEndBiomeSource", "tbInitialized", "density_coordinates")
+    calls(decoder, "decodeJavaSampler", prefix + end_source, "<init>")
+    calls("client/prediction/TerraBlenderBackend", "open", prefix + end_source, "<init>")
+    calls(end_source, "<init>", prefix + end_routing, "<init>")
+    # 26.3 samples in a resolver lambda; older targets implement getNoiseBiome.
+    calls(end_source, None, prefix + end_routing, "sample")
+
+    lod = "client/prediction/PredictionLodSampler"
+    read_class(lod, ":capture-palette-r2:")
+    calls(lod, "captureBiomeIndex", prefix + lod, "sourceBiomeIndices")
+    calls(lod, "cacheBiomes", prefix + lod, "sourceBiomeNames")
+    calls("client/prediction/ClientCaptureExtractor", "extractColumn",
+          prefix + "client/prediction/ClientTerrainSampler", "captureBiomeIndex")
+
+    read_class(decoder, "Required TerraBlender region routing unavailable", "vss_terrablender_end")
+    calls(decoder, "decodeJavaSampler", prefix + "client/prediction/TerraBlenderBackend", "buildRoutingSource")
+    native = "client/prediction/RustTerrainSampler"
+    read_class(native, "Native library lacks required TerraBlender routing", "vss_terrablender_end")
+    calls(native, "open", prefix + native, "terrablenderRouting")
+    calls(native, "open", prefix + "client/prediction/RustWorldgenBackend", "close")
+
+    density = "common/worldgen/DensityFunctionSnapshot"
+    calls(snapshot, None, prefix + density, "applied")
+    if minecraft == "26.3":
+        read_class(density, "dev.worldgen.lithostitched.impl.worldgen.densityfunction.marker.MergedFunction", "full")
+        calls(density, "applied", "java/lang/Class", "getMethod")
+        calls(density, "applied", "java/lang/reflect/Method", "invoke")
+        calls(density, "applied", prefix + density, "applied")
+    else:
+        calls(density, "applied", prefix + density, "UNWRAP")
+        calls(density, None, prefix + density, "legacyTectonic")
+        if not any(entry[1] == "<instanceof>" for entries in class_references(read_class(density)).values()
+                   for entry in entries):
+            raise ValueError("Applied density graph snapshot lacks its holder-unwrapping instruction")
+
+    fixes = ["worldgen-registry-tag-snapshot-binding", "terrablender-end-routing-snapshot-replay",
+             "lod-provider-capture-palette-r2", "required-biome-routing-fallback-guard",
+             "applied-density-graph-snapshot"]
+    if minecraft == "26.3":
+        better_end = "client/prediction/BetterEndCompat$BetterEndSurface"
+        read_class(better_end, "islandCellSize", "BetterEnd returned an invalid island interpolation grid")
+        calls(better_end, "open", "java/lang/Class", "getMethod")
+        calls(better_end, "open", "java/lang/reflect/Method", "invoke")
+        calls(better_end, "<init>", prefix + better_end, "scaleXZ")
+        calls(better_end, "<init>", prefix + better_end, "scaleY")
+        fixes.append("betterend-26.3-island-cell-size")
+    return fixes
+
+
 def source_files(root):
     paths = [p for p in (root / "src/main").rglob("*") if p.is_file()]
     paths += [p for p in (root / "src/versions").rglob("*") if p.is_file()]
@@ -283,6 +364,7 @@ def verify(jar, platform, build_id, source, minecraft=None):
                     for (method, _), entries in feature_snapshot.items() if method == "correct"),
                 "Cherry foliage snapshot does not read the target's actual remapped field")
         verify_version_paths(lambda name: check_class("client/prediction/" + name), names, minecraft)
+        worldgen_interface_fixes = verify_worldgen_interface_paths(check_class, minecraft)
         check_class("client/prediction/PredictionClimateSampler", "FabricBiomeCompat", "copyClimateContext")
         check_class("client/prediction/FabricBiomeCompat", "net.fabricmc.fabric.impl.biome.MultiNoiseSamplerHooks", "fabric_getSeed", "fabric_setSeed")
         check_class("client/prediction/PredictionBiomeCache", "LookupFailure", "sample")
@@ -542,7 +624,9 @@ def verify(jar, platform, build_id, source, minecraft=None):
     return {"jar": jar.name, "platform": platform, "buildId": build_id,
             "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
             "bytes": jar.stat().st_size, "nativeSha256": natives,
+            "worldgenInterfaceCheck": {"kind": "artifact-presence-reference", "gameplayValidated": False},
             "integratedFixes": ["community-explicit-far-plane", "community-delegated-ingest-completion", "engine-scoped-real-column-settlement", "community-native-inset-preservation", "legacy-fluid-inset-normalization",
+                                *worldgen_interface_fixes,
                                 *(["native-server-stream-ownership", "native-column-success-receipts", "native-column-timestamp-order"] if minecraft == "1.20.1" else []),
                                 "static-worldgen-codec-context", "inline-stronghold-biome-preference", "registry-context-surface-cache", "versioned-resource-atlas-token", "horizon-planned-root-capacity", "resident-node-traversal-capacity", "non-spinning-gpu-queue-bounds", "two-phase-dirty-capture-handoff", "bounded-capture-retry", "dirty-retention-buffer-fetch", "retired-refresh-barrier", "seeded-fabric-end-biomes", "failed-biome-surface-rejection", "end-decoration-cache-repair", "compact-column-pages", "contributing-feature-query", "native-owner-publication",
                                 "layout-plan-domain-reset", "partial-vegetation-retention", "terrain-only-parent-proof",

@@ -267,6 +267,18 @@ final class ClientWorldgenProfileDecoder {
                 : BiomeSource.CODEC
                 .parse(registries.ops(), generatorRoot.get("biome_source"))
                 .getOrThrow(false, message -> { throw new IllegalArgumentException(message); });
+        // A required server routing section can never fall through to the lossy vanilla codec.
+        if (generatorRoot.has("vss_terrablender")) {
+            biomeSource = TerraBlenderBackend.buildRoutingSource(generatorRoot.getAsJsonObject("vss_terrablender"),
+                    biomeSource, profile.seed(), registries);
+            if (biomeSource == null) throw new IllegalArgumentException("Required TerraBlender region routing unavailable");
+        }
+        if (generatorRoot.has("vss_terrablender_end")) {
+            if (!generatorRoot.getAsJsonObject("biome_source").get("type").getAsString().equals("minecraft:the_end"))
+                throw new IllegalArgumentException("TerraBlender End routing requires the End biome source");
+            biomeSource = new TerraBlenderEndBiomeSource(generatorRoot.getAsJsonObject("vss_terrablender_end"),
+                    profile.seed(), registries);
+        }
         return decodeJavaSampler(profile, generatorRoot, registries, clientRegistries, biomeSource);
     }
 

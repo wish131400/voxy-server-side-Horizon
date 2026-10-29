@@ -23,6 +23,13 @@ final class PredictionBackendSelection {
                     + ':' + WorldgenJson.sha256(registries);
         boolean explicitOverride = override != null && plan.kind() == TerrainPredictionPlan.Kind.UNAVAILABLE;
         if (explicitOverride) identity = override + ':' + WorldgenJson.sha256(generator) + ':' + WorldgenJson.sha256(registries);
+        // Earlier snapshots lost named-set membership and End routing. Their finished
+        // samples cannot prove the new biome/material/decoration result, even for
+        // the same seed. Keep legacy readers out of this corrected namespace.
+        if ((registries != null && registries.has("registry_tags"))
+                || (generator != null && generator.has("vss_terrablender_end")))
+            identity = "worldgen-compat-r2:" + WorldgenJson.sha256(generator == null ? new JsonObject() : generator)
+                    + ':' + WorldgenJson.sha256(registries == null ? new JsonObject() : registries);
         sampler.bindPredictionBackend("kind=" + (explicitOverride ? "BACKEND_OVERRIDE,snapshotKind=" + plan.kind() : plan.kind())
                 + ",backend=" + plan.backend() + (override == null ? "" : ",selectedBackend=" + override)
                 + ",revision=" + plan.revision() + ",executor=" + executor

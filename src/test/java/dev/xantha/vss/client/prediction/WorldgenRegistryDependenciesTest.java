@@ -13,7 +13,14 @@ import org.junit.jupiter.api.Test;
 
 class WorldgenRegistryDependenciesTest {
     @org.junit.jupiter.api.io.TempDir java.nio.file.Path temporary;
-    @BeforeAll static void bootstrap() { ClientTerrainSamplerTest.bootstrapMinecraft(); }
+    @BeforeAll static void bootstrap() throws Exception {
+        ClientTerrainSamplerTest.bootstrapMinecraft();
+        Object loader = net.fabricmc.loader.api.FabricLoader.getInstance();
+        java.nio.file.Path standalone = java.nio.file.Files.createTempDirectory("vss-worldgen-audit-");
+        for (String name : java.util.List.of("gameDir", "configDir")) {
+            var field = loader.getClass().getDeclaredField(name); field.setAccessible(true); field.set(loader, standalone);
+        }
+    }
 
     @Test void dependencyClosureRestoresUnsyncedRegistriesAndForwardHolders() {
         var configKey = ResourceKey.<Integer>createRegistryKey(Identifier.parse("example:noise_config"));
@@ -47,7 +54,7 @@ class WorldgenRegistryDependenciesTest {
         assertTrue(regionCodec.parse(oldClient.ops(), encoded).error().isPresent(), "reproduce missing client registry");
         var client = ClientWorldgenRegistries.decode(root, RegistryAccess.EMPTY, codecs);
         assertEquals(731, regionCodec.parse(client.ops(), encoded).getOrThrow().value().value());
-        assertEquals(731, client.access().lookupOrThrow(configKey).get(configId));
+        assertEquals(731, client.access().lookupOrThrow(configKey).getOrThrow(configId).value());
         assertThrows(IllegalStateException.class, () -> ClientWorldgenRegistries.decode(root, RegistryAccess.EMPTY, List.of()));
     }
 
@@ -89,7 +96,7 @@ class WorldgenRegistryDependenciesTest {
                 var actualRandom = net.minecraft.util.RandomSource.create(78123);
                 for (int i = 0; i < 32; i++) assertEquals(
                         randomTemplate.invoke(entry.getValue(), expectedRandom),
-                        randomTemplate.invoke(actual.get(entry.getKey()), actualRandom));
+                        randomTemplate.invoke(actual.getOrThrow(entry.getKey()).value(), actualRandom));
             }
         }
     }
@@ -176,7 +183,7 @@ class WorldgenRegistryDependenciesTest {
             assertNotEquals(expected.compute(point), actual.compute(point), "unbound noise reproduces wrong seed");
             client.bindWorldSeed(seed);
             for (var entry : registry.entrySet()) {
-                Object decodedConfig = client.access().lookupOrThrow(key).get(entry.getKey());
+                Object decodedConfig = client.access().lookupOrThrow(key).getOrThrow(entry.getKey()).value();
                 assertNotSame(entry.getValue(), decodedConfig);
                 var sample = configType.getMethod("sample", double.class, double.class, double.class);
                 for (int i = 0; i < 64; i++) assertEquals(

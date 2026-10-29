@@ -1,15 +1,17 @@
-//! Explicitly opt-in comparison against a released Java 2.0.6 fixture. Generate
-//! it with LithostitchedNativeTest.releasedScalarAndVolumeReferences, then set
-//! VSS_LITHOSTITCHED_263_FIXTURE and run this test with --ignored.
+//! Comparison against the released Java 2.0.6 scalar/volume fixture. Regenerate
+//! with LithostitchedNativeTest.releasedScalarAndVolumeReferences. An explicit
+//! VSS_LITHOSTITCHED_263_FIXTURE path can audit a freshly generated reference.
 use serde_json::Value;
 use vss_native_core::density::{Graph, Mode, ModernVolume};
 
 #[test]
-#[ignore = "requires the released Lithostitched 2.0.6 scalar/volume fixture"]
 fn released_lithostitched_263_scalar_and_volume_bits() {
-    let path = std::env::var("VSS_LITHOSTITCHED_263_FIXTURE")
-        .expect("set VSS_LITHOSTITCHED_263_FIXTURE to the released Java reference JSON");
-    let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let reference = std::env::var_os("VSS_LITHOSTITCHED_263_FIXTURE")
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .unwrap_or_else(|| {
+            include_str!("fixtures/worldgen263/lithostitched-2.0.6.json").to_owned()
+        });
+    let doc: Value = serde_json::from_str(&reference).unwrap();
     let mut checked = 0;
     for seed in [0, -918273645, i64::MIN, i64::MAX] {
         let graph = Graph::from_document(seed, &doc).unwrap();
