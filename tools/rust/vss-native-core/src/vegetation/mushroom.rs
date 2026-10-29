@@ -5,9 +5,10 @@ pub struct Mushroom {
     radius: i32,
     cap: StateProvider,
     stem: StateProvider,
+    can_place_on: Option<Predicate>,
 }
 impl Mushroom {
-    pub(super) fn parse(v: &Value, red: bool, p: &mut Palette) -> Result<Self> {
+    pub(super) fn parse(v: &Value, red: bool, doc: &Value, p: &mut Palette) -> Result<Self> {
         let radius = v["foliage_radius"].as_i64().unwrap_or(2);
         if !(1..=8).contains(&radius) {
             return Err("unsupported mushroom foliage radius".into());
@@ -15,8 +16,12 @@ impl Mushroom {
         Ok(Self {
             red,
             radius: radius as i32,
-            cap: StateProvider::parse(&v["cap_provider"], p)?,
-            stem: StateProvider::parse(&v["stem_provider"], p)?,
+            cap: StateProvider::parse_with_registries(&v["cap_provider"], doc, p)?,
+            stem: StateProvider::parse_with_registries(&v["stem_provider"], doc, p)?,
+            can_place_on: v
+                .get("can_place_on")
+                .map(|v| Predicate::parse(v, p, 0))
+                .transpose()?,
         })
     }
     pub(super) fn place(&self, w: &mut Volume, r: &mut Random, p: Pos) -> Result<bool> {
@@ -28,7 +33,11 @@ impl Mushroom {
             return Ok(false);
         }
         let below = w.get(offset(p, 0, -1, 0));
-        if !w.palette.tag(below, "minecraft:dirt")
+        if let Some(predicate) = &self.can_place_on {
+            if !predicate.test(w, offset(p, 0, -1, 0))? {
+                return Ok(false);
+            }
+        } else if !w.palette.tag(below, "minecraft:dirt")
             && !w.palette.tag(below, "minecraft:mushroom_grow_block")
         {
             return Ok(false);
@@ -40,8 +49,11 @@ impl Mushroom {
             for x in -radius..=radius {
                 for z in -radius..=radius {
                     let b = w.get(offset(p, x, y, z));
-                    if w.palette.definition(b).motion_blocking
-                        && !w.palette.tag(b, "minecraft:leaves")
+                    if (if self.can_place_on.is_some() {
+                        !w.palette.is_air(b)
+                    } else {
+                        w.palette.definition(b).motion_blocking
+                    }) && !w.palette.tag(b, "minecraft:leaves")
                     {
                         return Ok(false);
                     }
@@ -65,10 +77,19 @@ impl Mushroom {
                         }
                         let q = offset(p, x, y, z);
                         let old = w.get(q);
-                        if blocked(&w.palette, old) {
+                        let sampled = if self.can_place_on.is_some() {
+                            Some(self.cap.state_in(r, p, w)?)
+                        } else {
+                            None
+                        };
+                        if self.blocked(&w.palette, old) {
                             continue;
                         }
-                        let mut state = self.cap.state(r, p, &mut w.palette)?;
+                        let mut state = if let Some(state) = sampled {
+                            state
+                        } else {
+                            self.cap.state_in(r, p, w)?
+                        };
                         let props = [
                             ("up", y >= height - 1),
                             ("west", x < -side),
@@ -96,10 +117,19 @@ impl Mushroom {
                     }
                     let q = offset(p, x, height, z);
                     let old = w.get(q);
-                    if blocked(&w.palette, old) {
+                    let sampled = if self.can_place_on.is_some() {
+                        Some(self.cap.state_in(r, p, w)?)
+                    } else {
+                        None
+                    };
+                    if self.blocked(&w.palette, old) {
                         continue;
                     }
-                    let mut state = self.cap.state(r, p, &mut w.palette)?;
+                    let mut state = if let Some(state) = sampled {
+                        state
+                    } else {
+                        self.cap.state_in(r, p, w)?
+                    };
                     let props = [
                         ("west", west || edge_z && x == 1 - radius),
                         ("east", east || edge_z && x == radius - 1),
@@ -114,12 +144,28 @@ impl Mushroom {
         for y in 0..height {
             let q = offset(p, 0, y, 0);
             let old = w.get(q);
-            if !blocked(&w.palette, old) {
-                let state = self.stem.state(r, p, &mut w.palette)?;
+            let sampled = if self.can_place_on.is_some() {
+                Some(self.stem.state_in(r, p, w)?)
+            } else {
+                None
+            };
+            if !self.blocked(&w.palette, old) {
+                let state = if let Some(state) = sampled {
+                    state
+                } else {
+                    self.stem.state_in(r, p, w)?
+                };
                 w.set(q, state);
             }
         }
         Ok(true)
+    }
+    fn blocked(&self, p: &Palette, id: StateId) -> bool {
+        if self.can_place_on.is_some() {
+            !p.is_air(id) && !p.tag(id, "minecraft:replaceable_by_mushrooms")
+        } else {
+            p.definition(id).motion_blocking && !p.tag(id, "minecraft:leaves")
+        }
     }
 }
 fn apply_flags(p: &mut Palette, mut state: StateId, flags: &[(&str, bool)]) -> Result<StateId> {
@@ -132,8 +178,4 @@ fn apply_flags(p: &mut Palette, mut state: StateId, flags: &[(&str, bool)]) -> R
         }
     }
     Ok(state)
-}
-
-fn blocked(p: &Palette, id: StateId) -> bool {
-    p.definition(id).motion_blocking && !p.tag(id, "minecraft:leaves")
 }

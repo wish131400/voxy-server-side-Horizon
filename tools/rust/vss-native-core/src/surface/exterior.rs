@@ -67,7 +67,7 @@ impl Surface {
                     }
                 }
                 above += 1;
-                if state == self.default {
+                if self.modern || state == self.default {
                     let p = [x, y, z];
                     let (name, data) = biome(p)?;
                     let c = Context {
@@ -82,7 +82,7 @@ impl Surface {
                         water,
                         min_surface,
                     };
-                    if let Some(id) = self.rule(&self.rule, graph, &c) {
+                    if let Some(id) = self.rule(&self.rule, graph, &c, &mut Some(&mut job.scratch)) {
                         column.blocks[(y - column.bottom) as usize] = id;
                     }
                 }

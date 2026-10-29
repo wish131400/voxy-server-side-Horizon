@@ -5,7 +5,7 @@ pub(super) enum Decorator {
     LeafVine(f32),
     Cocoa(f32),
     Beehive(f32),
-    Ground(StateProvider),
+    Ground(StateProvider, bool),
     Attached {
         chance: f32,
         xz: i32,
@@ -16,13 +16,16 @@ pub(super) enum Decorator {
     },
 }
 impl Decorator {
-    pub fn parse(v: &Value, palette: &mut Palette) -> Result<Self> {
+    pub fn parse(v: &Value, doc: &Value, palette: &mut Palette) -> Result<Self> {
         Ok(match minecraft_type(v)? {
             "trunk_vine" => Self::TrunkVine,
             "leave_vine" => Self::LeafVine(number(v, "probability")? as f32),
             "cocoa" => Self::Cocoa(number(v, "probability")? as f32),
             "beehive" => Self::Beehive(number(v, "probability")? as f32),
-            "alter_ground" => Self::Ground(StateProvider::parse(&v["provider"], palette)?),
+            "alter_ground" => Self::Ground(
+                StateProvider::parse_with_registries(&v["provider"], doc, palette)?,
+                doc["vss_density_semantics"].as_str() == Some("float-26.3"),
+            ),
             "attached_to_leaves" => {
                 let xz = integer(v, "exclusion_radius_xz")?;
                 let y = integer(v, "exclusion_radius_y")?;
@@ -43,7 +46,11 @@ impl Decorator {
                     chance: number(v, "probability")? as f32,
                     xz,
                     y,
-                    provider: StateProvider::parse(&v["block_provider"], palette)?,
+                    provider: StateProvider::parse_with_registries(
+                        &v["block_provider"],
+                        doc,
+                        palette,
+                    )?,
                     empty,
                     directions,
                 }
@@ -172,7 +179,7 @@ impl Decorator {
                     }
                 }
             }
-            Self::Ground(provider) => {
+            Self::Ground(provider, modern) => {
                 let mut list = vec![];
                 if roots.is_empty() {
                     list.extend_from_slice(logs);
@@ -185,14 +192,14 @@ impl Decorator {
                 if let Some(&first) = list.first() {
                     for p in list.into_iter().filter(|p| p[1] == first[1]) {
                         for (x, z) in [(-1, -1), (2, -1), (-1, 2), (2, 2)] {
-                            circle(w, r, offset(p, x, 0, z), provider, out)?;
+                            circle(w, r, offset(p, x, 0, z), provider, *modern, out)?;
                         }
                         for _ in 0..5 {
                             let k = r.next_bounded(64);
                             let x = k % 8;
                             let z = k / 8;
                             if x == 0 || x == 7 || z == 0 || z == 7 {
-                                circle(w, r, offset(p, x - 3, 0, z - 3), provider, out)?;
+                                circle(w, r, offset(p, x - 3, 0, z - 3), provider, *modern, out)?;
                             }
                         }
                     }
@@ -235,7 +242,7 @@ impl Decorator {
                                 }
                             }
                         }
-                        let state = provider.state(r, q, &mut w.palette)?;
+                        let state = provider.state_in(r, q, w)?;
                         w.set(q, state);
                         out.push(q);
                     }
@@ -250,6 +257,7 @@ fn circle(
     r: &mut Random,
     p: Pos,
     provider: &StateProvider,
+    modern: bool,
     out: &mut Vec<Pos>,
 ) -> Result<()> {
     for dx in -2i32..=2 {
@@ -261,8 +269,19 @@ fn circle(
             for y in (-3..=2).rev() {
                 let q = offset(base, 0, y, 0);
                 let b = w.get(q);
+                if modern {
+                    if let Some(state) = provider.optional_state(r, q, w)? {
+                        w.set(q, state);
+                        out.push(q);
+                        break;
+                    }
+                    if !w.palette.is_air(b) && y < 0 {
+                        break;
+                    }
+                    continue;
+                }
                 if w.palette.tag(b, "minecraft:dirt") {
-                    let state = provider.state(r, base, &mut w.palette)?;
+                    let state = provider.state_in(r, base, w)?;
                     w.set(q, state);
                     out.push(q);
                     break;

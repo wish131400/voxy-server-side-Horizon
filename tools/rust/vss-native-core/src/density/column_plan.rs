@@ -32,6 +32,7 @@ impl ColumnPlan {
         let mut count = 0;
         for node in &g.nodes {
             let y = match node {
+                Node::Modern(n) => n.uses_y(&dependent),
                 Node::Constant(_) | Node::End(_) | Node::FtfNoise(..) => false,
                 Node::FindTopSurface { upper, .. } => dependent[*upper],
                 Node::Axis(a) => *a == 1,

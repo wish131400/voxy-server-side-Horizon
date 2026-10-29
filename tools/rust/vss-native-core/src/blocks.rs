@@ -32,6 +32,8 @@ pub struct Definition {
     pub replaceable: Option<bool>,
     pub support_faces: Option<u8>,
     pub shape_update: String,
+    /// Exported only when the Java block inherits the unconditional base hook.
+    pub survival_unconditional: bool,
 }
 #[derive(Clone)]
 pub struct Palette {
@@ -86,6 +88,7 @@ impl Palette {
                     .as_str()
                     .unwrap_or("compatibility")
                     .into(),
+                survival_unconditional: value["survival"].as_str() == Some("none"),
             });
         }
         if definitions.len() > 65536 {
@@ -110,12 +113,17 @@ impl Palette {
         let mut source = 0i32;
         for group in doc["groups"].as_array().ok_or("missing palette groups")? {
             let name = string(group, "name")?;
-            let keys: Vec<String> = serde_json::from_value(group["properties"].clone()).map_err(|e| e.to_string())?;
-            let values: Vec<Vec<String>> = serde_json::from_value(group["values"].clone()).map_err(|e| e.to_string())?;
+            let keys: Vec<String> =
+                serde_json::from_value(group["properties"].clone()).map_err(|e| e.to_string())?;
+            let values: Vec<Vec<String>> =
+                serde_json::from_value(group["values"].clone()).map_err(|e| e.to_string())?;
             if keys.len() != values.len() || values.iter().any(Vec::is_empty) {
                 return Err("invalid compact properties".into());
             }
-            let def_index = *palette.definitions.get(name).ok_or("unknown compact block")?;
+            let def_index = *palette
+                .definitions
+                .get(name)
+                .ok_or("unknown compact block")?;
             let def = &palette.definition_values[def_index];
             let unique: HashSet<_> = keys.iter().collect();
             if unique.len() != keys.len() || keys.len() != def.properties.len() {
@@ -124,22 +132,35 @@ impl Palette {
             for (key, choices) in keys.iter().zip(&values) {
                 let allowed = def.properties.get(key).ok_or("unknown compact property")?;
                 if choices.iter().collect::<HashSet<_>>().len() != choices.len()
-                    || choices.iter().any(|v| !allowed.contains(v)) {
+                    || choices.iter().any(|v| !allowed.contains(v))
+                {
                     return Err("invalid compact property value".into());
                 }
             }
             for code in group["codes"].as_array().ok_or("missing compact states")? {
-                if source >= 2_000_000 { return Err("block state budget exceeded".into()); }
+                if source >= 2_000_000 {
+                    return Err("block state budget exceeded".into());
+                }
                 let mut code = code.as_u64().ok_or("invalid compact state code")?;
                 let mut properties = BTreeMap::new();
                 for (key, choices) in keys.iter().zip(&values) {
-                    properties.insert(key.clone(), choices[(code % choices.len() as u64) as usize].clone());
+                    properties.insert(
+                        key.clone(),
+                        choices[(code % choices.len() as u64) as usize].clone(),
+                    );
                     code /= choices.len() as u64;
                 }
-                if code != 0 { return Err("compact state code out of range".into()); }
-                let id = palette.insert(State { name: name.into(), properties })?;
+                if code != 0 {
+                    return Err("compact state code out of range".into());
+                }
+                let id = palette.insert(State {
+                    name: name.into(),
+                    properties,
+                })?;
                 let info = &mut Arc::make_mut(&mut palette.state_info)[id as usize];
-                if info.source >= 0 { return Err("duplicate compact state".into()); }
+                if info.source >= 0 {
+                    return Err("duplicate compact state".into());
+                }
                 info.source = source;
                 source += 1;
             }
@@ -148,20 +169,38 @@ impl Palette {
     }
     pub fn compact_mapping(&self) -> Value {
         let sources: Vec<i32> = self.state_info.iter().map(|s| s.source).collect();
-        let extra: Vec<Value> = self.states.iter().enumerate()
+        let extra: Vec<Value> = self
+            .states
+            .iter()
+            .enumerate()
             .filter(|(i, _)| sources[*i] < 0)
-            .map(|(i, state)| json!([i, state.json()])).collect();
+            .map(|(i, state)| json!([i, state.json()]))
+            .collect();
         json!({"state_sources": sources, "extra_states": extra})
     }
     pub fn intern(&mut self, v: &Value) -> Result<StateId> {
-        let name = string(v, "Name")?;
+        let name = if let Some(name) = v.as_str() {
+            name
+        } else {
+            v.get("Name")
+                .or_else(|| v.get("id"))
+                .and_then(Value::as_str)
+                .ok_or("missing block state Name/id")?
+        };
+        let qualified;
+        let name = if name.contains(':') {
+            name
+        } else {
+            qualified = format!("minecraft:{name}");
+            &qualified
+        };
         let def_index = self
             .definitions
             .get(name)
             .ok_or_else(|| format!("unknown block {name}"))?;
         let def = &self.definition_values[*def_index];
         let mut props = def.defaults.clone();
-        if let Some(values) = v.get("Properties") {
+        if let Some(values) = v.get("Properties").or_else(|| v.get("properties")) {
             for (key, value) in values.as_object().ok_or("invalid block properties")? {
                 let text = value.as_str().ok_or("block property must be a string")?;
                 if !def
@@ -322,7 +361,9 @@ impl ProxyBase {
             let slot = (qx / axis) * (self.depth / axis) + qz / axis;
             let columns = self.lazy_chunks[slot].get_or_init(|| {
                 let columns = loader(qx / axis, qz / axis)?;
-                if columns.len() != axis * axis { return Err("lazy proxy page column count".into()); }
+                if columns.len() != axis * axis {
+                    return Err("lazy proxy page column count".into());
+                }
                 Ok(columns)
             });
             columns.as_ref().map_err(Clone::clone)?[(qx % axis) * axis + qz % axis]
@@ -333,12 +374,16 @@ impl ProxyBase {
     fn value(&self, i: usize, origin_y: i32, height: usize) -> Result<StateId> {
         let y = origin_y + (i % height) as i32;
         let (base_y, base_height) = self.base_bounds.unwrap_or((origin_y, height as i32));
-        if y < base_y || y >= base_y + base_height { return Ok(self.air); }
+        if y < base_y || y >= base_y + base_height {
+            return Ok(self.air);
+        }
         if let Some(loader) = &self.interior_loader {
             let c = i / height;
             let values = self.interior_columns[c].get_or_init(|| {
                 let values = loader(c / self.depth, c % self.depth)?;
-                if values.len() != base_height as usize { return Err("interior proxy column height".into()); }
+                if values.len() != base_height as usize {
+                    return Err("interior proxy column height".into());
+                }
                 Ok(values)
             });
             return Ok(values.as_ref().map_err(Clone::clone)?[(y - base_y) as usize]);
@@ -448,10 +493,17 @@ impl Volume {
             return Err("proxy column table size".into());
         }
         let size = [width, height, depth];
-        if height == 0 || width == 0 || depth == 0
-            || width.checked_mul(height).and_then(|v| v.checked_mul(depth)).is_none()
+        if height == 0
+            || width == 0
+            || depth == 0
+            || width
+                .checked_mul(height)
+                .and_then(|v| v.checked_mul(depth))
+                .is_none()
             || width * height * depth > 16_777_216
-            || width > 256 || depth > 256 || height > 4096
+            || width > 256
+            || depth > 256
+            || height > 4096
         {
             return Err("volume budget exceeded".into());
         }
@@ -499,17 +551,38 @@ impl Volume {
     }
     /// Keep sparse edit space at dimension height; the immutable base remains noise-height.
     pub fn proxy_base_bounds(&mut self, min_y: i32, height: i32) {
-        if let Some(proxy) = &mut self.proxy { proxy.base_bounds = Some((min_y, height)); }
+        if let Some(proxy) = &mut self.proxy {
+            proxy.base_bounds = Some((min_y, height));
+        }
     }
     /// Same bounded proxy, but sample each 16x16 chunk only on first read.
-    pub fn lazy_proxy(origin: Pos, width: usize, depth: usize, height: usize,
-                      palette: Palette, loader: ColumnLoader) -> Result<Self> {
+    pub fn lazy_proxy(
+        origin: Pos,
+        width: usize,
+        depth: usize,
+        height: usize,
+        palette: Palette,
+        loader: ColumnLoader,
+    ) -> Result<Self> {
         Self::paged_proxy(origin, width, depth, height, palette, 16, loader)
     }
     /// Sparse edits over lazy, complete 3D columns. No exterior heightfield approximation.
-    pub fn interior_proxy(origin: Pos, width: usize, depth: usize, height: usize,
-                          palette: Palette, loader: InteriorLoader) -> Result<Self> {
-        let mut volume = Self::proxy(origin, width, depth, height, palette, vec![[0; 10]; width * depth])?;
+    pub fn interior_proxy(
+        origin: Pos,
+        width: usize,
+        depth: usize,
+        height: usize,
+        palette: Palette,
+        loader: InteriorLoader,
+    ) -> Result<Self> {
+        let mut volume = Self::proxy(
+            origin,
+            width,
+            depth,
+            height,
+            palette,
+            vec![[0; 10]; width * depth],
+        )?;
         let proxy = volume.proxy.as_mut().unwrap();
         proxy.columns.clear();
         proxy.interior_columns = (0..width * depth).map(|_| OnceLock::new()).collect();
@@ -518,27 +591,54 @@ impl Volume {
     }
     /// Lazy pages use x-major column order. Small pages avoid sampling an
     /// entire neighbour chunk when only a canopy edge touches it.
-    pub fn paged_proxy(origin: Pos, width: usize, depth: usize, height: usize,
-                       palette: Palette, axis: usize, loader: ColumnLoader) -> Result<Self> {
-        if width == 0 || depth == 0 || width > 256 || depth > 256
-            || !matches!(axis, 4 | 16) || width % axis != 0 || depth % axis != 0 {
+    pub fn paged_proxy(
+        origin: Pos,
+        width: usize,
+        depth: usize,
+        height: usize,
+        palette: Palette,
+        axis: usize,
+        loader: ColumnLoader,
+    ) -> Result<Self> {
+        if width == 0
+            || depth == 0
+            || width > 256
+            || depth > 256
+            || !matches!(axis, 4 | 16)
+            || width % axis != 0
+            || depth % axis != 0
+        {
             return Err("lazy proxy chunk alignment".into());
         }
-        let mut volume = Self::proxy(origin, width, depth, height, palette, vec![[0; 10]; width * depth])?;
+        let mut volume = Self::proxy(
+            origin,
+            width,
+            depth,
+            height,
+            palette,
+            vec![[0; 10]; width * depth],
+        )?;
         let proxy = volume.proxy.as_mut().unwrap();
         proxy.columns = Vec::new();
         proxy.page_axis = axis;
-        proxy.lazy_chunks = (0..width / axis * (depth / axis)).map(|_| OnceLock::new()).collect();
+        proxy.lazy_chunks = (0..width / axis * (depth / axis))
+            .map(|_| OnceLock::new())
+            .collect();
         proxy.loader = Some(loader);
         Ok(volume)
     }
     /// Missing lazy data invalidates the transaction; it must never commit as air.
     fn value_at(&mut self, i: usize) -> StateId {
         if let Some(proxy) = &self.proxy {
-            if let Some(&value) = self.proxy_edits.get(&i) { return value; }
+            if let Some(&value) = self.proxy_edits.get(&i) {
+                return value;
+            }
             match proxy.value(i, self.origin[1], self.size[1]) {
                 Ok(value) => value,
-                Err(_) => { self.incomplete = true; self.palette.air }
+                Err(_) => {
+                    self.incomplete = true;
+                    self.palette.air
+                }
             }
         } else {
             self.blocks[i]
@@ -546,12 +646,17 @@ impl Volume {
     }
     /// Explicit dense export loads all columns, and fails atomically on missing data.
     pub fn materialize(&mut self) -> Result<()> {
-        let Some(proxy) = &self.proxy else { return Ok(()); };
+        let Some(proxy) = &self.proxy else {
+            return Ok(());
+        };
         let cells = self.size[0] * self.size[1] * self.size[2];
         let mut blocks = vec![self.palette.air; cells];
         for (i, slot) in blocks.iter_mut().enumerate() {
-            *slot = if let Some(&value) = self.proxy_edits.get(&i) { value }
-                else { proxy.value(i, self.origin[1], self.size[1])? };
+            *slot = if let Some(&value) = self.proxy_edits.get(&i) {
+                value
+            } else {
+                proxy.value(i, self.origin[1], self.size[1])?
+            };
         }
         self.blocks = blocks;
         self.proxy = None;
@@ -613,8 +718,10 @@ impl Volume {
                     self.changes.push((i, self.proxy_edits.get(&i).copied()));
                 }
                 self.proxy_edits.insert(i, id);
-                self.proxy_write_tops.entry(i / self.size[1])
-                    .and_modify(|top| *top = (*top).max(p[1] + 1)).or_insert(p[1] + 1);
+                self.proxy_write_tops
+                    .entry(i / self.size[1])
+                    .and_modify(|top| *top = (*top).max(p[1] + 1))
+                    .or_insert(p[1] + 1);
                 self.invalidate_column_at(i);
                 return;
             }
@@ -658,7 +765,9 @@ impl Volume {
         }
         let value = self.scan_heightmap(x, z, kind);
         // Never memoise a failed lazy load or an out-of-bounds neighbour as air.
-        if !self.incomplete { self.height_cache.insert((x, z, kind), value); }
+        if !self.incomplete {
+            self.height_cache.insert((x, z, kind), value);
+        }
         value
     }
     /// Oracle for the height cache: always performs the full uncached scan.
@@ -675,9 +784,20 @@ impl Volume {
             }
             let column = i / self.size[1];
             match proxy.column(column) {
-                Ok(c) => top = top.min(c[0].max(c[1])
-                    .max(self.proxy_write_tops.get(&column).copied().unwrap_or(self.origin[1]))),
-                Err(_) => { self.incomplete = true; return self.origin[1]; }
+                Ok(c) => {
+                    top = top.min(
+                        c[0].max(c[1]).max(
+                            self.proxy_write_tops
+                                .get(&column)
+                                .copied()
+                                .unwrap_or(self.origin[1]),
+                        ),
+                    )
+                }
+                Err(_) => {
+                    self.incomplete = true;
+                    return self.origin[1];
+                }
             }
         }
         self.scan_heightmap_from(x, z, kind, top)

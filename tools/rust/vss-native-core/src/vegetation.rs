@@ -1,5 +1,5 @@
 //! Vanilla vegetation features on native block storage. Placement modifiers
-//! execute lazily, depth first, sharing the feature's WorldgenRandom stream.
+//! preserve depth-first modifier output order on the shared WorldgenRandom stream.
 //! Unsupported codecs fail compilation; they never silently become fake trees.
 use crate::{
     blocks::{offset, Palette, Pos, StateId, Volume},
@@ -12,10 +12,11 @@ use serde_json::Value;
 use std::collections::HashSet;
 mod decorators;
 use decorators::{sorted_positions, Decorator};
+mod modern;
 mod mushroom;
+mod nether;
 mod shape;
 mod special;
-mod nether;
 use special::{Branches, Roots};
 
 pub struct Placed {
@@ -32,6 +33,7 @@ pub enum Feature {
     Tree(Tree),
     Mushroom(mushroom::Mushroom),
     Nether(nether::NetherFeature),
+    Modern(modern::ModernFeature),
     None,
 }
 enum Modifier {
@@ -43,6 +45,7 @@ enum Modifier {
     WaterDepth(i32),
     Rarity(i32),
     Offset(IntProvider, IntProvider),
+    Offset3(IntProvider, IntProvider, IntProvider),
     Filter(Predicate),
     Biome,
     NoiseCount(i32, f64, f64),
@@ -70,7 +73,8 @@ pub struct Tree {
     height: [i32; 3],
     trunk: StateProvider,
     foliage: StateProvider,
-    dirt: StateProvider,
+    dirt: Option<StateProvider>,
+    modern_soil: bool,
     force_dirt: bool,
     ignore_vines: bool,
     minimum: Value,
@@ -94,7 +98,8 @@ impl<'a> PlacementContext<'a> {
             top_feature,
             biome_allowed,
             budget: 262144,
-            noise: NOISE.get_or_init(|| PerlinSimplexNoise::new(&mut Random::new(2345, 2), &[0]).unwrap()),
+            noise: NOISE
+                .get_or_init(|| PerlinSimplexNoise::new(&mut Random::new(2345, 2), &[0]).unwrap()),
         }
     }
     fn charge(&mut self) -> Result<()> {
@@ -189,7 +194,9 @@ impl Placed {
                 // consume random values or alter the sampled floors.
                 let positions = nether::layer_positions(w, r, p, count, c)?;
                 let mut result = false;
-                for q in positions { result |= self.step(next, w, r, q, c)?; }
+                for q in positions {
+                    result |= self.step(next, w, r, q, c)?;
+                }
                 return Ok(result);
             }
             Modifier::Square => {
@@ -218,12 +225,21 @@ impl Placed {
                 let dz = xz.sample(r);
                 p = offset(p, dx, dy, dz);
             }
+            Modifier::Offset3(x, y, z) => {
+                let dx = x.sample(r);
+                let dy = y.sample(r);
+                let dz = z.sample(r);
+                p = offset(p, dx, dy, dz);
+            }
             Modifier::Filter(test) => {
                 if !test.test(w, p)? {
                     return Ok(false);
                 }
             }
             Modifier::Biome => {
+                if c.top_feature.is_empty() {
+                    return Err("biome placement requires a registered top feature".into());
+                }
                 if !(c.biome_allowed)(c.top_feature, p) {
                     return Ok(false);
                 }
@@ -292,6 +308,7 @@ impl Feature {
                 a.deterministic()?;
                 b.deterministic()
             }
+            Self::Modern(feature) => feature.deterministic(),
             _ => Ok(()),
         }
     }
@@ -308,9 +325,13 @@ impl Feature {
                 .ok_or_else(|| format!("missing configured feature {name}"))?;
             return Self::parse(v, doc, p, depth + 1);
         }
-        let config = &v["config"];
+        let config = v.get("config").unwrap_or(v);
         Ok(match minecraft_type(v)? {
-            "simple_block" => Self::Simple(StateProvider::parse(&config["to_place"], p)?),
+            "simple_block" => Self::Simple(StateProvider::parse_with_registries(
+                &config["to_place"],
+                doc,
+                p,
+            )?),
             "bamboo" => Self::Bamboo(number(config, "probability")? as f32),
             "random_patch" | "flower" | "no_bonemeal_flower" => {
                 let tries = config["tries"].as_i64().unwrap_or(128);
@@ -363,12 +384,38 @@ impl Feature {
                 Box::new(Placed::parse(&config["feature_true"], doc, p, depth + 1)?),
                 Box::new(Placed::parse(&config["feature_false"], doc, p, depth + 1)?),
             ),
-            "tree" => Self::Tree(Tree::parse(config, p)?),
-            "huge_fungus" | "nether_forest_vegetation" | "glowstone_blob" | "weeping_vines" | "twisting_vines" | "spring_feature" =>
-                Self::Nether(nether::NetherFeature::parse(minecraft_type(v)?, config, p)?),
-            "huge_brown_mushroom" | "huge_red_mushroom" => Self::Mushroom(
-                mushroom::Mushroom::parse(config, minecraft_type(v)? == "huge_red_mushroom", p)?,
-            ),
+            "tree" => Self::Tree(Tree::parse(config, doc, p)?),
+            "huge_fungus"
+            | "nether_forest_vegetation"
+            | "glowstone_blob"
+            | "weeping_vines"
+            | "twisting_vines"
+            | "spring_feature" => Self::Nether(nether::NetherFeature::parse(
+                minecraft_type(v)?,
+                config,
+                doc,
+                p,
+            )?),
+            "huge_brown_mushroom" | "huge_red_mushroom" => {
+                Self::Mushroom(mushroom::Mushroom::parse(
+                    config,
+                    minecraft_type(v)? == "huge_red_mushroom",
+                    doc,
+                    p,
+                )?)
+            }
+            "projected_random_patchy_square"
+            | "random_neighbor_spread"
+            | "single_block_pillar"
+            | "sequence"
+            | "overlay"
+            | "block_column" => Self::Modern(modern::ModernFeature::parse(
+                minecraft_type(v)?,
+                config,
+                doc,
+                p,
+                depth + 1,
+            )?),
             "no_op" => Self::None,
             s => return Err(format!("unsupported configured feature minecraft:{s}")),
         })
@@ -384,7 +431,9 @@ impl Feature {
         match self {
             Self::None => Ok(true),
             Self::Simple(provider) => {
-                let id = provider.state(r, p, &mut w.palette)?;
+                let Some(id) = provider.optional_state(r, p, w)? else {
+                    return Ok(false);
+                };
                 if !survives(w, p, id)? {
                     return Ok(false);
                 }
@@ -438,6 +487,7 @@ impl Feature {
             Self::Tree(tree) => tree.place(w, r, p),
             Self::Mushroom(m) => m.place(w, r, p),
             Self::Nether(feature) => feature.place(w, r, p, c),
+            Self::Modern(feature) => feature.place(w, r, p, c),
         }
     }
     /// An incomplete halo or an unsupported survival hook rolls back writes
@@ -465,6 +515,9 @@ impl Feature {
     }
 }
 fn survives(w: &mut Volume, p: Pos, id: StateId) -> Result<bool> {
+    if w.palette.definition(id).survival_unconditional {
+        return Ok(true);
+    }
     let below = w.get(offset(p, 0, -1, 0));
     if w.palette.definition(id).double_plant
         && w.palette
@@ -481,15 +534,34 @@ fn survives(w: &mut Volume, p: Pos, id: StateId) -> Result<bool> {
                 .is_some_and(|v| v == "lower"));
     }
     let name = w.palette.state(id).name.as_str();
+    let support_tag = match name {
+        "minecraft:crimson_roots" => Some("minecraft:supports_crimson_roots"),
+        "minecraft:warped_roots" => Some("minecraft:supports_warped_roots"),
+        "minecraft:nether_sprouts" => Some("minecraft:supports_nether_sprouts"),
+        "minecraft:crimson_fungus" => Some("minecraft:supports_crimson_fungus"),
+        "minecraft:warped_fungus" => Some("minecraft:supports_warped_fungus"),
+        "minecraft:bamboo" => Some("minecraft:supports_bamboo"),
+        _ => None,
+    };
+    if support_tag.is_some_and(|tag| w.palette.tag(below, tag)) {
+        return Ok(true);
+    }
     match name {
-        "minecraft:crimson_roots" | "minecraft:warped_roots" | "minecraft:nether_sprouts" =>
-            Ok(w.palette.tag(below, "minecraft:nylium") || w.palette.is(below, "minecraft:soul_soil")
-                || w.palette.tag(below, "minecraft:dirt") || w.palette.is(below, "minecraft:farmland")),
-        "minecraft:crimson_fungus" | "minecraft:warped_fungus" =>
-            Ok(w.palette.tag(below, "minecraft:nylium") || w.palette.is(below, "minecraft:mycelium")
-                || w.palette.is(below, "minecraft:soul_soil") || w.palette.tag(below, "minecraft:dirt") || w.palette.is(below, "minecraft:farmland")),
-        "minecraft:soul_fire" => Ok(w.palette.tag(below,"minecraft:soul_fire_base_blocks")),
-        "minecraft:fire" if w.palette.is(below,"minecraft:netherrack") => Ok(true),
+        "minecraft:crimson_roots" | "minecraft:warped_roots" | "minecraft:nether_sprouts" => {
+            Ok(w.palette.tag(below, "minecraft:nylium")
+                || w.palette.is(below, "minecraft:soul_soil")
+                || w.palette.tag(below, "minecraft:dirt")
+                || w.palette.is(below, "minecraft:farmland"))
+        }
+        "minecraft:crimson_fungus" | "minecraft:warped_fungus" => {
+            Ok(w.palette.tag(below, "minecraft:nylium")
+                || w.palette.is(below, "minecraft:mycelium")
+                || w.palette.is(below, "minecraft:soul_soil")
+                || w.palette.tag(below, "minecraft:dirt")
+                || w.palette.is(below, "minecraft:farmland"))
+        }
+        "minecraft:soul_fire" => Ok(w.palette.tag(below, "minecraft:soul_fire_base_blocks")),
+        "minecraft:fire" if w.palette.is(below, "minecraft:netherrack") => Ok(true),
         "minecraft:azalea" | "minecraft:flowering_azalea" | "minecraft:mangrove_propagule" => {
             if name == "minecraft:mangrove_propagule"
                 && w.palette
@@ -501,7 +573,13 @@ fn survives(w: &mut Volume, p: Pos, id: StateId) -> Result<bool> {
                 let above = w.get(offset(p, 0, 1, 0));
                 return Ok(w.palette.is(above, "minecraft:mangrove_leaves"));
             }
-            Ok(w.palette.tag(below, "minecraft:dirt")
+            let tag = if name == "minecraft:mangrove_propagule" {
+                "minecraft:supports_mangrove_propagule"
+            } else {
+                "minecraft:supports_azalea"
+            };
+            Ok(w.palette.tag(below, tag)
+                || w.palette.tag(below, "minecraft:dirt")
                 || w.palette.is(below, "minecraft:farmland")
                 || w.palette.is(below, "minecraft:clay"))
         }
@@ -537,10 +615,11 @@ fn survives(w: &mut Volume, p: Pos, id: StateId) -> Result<bool> {
         | "minecraft:lilac"
         | "minecraft:rose_bush"
         | "minecraft:peony"
-        | "minecraft:pink_petals" => {
-            Ok(w.palette.tag(below, "minecraft:dirt") || w.palette.is(below, "minecraft:farmland"))
-        }
-        "minecraft:wither_rose" => Ok(w.palette.tag(below, "minecraft:dirt")
+        | "minecraft:pink_petals" => Ok(w.palette.tag(below, "minecraft:supports_vegetation")
+            || w.palette.tag(below, "minecraft:dirt")
+            || w.palette.is(below, "minecraft:farmland")),
+        "minecraft:wither_rose" => Ok(w.palette.tag(below, "minecraft:supports_wither_rose")
+            || w.palette.tag(below, "minecraft:dirt")
             || [
                 "minecraft:farmland",
                 "minecraft:netherrack",
@@ -599,7 +678,7 @@ fn bamboo(w: &mut Volume, r: &mut Random, p: Pos, chance: f32) -> Result<bool> {
     Ok(true)
 }
 impl Tree {
-    fn parse(v: &Value, p: &mut Palette) -> Result<Self> {
+    fn parse(v: &Value, doc: &Value, p: &mut Palette) -> Result<Self> {
         let trunk = &v["trunk_placer"];
         if ![
             "straight_trunk_placer",
@@ -622,13 +701,13 @@ impl Tree {
         let roots = v
             .get("root_placer")
             .filter(|v| !v.is_null())
-            .map(|v| Roots::parse(v, p))
+            .map(|v| Roots::parse(v, doc, p))
             .transpose()?;
         let decorators = v["decorators"]
             .as_array()
             .ok_or("missing tree decorators")?
             .iter()
-            .map(|v| Decorator::parse(v, p))
+            .map(|v| Decorator::parse(v, doc, p))
             .collect::<Result<Vec<_>>>()?;
         let f = &v["foliage_placer"];
         let kind = minecraft_type(f)?;
@@ -689,9 +768,15 @@ impl Tree {
                 .unwrap_or(0)
                 .clamp(0, 256) as i32,
             height,
-            trunk: StateProvider::parse(&v["trunk_provider"], p)?,
-            foliage: StateProvider::parse(&v["foliage_provider"], p)?,
-            dirt: StateProvider::parse(&v["dirt_provider"], p)?,
+            trunk: StateProvider::parse_with_registries(&v["trunk_provider"], doc, p)?,
+            foliage: StateProvider::parse_with_registries(&v["foliage_provider"], doc, p)?,
+            dirt: v
+                .get("below_trunk_provider")
+                .or_else(|| v.get("dirt_provider"))
+                .filter(|v| !v.is_null())
+                .map(|v| StateProvider::parse_with_registries(v, doc, p))
+                .transpose()?,
+            modern_soil: v.get("config").is_none() && v.get("dirt_provider").is_none(),
             force_dirt: v["force_dirt"].as_bool().unwrap_or(false),
             ignore_vines: v["ignore_vines"].as_bool().unwrap_or(false),
             minimum,
@@ -976,13 +1061,23 @@ impl Tree {
         Ok(true)
     }
     fn dirt_at(&self, w: &mut Volume, r: &mut Random, p: Pos, logs: &mut Vec<Pos>) -> Result<()> {
+        let Some(provider) = &self.dirt else {
+            return Ok(());
+        };
+        if self.modern_soil {
+            if let Some(state) = provider.optional_state(r, p, w)? {
+                w.set(p, state);
+                logs.push(p);
+            }
+            return Ok(());
+        }
         let soil = w.get(p);
         if self.force_dirt
             || !w.palette.tag(soil, "minecraft:dirt")
             || w.palette.is(soil, "minecraft:grass_block")
             || w.palette.is(soil, "minecraft:mycelium")
         {
-            let state = self.dirt.state(r, p, &mut w.palette)?;
+            let state = provider.state_in(r, p, w)?;
             w.set(p, state);
             logs.push(p);
         }
@@ -993,7 +1088,7 @@ impl Tree {
         if !self.valid_trunk(&w.palette, b) {
             return Ok(false);
         }
-        let state = self.trunk.state(r, p, &mut w.palette)?;
+        let state = self.trunk.state_in(r, p, w)?;
         w.set(p, state);
         logs.push(p);
         Ok(true)
@@ -1242,7 +1337,7 @@ impl Tree {
             let block = w.get(q);
             if write {
                 if w.palette.tree_replaceable(block) {
-                    let mut state = self.trunk.state(r, q, &mut w.palette)?;
+                    let mut state = self.trunk.state_in(r, q, w)?;
                     let x = (q[0] - a[0]).abs();
                     let z = (q[2] - a[2]).abs();
                     if w.palette.state(state).properties.contains_key("axis") {
@@ -1271,7 +1366,7 @@ impl Tree {
     fn leaf(&self, w: &mut Volume, r: &mut Random, q: Pos, leaves: &mut Vec<Pos>) -> Result<()> {
         let b = w.get(q);
         if w.palette.tree_replaceable(b) {
-            let mut state = self.foliage.state(r, q, &mut w.palette)?;
+            let mut state = self.foliage.state_in(r, q, w)?;
             if w.palette
                 .state(state)
                 .properties
@@ -1391,7 +1486,7 @@ impl Tree {
                 let q = offset(top, sx, y, sz);
                 let b = w.get(q);
                 if w.palette.tree_replaceable(b) {
-                    let mut state = self.foliage.state(r, q, &mut w.palette)?;
+                    let mut state = self.foliage.state_in(r, q, w)?;
                     if w.palette
                         .state(state)
                         .properties
@@ -1565,6 +1660,11 @@ impl Modifier {
                 IntProvider::parse(&v["xz_spread"])?,
                 IntProvider::parse(&v["y_spread"])?,
             ),
+            "offset" => Self::Offset3(
+                IntProvider::parse(&v["x"])?,
+                IntProvider::parse(&v["y"])?,
+                IntProvider::parse(&v["z"])?,
+            ),
             "block_predicate_filter" => Self::Filter(Predicate::parse(&v["predicate"], p, 0)?),
             "biome" => Self::Biome,
             "noise_based_count" => Self::NoiseCount(
@@ -1582,7 +1682,7 @@ impl Modifier {
     }
 }
 impl Predicate {
-    fn parse(v: &Value, p: &mut Palette, depth: usize) -> Result<Self> {
+    pub(crate) fn parse(v: &Value, p: &mut Palette, depth: usize) -> Result<Self> {
         if depth > 64 {
             return Err("block predicate depth budget".into());
         }
@@ -1628,7 +1728,7 @@ impl Predicate {
             s => return Err(format!("unsupported block predicate {s}")),
         })
     }
-    fn test(&self, w: &mut Volume, p: Pos) -> Result<bool> {
+    pub(crate) fn test(&self, w: &mut Volume, p: Pos) -> Result<bool> {
         Ok(match self {
             Self::True => true,
             Self::All(values) => {

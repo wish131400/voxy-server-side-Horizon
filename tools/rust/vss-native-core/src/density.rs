@@ -13,6 +13,7 @@ use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 mod column_plan;
 mod height_plan;
+mod modern;
 mod surface_plan;
 pub(crate) use surface_plan::Sign as SurfaceSign;
 mod cache_order;
@@ -72,6 +73,7 @@ enum Marker {
     Cell,
 }
 enum Node {
+    Modern(Box<modern::Node>),
     Constant(f64),
     Gradient(i32, i32, f64, f64),
     Unary(Unary, Id),
@@ -96,7 +98,12 @@ enum Node {
     FtfUnit(Id, i32),
     LinearSpline(Id, Vec<(f64, Id)>),
     /// 1.21.11+: highest positive density lattice sample, returning a height.
-    FindTopSurface { density: Id, upper: Id, lower: i32, step: i32 },
+    FindTopSurface {
+        density: Id,
+        upper: Id,
+        lower: i32,
+        step: i32,
+    },
 }
 enum Spline {
     Constant(f32),
@@ -105,7 +112,20 @@ enum Spline {
         points: Vec<(f32, Spline, f32)>,
     },
 }
+enum GraphNoise {
+    Legacy(NormalNoise),
+    Modern(crate::noise::modern::Noise),
+}
+impl GraphNoise {
+    fn absolute_bound(&self) -> f64 {
+        match self {
+            Self::Legacy(n) => n.absolute_bound(),
+            Self::Modern(n) => n.absolute_bound(),
+        }
+    }
+}
 pub struct Graph {
+    modern: bool,
     nodes: Vec<Node>,
     column_plan: ColumnPlan,
     surface_plan: Option<surface_plan::SurfacePlan>,
@@ -113,7 +133,7 @@ pub struct Graph {
     exposed_column_order: bool,
     wide_noise_cells: bool,
     interpolator_count: usize,
-    noises: Vec<NormalNoise>,
+    noises: Vec<GraphNoise>,
     noise_ids: HashMap<String, usize>,
     pub roots: HashMap<String, Id>,
     pub random: Positional,
@@ -121,8 +141,26 @@ pub struct Graph {
     pub legacy: bool,
 }
 impl Graph {
+    pub(crate) fn compute_in_volume(
+        &self,
+        id: Id,
+        p: [i32; 3],
+        mode: Mode,
+        volume: ModernVolume,
+        scratch: &mut Scratch,
+    ) -> f64 {
+        let old = scratch.modern_volume.replace(volume);
+        let result = self.compute(id, p, mode, scratch);
+        scratch.modern_volume = old;
+        result
+    }
+    pub fn is_modern(&self) -> bool {
+        self.modern
+    }
     pub(crate) fn uses_signed_sqrt(&self) -> bool {
-        self.nodes.iter().any(|node| matches!(node, Node::Unary(Unary::Sqrt, _)))
+        self.nodes
+            .iter()
+            .any(|node| matches!(node, Node::Unary(Unary::Sqrt, _)))
     }
     pub fn requires_complete_column_order(&self) -> bool {
         self.exposed_column_order
@@ -162,7 +200,13 @@ impl Graph {
         self.fill_array_inner(id, points, mode, s)
     }
 
-    fn fill_array_inner(&self, id: Id, points: &[[i32; 3]], mode: Mode, s: &mut Scratch) -> Vec<f64> {
+    fn fill_array_inner(
+        &self,
+        id: Id,
+        points: &[[i32; 3]],
+        mode: Mode,
+        s: &mut Scratch,
+    ) -> Vec<f64> {
         match &self.nodes[id] {
             Node::Marker(Marker::Cache2d, child) => self.fill_array_inner(*child, points, mode, s),
             Node::Marker(Marker::Once, child) => {
@@ -212,7 +256,10 @@ impl Graph {
                 }
                 let mut values = self.fill_array_inner(*a, points, mode, s);
                 if matches!(op, Binary::Add) {
-                    for (v, b) in values.iter_mut().zip(self.fill_array_inner(*b, points, mode, s)) {
+                    for (v, b) in values
+                        .iter_mut()
+                        .zip(self.fill_array_inner(*b, points, mode, s))
+                    {
                         *v += b;
                     }
                 } else {
@@ -278,11 +325,15 @@ impl Graph {
             p[1].div_euclid(s.height) * s.height,
             p[2].div_euclid(s.width) * s.width,
         ];
-        if !self.exposed_column_order && base[0]>=s.origin_x && base[2]>=s.origin_z
-            && base[0]+s.width<=s.origin_x+s.span && base[2]+s.width<=s.origin_z+s.span {
+        if !self.exposed_column_order
+            && base[0] >= s.origin_x
+            && base[2] >= s.origin_z
+            && base[0] + s.width <= s.origin_x + s.span
+            && base[2] + s.width <= s.origin_z + s.span
+        {
             // Only skip arrays inside the covered flat lattice. A wide cell
             // or an out-of-chunk query must retain the original traversal.
-            s.prepared_cell=None;
+            s.prepared_cell = None;
             s.final_values.clear();
             return;
         }
@@ -348,12 +399,15 @@ impl Graph {
             .as_bool()
             .ok_or("missing legacy_random_source")?;
         let graph = Self {
+            modern: doc["vss_density_semantics"].as_str() == Some("float-26.3"),
             nodes: vec![],
             column_plan: ColumnPlan::empty(),
             surface_plan: None,
             stateful_columns: false,
             exposed_column_order: false,
-            wide_noise_cells: doc["settings"]["noise"]["size_horizontal"].as_i64().is_some_and(|v|v>4),
+            wide_noise_cells: doc["settings"]["noise"]["size_horizontal"]
+                .as_i64()
+                .is_some_and(|v| v > 4),
             interpolator_count: 0,
             noises: vec![],
             noise_ids: HashMap::new(),
@@ -432,6 +486,7 @@ impl Graph {
         let mut dependencies = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let uses_y = match node {
+                Node::Modern(n) => n.uses_y(&dependencies),
                 Node::Constant(_) | Node::End(_) | Node::FtfNoise(..) => false,
                 Node::FtfUnit(input, _) => dependencies[*input],
                 // Density probes replace Y with the search lattice. Only the
@@ -499,6 +554,7 @@ impl Graph {
     }
     pub fn add_root(&mut self, name: &str, value: &Value, doc: &Value) -> Result<Id> {
         let placeholder = Self {
+            modern: false,
             nodes: vec![],
             column_plan: ColumnPlan::empty(),
             surface_plan: None,
@@ -534,9 +590,60 @@ impl Graph {
         result
     }
     pub fn noise(&self, id: usize, x: f64, y: f64, z: f64) -> f64 {
-        self.noises[id].sample(x, y, z)
+        self.noise_for_volume(id, x, y, z, false)
+    }
+    fn noise_for_volume(&self, id: usize, x: f64, y: f64, z: f64, volume: bool) -> f64 {
+        match &self.noises[id] {
+            GraphNoise::Legacy(n) => n.sample(x, y, z),
+            GraphNoise::Modern(n) => n.sample(x, y, z, volume) as f64,
+        }
+    }
+    fn register_modern_noise(&mut self, value: &Value, doc: &Value) -> Result<usize> {
+        let key = value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string());
+        if let Some(id) = self.noise_ids.get(&key) {
+            return Ok(*id);
+        }
+        let definition = if let Some(name) = value.as_str() {
+            doc["noises"]
+                .get(name)
+                .ok_or_else(|| format!("missing modern noise {name}"))?
+        } else {
+            value
+        };
+        let seed_name = doc["noise_seed_aliases"]
+            .get(&key)
+            .and_then(Value::as_str)
+            .unwrap_or(&key);
+        let legacy_nether = matches!(
+            key.as_str(),
+            "minecraft:nether/temperature" | "minecraft:nether/vegetation"
+        );
+        let mut random = if legacy_nether {
+            Random::new(
+                self.seed
+                    .wrapping_add(i64::from(key == "minecraft:nether/vegetation")),
+                0,
+            )
+        } else {
+            self.random.from_hash(seed_name)
+        };
+        let noise = crate::noise::modern::Noise::from_declaration_with_legacy(
+            &mut random,
+            definition,
+            legacy_nether,
+        )?;
+        let id = self.noises.len();
+        self.noises.push(GraphNoise::Modern(noise));
+        self.noise_ids.insert(key, id);
+        Ok(id)
     }
     pub fn registered_noise(&mut self, name: &str, doc: &Value) -> Result<usize> {
+        if self.modern {
+            return self.register_modern_noise(&Value::String(name.into()), doc);
+        }
         if let Some(&id) = self.noise_ids.get(name) {
             return Ok(id);
         }
@@ -582,7 +689,7 @@ impl Graph {
             }
             .ok_or_else(|| format!("invalid noise {name}"))?;
         let id = self.noises.len();
-        self.noises.push(noise);
+        self.noises.push(GraphNoise::Legacy(noise));
         self.noise_ids.insert(name.into(), id);
         Ok(id)
     }
@@ -606,7 +713,14 @@ impl Graph {
     pub(crate) fn raw_scratch(&self) -> Result<Scratch> {
         self.scratch_for_mode(0, 0, 4, 8, true)
     }
-    fn scratch_for_mode(&self, origin_x: i32, origin_z: i32, width: i32, height: i32, raw: bool) -> Result<Scratch> {
+    fn scratch_for_mode(
+        &self,
+        origin_x: i32,
+        origin_z: i32,
+        width: i32,
+        height: i32,
+        raw: bool,
+    ) -> Result<Scratch> {
         if !(1..=64).contains(&width) || !(1..=64).contains(&height) {
             return Err("invalid noise cell size".into());
         }
@@ -617,10 +731,28 @@ impl Graph {
             width,
             height,
             memo: vec![None; self.nodes.len()],
+            modern_memo_volumes: vec![None; if self.modern { self.nodes.len() } else { 0 }],
+            modern_volume: None,
+            modern_corners: FxHashMap::default(),
+            modern_cells: vec![
+                None;
+                if self.modern {
+                    self.interpolator_count
+                } else {
+                    0
+                }
+            ],
             horizontal: vec![HorizontalCache::default(); self.column_plan.count],
             use_column_plan: true,
             corners: FxHashMap::default(),
-            cells: vec![None; if raw { 0 } else { self.interpolator_count }],
+            cells: vec![
+                None;
+                if raw && !self.modern {
+                    0
+                } else {
+                    self.interpolator_count
+                }
+            ],
             column_edges: vec![None; if raw { 0 } else { self.interpolator_count }],
             flat: FxHashMap::default(),
             cached_2d: FxHashMap::default(),
@@ -655,52 +787,100 @@ impl Graph {
     /// nodes widen the range; they must never be inferred from endpoint signs.
     /// Stateful graphs keep their normal NoiseChunk traversal instead.
     pub fn column_range(&self, id: Id, bottom: [i32; 3], top: i32, s: &mut Scratch) -> (f64, f64) {
-        self.vertical_range(id,bottom,top,Mode::Cell,s)
+        self.vertical_range(id, bottom, top, Mode::Cell, s)
     }
-    pub(crate) fn surface_sign(&self,p:[i32;3],top:i32,s:&mut Scratch)->SurfaceSign {
-        self.surface_plan.as_ref().map_or(SurfaceSign::Unknown,|plan|plan.classify(self,p,top,s,1e-12,false))
+    pub(crate) fn surface_sign(&self, p: [i32; 3], top: i32, s: &mut Scratch) -> SurfaceSign {
+        self.surface_plan
+            .as_ref()
+            .map_or(SurfaceSign::Unknown, |plan| {
+                plan.classify(self, p, top, s, 1e-12, false)
+            })
     }
-    pub(crate) fn surface_cell_sign(&self,p:[i32;3],top:i32,s:&mut Scratch)->SurfaceSign {
-        self.surface_plan.as_ref().map_or(SurfaceSign::Unknown,|plan|plan.classify(self,p,top,s,1e-12,true))
+    pub(crate) fn surface_cell_sign(&self, p: [i32; 3], top: i32, s: &mut Scratch) -> SurfaceSign {
+        self.surface_plan
+            .as_ref()
+            .map_or(SurfaceSign::Unknown, |plan| {
+                plan.classify(self, p, top, s, 1e-12, true)
+            })
     }
-    pub(crate) fn single_range(&self, id: Id, bottom: [i32; 3], top: i32, s: &mut Scratch) -> (f64, f64) {
+    pub(crate) fn single_range(
+        &self,
+        id: Id,
+        bottom: [i32; 3],
+        top: i32,
+        s: &mut Scratch,
+    ) -> (f64, f64) {
         if let Some(plan) = self.column_plan.height.as_ref().filter(|p| p.root == id) {
             return plan.range(self, bottom[0], bottom[2], bottom[1], top, s);
         }
         self.vertical_range(id, bottom, top, Mode::Single, s)
     }
-    fn vertical_range(&self, id: Id, bottom: [i32; 3], top: i32, mode: Mode, s: &mut Scratch) -> (f64, f64) {
+    fn vertical_range(
+        &self,
+        id: Id,
+        bottom: [i32; 3],
+        top: i32,
+        mode: Mode,
+        s: &mut Scratch,
+    ) -> (f64, f64) {
         self.spatial_range(id, bottom, top, mode, s, false)
     }
     /// Bound every block in one interpolation cell, not just one X/Z column.
     /// Unknown spatial expressions retain unbounded ranges.
-    pub(crate) fn cell_range(&self, id: Id, bottom: [i32; 3], top: i32, s: &mut Scratch) -> (f64, f64) {
+    pub(crate) fn cell_range(
+        &self,
+        id: Id,
+        bottom: [i32; 3],
+        top: i32,
+        s: &mut Scratch,
+    ) -> (f64, f64) {
         self.spatial_range(id, bottom, top, Mode::Cell, s, true)
     }
-    fn spatial_range(&self, id: Id, bottom: [i32; 3], top: i32, mode: Mode, s: &mut Scratch, whole_cell: bool) -> (f64, f64) {
+    fn spatial_range(
+        &self,
+        id: Id,
+        bottom: [i32; 3],
+        top: i32,
+        mode: Mode,
+        s: &mut Scratch,
+        whole_cell: bool,
+    ) -> (f64, f64) {
         let unknown = (f64::NEG_INFINITY, f64::INFINITY);
-        if (self.stateful_columns && (self.exposed_column_order || mode==Mode::Single
-            || bottom[0] < s.origin_x || bottom[2] < s.origin_z
-            || bottom[0]+if whole_cell {s.width} else {0} > s.origin_x+s.span
-            || bottom[2]+if whole_cell {s.width} else {0} > s.origin_z+s.span)) || bottom[1] > top
-            || (mode==Mode::Cell && bottom[1].div_euclid(s.height) != top.div_euclid(s.height)) {
+        if (self.stateful_columns
+            && (self.exposed_column_order
+                || mode == Mode::Single
+                || bottom[0] < s.origin_x
+                || bottom[2] < s.origin_z
+                || bottom[0] + if whole_cell { s.width } else { 0 } > s.origin_x + s.span
+                || bottom[2] + if whole_cell { s.width } else { 0 } > s.origin_z + s.span))
+            || bottom[1] > top
+            || (mode == Mode::Cell && bottom[1].div_euclid(s.height) != top.div_euclid(s.height))
+        {
             return unknown;
         }
-        if mode==Mode::Single && self.column_plan.slots.get(id).is_some_and(|slot| *slot!=column_plan::NONE) {
-            let value=self.compute(id,bottom,mode,s);
-            return (value,value);
+        if mode == Mode::Single
+            && self
+                .column_plan
+                .slots
+                .get(id)
+                .is_some_and(|slot| *slot != column_plan::NONE)
+        {
+            let value = self.compute(id, bottom, mode, s);
+            return (value, value);
         }
-        let range = |n, s: &mut Scratch| self.spatial_range(n, bottom, top,mode,s,whole_cell);
+        let range = |n, s: &mut Scratch| self.spatial_range(n, bottom, top, mode, s, whole_cell);
         let result = match &self.nodes[id] {
             Node::Constant(v) => return (*v, *v),
             Node::Gradient(..) => {
                 let a = self.compute(id, bottom, mode, s);
                 let b = self.compute(id, [bottom[0], top, bottom[2]], mode, s);
-                if a == b && a.is_finite() { return (a, b); }
+                if a == b && a.is_finite() {
+                    return (a, b);
+                }
                 (a.min(b), a.max(b))
             }
-            Node::Marker(Marker::Interpolated(_), n) if mode==Mode::Single => range(*n,s),
-            Node::Marker(Marker::Cache2d, n) if mode==Mode::Single => range(*n,s),
+            Node::Marker(Marker::Interpolated(_), n) if mode == Mode::Single => range(*n, s),
+            Node::Marker(Marker::Cache2d, n) if mode == Mode::Single => range(*n, s),
             Node::Marker(Marker::Interpolated(slot), child) => {
                 if whole_cell {
                     // Loading the interpolator at the base resolves exactly
@@ -708,13 +888,18 @@ impl Graph {
                     // interpolation remains within their convex hull, widened
                     // below for the original rounded arithmetic.
                     self.compute(id, bottom, Mode::Cell, s);
-                    return s.cells[*slot].filter(|(p, _)| *p == bottom).map_or(unknown, |(_, values)| {
-                        if values.iter().any(|v| !v.is_finite()) { return unknown; }
-                        let low = values.into_iter().fold(f64::INFINITY, f64::min);
-                        let high = values.into_iter().fold(f64::NEG_INFINITY, f64::max);
-                        let pad = (1. + low.abs().max(high.abs())) * 1e-12;
-                        (low - pad, high + pad)
-                    });
+                    return s.cells[*slot].filter(|(p, _)| *p == bottom).map_or(
+                        unknown,
+                        |(_, values)| {
+                            if values.iter().any(|v| !v.is_finite()) {
+                                return unknown;
+                            }
+                            let low = values.into_iter().fold(f64::INFINITY, f64::min);
+                            let high = values.into_iter().fold(f64::NEG_INFINITY, f64::max);
+                            let pad = (1. + low.abs().max(high.abs())) * 1e-12;
+                            (low - pad, high + pad)
+                        },
+                    );
                 }
                 // At an X/Z lattice point, six corners have zero weight.
                 // A finite global bound proves they cannot introduce NaN via
@@ -722,42 +907,55 @@ impl Graph {
                 // Do not publish a partial entry in the full-cell cache.
                 // Flat-sheltered caches are pure only inside their covered
                 // X/Z region; every original corner must remain inside it.
-                if (!self.stateful_columns || (!self.exposed_column_order
-                    && bottom[0]>=s.origin_x && bottom[2]>=s.origin_z
-                    && bottom[0]+s.width<=s.origin_x+s.span
-                    && bottom[2]+s.width<=s.origin_z+s.span))
-                    && bottom[0].rem_euclid(s.width)==0
-                    && bottom[2].rem_euclid(s.width)==0 {
-                    let (lo,hi)=self.column_plan.bounds[*child];
-                    let magnitude=lo.abs().max(hi.abs());
+                if (!self.stateful_columns
+                    || (!self.exposed_column_order
+                        && bottom[0] >= s.origin_x
+                        && bottom[2] >= s.origin_z
+                        && bottom[0] + s.width <= s.origin_x + s.span
+                        && bottom[2] + s.width <= s.origin_z + s.span))
+                    && bottom[0].rem_euclid(s.width) == 0
+                    && bottom[2].rem_euclid(s.width) == 0
+                {
+                    let (lo, hi) = self.column_plan.bounds[*child];
+                    let magnitude = lo.abs().max(hi.abs());
                     if magnitude.is_finite() && magnitude < 1e100 {
-                        let base_y=bottom[1].div_euclid(s.height)*s.height;
-                        let base=[bottom[0],base_y,bottom[2]];
-                        let values=if let Some((_,values))=s.column_edges[*slot].filter(|(p,_)|*p==base) { values } else {
-                            let mut values=[0.;2];
-                            for (i,value) in values.iter_mut().enumerate() {
-                                let q=[bottom[0],base_y+i as i32*s.height,bottom[2]];
-                                *value=if let Some(&v)=s.corners.get(&(*child,q)) { v } else {
-                                    let v=self.compute(*child,q,Mode::Single,s);
-                                    if s.corners.len()<262144 { s.corners.insert((*child,q),v); }
+                        let base_y = bottom[1].div_euclid(s.height) * s.height;
+                        let base = [bottom[0], base_y, bottom[2]];
+                        let values = if let Some((_, values)) =
+                            s.column_edges[*slot].filter(|(p, _)| *p == base)
+                        {
+                            values
+                        } else {
+                            let mut values = [0.; 2];
+                            for (i, value) in values.iter_mut().enumerate() {
+                                let q = [bottom[0], base_y + i as i32 * s.height, bottom[2]];
+                                *value = if let Some(&v) = s.corners.get(&(*child, q)) {
+                                    v
+                                } else {
+                                    let v = self.compute(*child, q, Mode::Single, s);
+                                    if s.corners.len() < 262144 {
+                                        s.corners.insert((*child, q), v);
+                                    }
                                     v
                                 };
                             }
-                            s.column_edges[*slot]=Some((base,values));
+                            s.column_edges[*slot] = Some((base, values));
                             values
                         };
-                        if values.iter().all(|v|v.is_finite()) {
-                            let at=|y:i32| lerp((y-base_y) as f64/s.height as f64,values[0],values[1]);
-                            let (a,b)=(at(bottom[1]),at(top));
+                        if values.iter().all(|v| v.is_finite()) {
+                            let at = |y: i32| {
+                                lerp((y - base_y) as f64 / s.height as f64, values[0], values[1])
+                            };
+                            let (a, b) = (at(bottom[1]), at(top));
                             // `magnitude` above validates the unselected corners:
                             // their differences remain finite when multiplied by
                             // the zero X/Z weights. Only this vertical edge can
                             // contribute to the value and its rounding error.
                             // A global noise bound here can be orders of magnitude
                             // wider than the actual edge and force a point scan.
-                            let edge_magnitude=values[0].abs().max(values[1].abs());
-                            let error=(1.+edge_magnitude)*1e-12;
-                            return (a.min(b)-error,a.max(b)+error);
+                            let edge_magnitude = values[0].abs().max(values[1].abs());
+                            let error = (1. + edge_magnitude) * 1e-12;
+                            return (a.min(b) - error, a.max(b) + error);
                         }
                     }
                 }
@@ -765,8 +963,9 @@ impl Graph {
                 // rounded endpoint evaluations. Expand outward for FP rounding.
                 let a = self.compute(id, bottom, Mode::Cell, s);
                 let b = self.compute(id, [bottom[0], top, bottom[2]], Mode::Cell, s);
-                let magnitude = s.cells[*slot].map_or(f64::INFINITY, |(_, corners)|
-                    corners.into_iter().map(f64::abs).fold(0., f64::max));
+                let magnitude = s.cells[*slot].map_or(f64::INFINITY, |(_, corners)| {
+                    corners.into_iter().map(f64::abs).fold(0., f64::max)
+                });
                 let error = (1. + magnitude) * 1e-12;
                 (a.min(b) - error, a.max(b) + error)
             }
@@ -774,13 +973,36 @@ impl Graph {
             Node::Unary(op, n) => {
                 let (a, b) = range(*n, s);
                 match op {
-                    Unary::Abs => (if a <= 0. && b >= 0. { 0. } else { a.abs().min(b.abs()) }, a.abs().max(b.abs())),
-                    Unary::Square => (if a <= 0. && b >= 0. { 0. } else { (a*a).min(b*b) }, (a*a).max(b*b)),
-                    Unary::Cube => (a*a*a, b*b*b),
-                    Unary::Half => (if a > 0. { a } else { a*0.5 }, if b > 0. { b } else { b*0.5 }),
-                    Unary::Quarter => (if a > 0. { a } else { a*0.25 }, if b > 0. { b } else { b*0.25 }),
+                    Unary::Abs => (
+                        if a <= 0. && b >= 0. {
+                            0.
+                        } else {
+                            a.abs().min(b.abs())
+                        },
+                        a.abs().max(b.abs()),
+                    ),
+                    Unary::Square => (
+                        if a <= 0. && b >= 0. {
+                            0.
+                        } else {
+                            (a * a).min(b * b)
+                        },
+                        (a * a).max(b * b),
+                    ),
+                    Unary::Cube => (a * a * a, b * b * b),
+                    Unary::Half => (
+                        if a > 0. { a } else { a * 0.5 },
+                        if b > 0. { b } else { b * 0.5 },
+                    ),
+                    Unary::Quarter => (
+                        if a > 0. { a } else { a * 0.25 },
+                        if b > 0. { b } else { b * 0.25 },
+                    ),
                     Unary::Squeeze => {
-                        let f = |v: f64| { let v = v.clamp(-1., 1.); v/2. - v*v*v/24. };
+                        let f = |v: f64| {
+                            let v = v.clamp(-1., 1.);
+                            v / 2. - v * v * v / 24.
+                        };
                         (f(a), f(b))
                     }
                     _ => unknown,
@@ -804,52 +1026,110 @@ impl Graph {
                     Binary::Min => (lo.min(l), hi.min(h)),
                     Binary::Max => (lo.max(l), hi.max(h)),
                     Binary::Mul => {
-                        let products = [lo*l, lo*h, hi*l, hi*h];
-                        if products.iter().any(|v| v.is_nan()) { unknown } else {
-                            (products.iter().copied().fold(f64::INFINITY, f64::min),
-                             products.iter().copied().fold(f64::NEG_INFINITY, f64::max))
+                        let products = [lo * l, lo * h, hi * l, hi * h];
+                        if products.iter().any(|v| v.is_nan()) {
+                            unknown
+                        } else {
+                            (
+                                products.iter().copied().fold(f64::INFINITY, f64::min),
+                                products.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                            )
                         }
                     }
                 }
             }
-            Node::Clamp(n, a, b) => { let (l, h) = range(*n, s); (l.clamp(*a, *b), h.clamp(*a, *b)) }
+            Node::Clamp(n, a, b) => {
+                let (l, h) = range(*n, s);
+                (l.clamp(*a, *b), h.clamp(*a, *b))
+            }
             Node::Range(n, a, b, yes, no) => {
                 let (l, h) = range(*n, s);
-                if l >= *a && h < *b { range(*yes, s) }
-                else if h < *a || l >= *b { range(*no, s) }
-                else { let (l, h) = range(*yes, s); let (a, b) = range(*no, s); (l.min(a), h.max(b)) }
+                if l >= *a && h < *b {
+                    range(*yes, s)
+                } else if h < *a || l >= *b {
+                    range(*no, s)
+                } else {
+                    let (l, h) = range(*yes, s);
+                    let (a, b) = range(*no, s);
+                    (l.min(a), h.max(b))
+                }
             }
             _ => unknown,
         };
-        if result.0.is_nan() || result.1.is_nan() { return unknown; }
+        if result.0.is_nan() || result.1.is_nan() {
+            return unknown;
+        }
         // Deliberately wider than a handful of ULPs. Near-zero intervals fall
         // back to block(), rather than relying on reordered FP arithmetic.
-        let pad = |v: f64| if v.is_finite() { (1. + v.abs()) * 1e-12 } else { 0. };
+        let pad = |v: f64| {
+            if v.is_finite() {
+                (1. + v.abs()) * 1e-12
+            } else {
+                0.
+            }
+        };
         (result.0 - pad(result.0), result.1 + pad(result.1))
     }
 
     /// Locate the highest lattice sample above a threshold. Every excluded
     /// interval has a proven upper bound; arbitrary thin branches subdivide.
-    pub(crate) fn first_above(&self,id:Id,x:i32,z:i32,min:i32,max:i32,step:i32,threshold:f64,s:&mut Scratch) -> Option<i32> {
+    pub(crate) fn first_above(
+        &self,
+        id: Id,
+        x: i32,
+        z: i32,
+        min: i32,
+        max: i32,
+        step: i32,
+        threshold: f64,
+        s: &mut Scratch,
+    ) -> Option<i32> {
         if let Some(plan) = self.column_plan.height.as_ref().filter(|p| p.root == id) {
             return plan.first_above(self, x, z, min, max, step, threshold, s);
         }
-        self.first_above_interval(id,x,z,min,max,step,threshold,s)
+        self.first_above_interval(id, x, z, min, max, step, threshold, s)
     }
-    fn first_above_interval(&self,id:Id,x:i32,z:i32,min:i32,max:i32,step:i32,threshold:f64,s:&mut Scratch) -> Option<i32> {
-        let (low,high)=self.vertical_range(id,[x,min,z],max,Mode::Single,s);
-        if high<=threshold {return None;}
-        if low>threshold {return Some(max);}
-        if min==max {return (self.compute(id,[x,max,z],Mode::Single,s)>threshold).then_some(max);}
-        let middle=min+((max-min)/step/2)*step;
-        self.first_above_interval(id,x,z,middle+step,max,step,threshold,s)
-            .or_else(||self.first_above_interval(id,x,z,min,middle,step,threshold,s))
+    fn first_above_interval(
+        &self,
+        id: Id,
+        x: i32,
+        z: i32,
+        min: i32,
+        max: i32,
+        step: i32,
+        threshold: f64,
+        s: &mut Scratch,
+    ) -> Option<i32> {
+        let (low, high) = self.vertical_range(id, [x, min, z], max, Mode::Single, s);
+        if high <= threshold {
+            return None;
+        }
+        if low > threshold {
+            return Some(max);
+        }
+        if min == max {
+            return (self.compute(id, [x, max, z], Mode::Single, s) > threshold).then_some(max);
+        }
+        let middle = min + ((max - min) / step / 2) * step;
+        self.first_above_interval(id, x, z, middle + step, max, step, threshold, s)
+            .or_else(|| self.first_above_interval(id, x, z, min, middle, step, threshold, s))
     }
 
     pub fn compute(&self, id: Id, p: [i32; 3], mode: Mode, s: &mut Scratch) -> f64 {
-        let slot = self.column_plan.slots.get(id).copied().unwrap_or(column_plan::NONE);
-        if s.use_column_plan && slot != column_plan::NONE {
-            if let Some(v) = s.horizontal[slot].get(p[0], p[2], mode) { return v; }
+        let slot = self
+            .column_plan
+            .slots
+            .get(id)
+            .copied()
+            .unwrap_or(column_plan::NONE);
+        let horizontal = s.use_column_plan
+            && slot != column_plan::NONE
+            && (!self.modern || !modern::is_volume(mode));
+        let volume = s.modern_volume;
+        if horizontal {
+            if let Some(v) = s.horizontal[slot].get(p[0], p[2], mode) {
+                return v;
+            }
         }
         #[cfg(feature = "profiling")]
         crate::prof::hit_mode(match mode {
@@ -861,7 +1141,7 @@ impl Graph {
         });
         if let Some((q, m, v)) = s.memo[id].filter(|_| !self.stateful_columns || mode == Mode::Raw)
         {
-            if q == p && m == mode {
+            if q == p && m == mode && (!self.modern || s.modern_memo_volumes[id] == volume) {
                 return v;
             }
         }
@@ -883,7 +1163,13 @@ impl Graph {
         let [x, y, z] = p;
         let ev = |n, s: &mut Scratch| self.compute(n, p, mode, s);
         let v = match &self.nodes[id] {
-            Node::FindTopSurface { density, upper, lower, step } => {
+            Node::Modern(n) => n.compute(self, p, mode, s) as f64,
+            Node::FindTopSurface {
+                density,
+                upper,
+                lower,
+                step,
+            } => {
                 let top = ((ev(*upper, s) / *step as f64).floor() as i32).wrapping_mul(*step);
                 let mut found = *lower;
                 let mut probe = top;
@@ -893,7 +1179,9 @@ impl Graph {
                             found = probe;
                             break;
                         }
-                        let Some(next) = probe.checked_sub(*step) else { break; };
+                        let Some(next) = probe.checked_sub(*step) else {
+                            break;
+                        };
                         probe = next;
                     }
                 }
@@ -1014,14 +1302,32 @@ impl Graph {
                         }
                     }
                     Binary::Min => {
-                        if s.use_column_plan && !self.stateful_columns
-                            && self.column_plan.bounds.get(*b).is_some_and(|(min,_)| a < *min) { a }
-                        else { java_min(a, ev(*b, s)) }
+                        if s.use_column_plan
+                            && !self.stateful_columns
+                            && self
+                                .column_plan
+                                .bounds
+                                .get(*b)
+                                .is_some_and(|(min, _)| a < *min)
+                        {
+                            a
+                        } else {
+                            java_min(a, ev(*b, s))
+                        }
                     }
                     Binary::Max => {
-                        if s.use_column_plan && !self.stateful_columns
-                            && self.column_plan.bounds.get(*b).is_some_and(|(_,max)| a > *max) { a }
-                        else { java_max(a, ev(*b, s)) }
+                        if s.use_column_plan
+                            && !self.stateful_columns
+                            && self
+                                .column_plan
+                                .bounds
+                                .get(*b)
+                                .is_some_and(|(_, max)| a > *max)
+                        {
+                            a
+                        } else {
+                            java_max(a, ev(*b, s))
+                        }
                     }
                 }
             }
@@ -1095,7 +1401,9 @@ impl Graph {
                     }
                 }
                 Marker::Cell
-                    if matches!(mode, Mode::Cell | Mode::Block) && self.stateful_columns && s.prepared_cell.is_some() =>
+                    if matches!(mode, Mode::Cell | Mode::Block)
+                        && self.stateful_columns
+                        && s.prepared_cell.is_some() =>
                 {
                     if let Some(i) = s.cell_index(p) {
                         s.cell_values
@@ -1154,13 +1462,18 @@ impl Graph {
                     // interpolation order below (Cell differs from Block).
                     let v = if let Some((_, values)) = s.cells[*slot].filter(|(p, _)| *p == base) {
                         values
-                    } else if let Some((_, edge)) = s.column_edges[*slot].filter(|(q, values)|
-                        *q == base && x == base[0] && z == base[2]
-                        && values.iter().all(|v| v.is_finite() && *v != 0.)
-                        && (!self.stateful_columns || (!self.exposed_column_order
-                            && base[0] >= s.origin_x && base[2] >= s.origin_z
-                            && base[0] + s.width <= s.origin_x + s.span
-                            && base[2] + s.width <= s.origin_z + s.span))) {
+                    } else if let Some((_, edge)) = s.column_edges[*slot].filter(|(q, values)| {
+                        *q == base
+                            && x == base[0]
+                            && z == base[2]
+                            && values.iter().all(|v| v.is_finite() && *v != 0.)
+                            && (!self.stateful_columns
+                                || (!self.exposed_column_order
+                                    && base[0] >= s.origin_x
+                                    && base[2] >= s.origin_z
+                                    && base[0] + s.width <= s.origin_x + s.span
+                                    && base[2] + s.width <= s.origin_z + s.span))
+                    }) {
                         // The preceding density-bound search already proved
                         // all corners finite and loaded this vertical edge.
                         // Reuse it for liquid-band block queries at the same
@@ -1168,8 +1481,9 @@ impl Graph {
                         // the endpoints only in this local interpolation,
                         // never in the complete eight-corner cell cache.
                         // Zero endpoints retain the original signed-zero path.
-                        [edge[0], edge[0], edge[1], edge[1],
-                         edge[0], edge[0], edge[1], edge[1]]
+                        [
+                            edge[0], edge[0], edge[1], edge[1], edge[0], edge[0], edge[1], edge[1],
+                        ]
                     } else {
                         let mut values = [0.; 8];
                         for (i, value) in values.iter_mut().enumerate() {
@@ -1222,7 +1536,10 @@ impl Graph {
             );
         }
         s.memo[id] = Some((p, mode, v));
-        if s.use_column_plan && slot != column_plan::NONE {
+        if self.modern {
+            s.modern_memo_volumes[id] = volume;
+        }
+        if horizontal {
             s.horizontal[slot].put(p[0], p[2], mode, v);
         }
         v
@@ -1272,6 +1589,31 @@ pub enum Mode {
     Cell,
     Slice,
 }
+/// The actual sampleVolume request matters to float interpolation: partial
+/// first cells start with one multiplication, then advance by repeated adds.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ModernVolume {
+    pub size: [i32; 3],
+    pub origin: [i32; 3],
+    pub step: [i32; 3],
+}
+impl ModernVolume {
+    pub fn blocks(size: [i32; 3], origin: [i32; 3]) -> Self {
+        Self {
+            size,
+            origin,
+            step: [1; 3],
+        }
+    }
+    fn max(self, axis: usize) -> i32 {
+        self.origin[axis] + (self.size[axis] - 1) * self.step[axis]
+    }
+    fn slice(mut self, axis: usize, value: i32) -> Self {
+        self.size[axis] = 1;
+        self.origin[axis] = value;
+        self
+    }
+}
 pub struct Scratch {
     origin_x: i32,
     origin_z: i32,
@@ -1279,6 +1621,10 @@ pub struct Scratch {
     width: i32,
     height: i32,
     memo: Vec<Option<([i32; 3], Mode, f64)>>,
+    modern_memo_volumes: Vec<Option<ModernVolume>>,
+    pub(crate) modern_volume: Option<ModernVolume>,
+    modern_corners: FxHashMap<(Id, [i32; 3], ModernVolume), f32>,
+    modern_cells: Vec<Option<([i32; 3], ModernVolume, [f32; 8])>>,
     horizontal: Vec<HorizontalCache>,
     use_column_plan: bool,
     corners: FxHashMap<(Id, [i32; 3]), f64>,
@@ -1308,6 +1654,14 @@ impl Scratch {
         self.origin_z = z;
         self.span = 16;
         self.memo.fill(None);
+        self.modern_memo_volumes.fill(None);
+        self.modern_volume = self.modern_volume.map(|mut volume| {
+            volume.origin[0] = x;
+            volume.origin[2] = z;
+            volume
+        });
+        self.modern_corners.clear();
+        self.modern_cells.fill(None);
         self.horizontal.fill(HorizontalCache::default());
         self.corners.clear();
         self.cells.fill(None);
@@ -1329,19 +1683,32 @@ impl Scratch {
         use std::mem::size_of;
         // Include hash bucket slack/control bytes; charge generously rather
         // than pretending only live elements occupy memory.
-        self.memo.capacity()*size_of::<Option<([i32;3],Mode,f64)>>()
-            + self.horizontal.capacity()*size_of::<HorizontalCache>()
-            + self.cells.capacity()*size_of::<Option<([i32;3],[f64;8])>>()
-            + self.column_edges.capacity()*size_of::<Option<([i32;3],[f64;2])>>()
-            + (self.corners.capacity()+self.flat.capacity()+self.cached_2d.capacity())*64
-            + self.last_2d.capacity()*size_of::<Option<(i32,i32,f64)>>()
-            + self.once.capacity()*size_of::<(u64,f64)>()
-            + self.final_values.capacity()*8
-            + self.arrays.values().chain(self.cell_values.values()).map(|v|v.capacity()*8+64).sum::<usize>()
+        self.memo.capacity() * size_of::<Option<([i32; 3], Mode, f64)>>()
+            + self.horizontal.capacity() * size_of::<HorizontalCache>()
+            + self.modern_memo_volumes.capacity() * size_of::<Option<ModernVolume>>()
+            + self.modern_cells.capacity() * size_of::<Option<([i32; 3], ModernVolume, [f32; 8])>>()
+            + self.modern_corners.capacity() * 128
+            + self.cells.capacity() * size_of::<Option<([i32; 3], [f64; 8])>>()
+            + self.column_edges.capacity() * size_of::<Option<([i32; 3], [f64; 2])>>()
+            + (self.corners.capacity() + self.flat.capacity() + self.cached_2d.capacity()) * 64
+            + self.last_2d.capacity() * size_of::<Option<(i32, i32, f64)>>()
+            + self.once.capacity() * size_of::<(u64, f64)>()
+            + self.final_values.capacity() * 8
+            + self
+                .arrays
+                .values()
+                .chain(self.cell_values.values())
+                .map(|v| v.capacity() * 8 + 64)
+                .sum::<usize>()
     }
     /// Offline oracle: retain the original recursive evaluation without the
     /// compiled horizontal reuse. Production queries leave this enabled.
-    pub fn disable_column_plan(&mut self) { self.use_column_plan = false; }
+    pub fn disable_column_plan(&mut self) {
+        self.use_column_plan = false;
+    }
+    pub fn set_modern_volume(&mut self, volume: ModernVolume) {
+        self.modern_volume = Some(volume);
+    }
     pub fn clear_surface_slices(&mut self) {
         self.surface_slices = None;
         self.prepared_x = None;
@@ -1368,6 +1735,8 @@ impl Scratch {
         if self.beard != value {
             self.memo.fill(None);
             self.cells.fill(None);
+            self.modern_cells.fill(None);
+            self.modern_corners.clear();
             self.beard = value
         }
     }
@@ -1411,7 +1780,9 @@ impl Builder<'_> {
         if let Some(&id) = self.intern.get(&key).filter(|_| self.intern_values) {
             return Ok(id);
         }
-        let node = if let Some(c) = v.as_f64() {
+        let node = if self.graph.modern {
+            Node::Modern(Box::new(self.parse_modern(v)?))
+        } else if let Some(c) = v.as_f64() {
             if !c.is_finite() {
                 return Err("nonfinite constant".into());
             }
@@ -1421,9 +1792,15 @@ impl Builder<'_> {
             let t = full_type.strip_prefix("minecraft:").unwrap_or(full_type);
             match t {
                 "reterraforged:noise" | "freeterraforged:noise" => Node::FtfNoise(
-                    crate::freeterraforged_noise::Noise::parse(&v["noise"], self.doc,
-                        t.split_once(':').unwrap().0)?,
-                    crate::freeterraforged_noise::world_seed(self.graph.seed, t.starts_with("freeterraforged:")),
+                    crate::freeterraforged_noise::Noise::parse(
+                        &v["noise"],
+                        self.doc,
+                        t.split_once(':').unwrap().0,
+                    )?,
+                    crate::freeterraforged_noise::world_seed(
+                        self.graph.seed,
+                        t.starts_with("freeterraforged:"),
+                    ),
                 ),
                 "reterraforged:clamp_to_nearest_unit" | "freeterraforged:clamp_to_nearest_unit" => {
                     Node::FtfUnit(self.parse(&v["function"])?, integer(v, "resolution")?)
@@ -1456,7 +1833,9 @@ impl Builder<'_> {
                     "z" => 2,
                     _ => return Err("invalid axis".into()),
                 }),
-                "tectonic:invert" | "invert" => Node::Unary(Unary::Reciprocal, self.parse(&v["argument"])?),
+                "tectonic:invert" | "invert" => {
+                    Node::Unary(Unary::Reciprocal, self.parse(&v["argument"])?)
+                }
                 "lithostitched:sin"
                 | "lithostitched:cos"
                 | "lithostitched:sqrt"
@@ -1546,11 +1925,14 @@ impl Builder<'_> {
                 ),
                 "find_top_surface" => {
                     let step = integer(v, "cell_height")?;
-                    if step <= 0 { return Err("find_top_surface cell_height must be positive".into()); }
+                    if step <= 0 {
+                        return Err("find_top_surface cell_height must be positive".into());
+                    }
                     Node::FindTopSurface {
                         density: self.parse(&v["density"])?,
                         upper: self.parse(&v["upper_bound"])?,
-                        lower: integer(v, "lower_bound")?, step,
+                        lower: integer(v, "lower_bound")?,
+                        step,
                     }
                 }
                 "abs" | "square" | "cube" | "half_negative" | "quarter_negative" | "squeeze" => {
@@ -1583,6 +1965,40 @@ impl Builder<'_> {
                         return Err("inverted clamp".into());
                     }
                     Node::Clamp(self.parse(&v["input"])?, a, b)
+                }
+                "interval_select" => {
+                    let input = self.parse(&v["input"])?;
+                    let thresholds = v["thresholds"]
+                        .as_array()
+                        .ok_or("missing interval thresholds")?;
+                    let functions = v["functions"]
+                        .as_array()
+                        .ok_or("missing interval functions")?;
+                    if functions.len() < 2 || functions.len() != thresholds.len() + 1 {
+                        return Err(
+                            "interval_select requires one more function than thresholds".into()
+                        );
+                    }
+                    let mut previous = f64::NEG_INFINITY;
+                    let mut choices = Vec::with_capacity(thresholds.len());
+                    for (threshold, function) in thresholds.iter().zip(functions) {
+                        let threshold = threshold
+                            .as_f64()
+                            .filter(|v| v.is_finite())
+                            .ok_or("nonfinite interval threshold")?;
+                        if threshold < previous {
+                            return Err("unordered interval thresholds".into());
+                        }
+                        let function = self.parse(function)?;
+                        // Select uses inclusive bounds. The predecessor represents
+                        // vanilla's strict < comparison for every IEEE double,
+                        // including equal thresholds and adjacent float values.
+                        if previous < threshold {
+                            choices.push((previous, threshold.next_down(), function));
+                        }
+                        previous = threshold;
+                    }
+                    Node::Select(input, self.parse(functions.last().unwrap())?, choices)
                 }
                 "range_choice" => Node::Range(
                     self.parse(&v["input"])?,
@@ -1713,7 +2129,13 @@ fn unary(op: Unary, v: f64) -> f64 {
         Unary::Sqrt => {
             // SqrtDensityFunction.transform preserves the sign of negative
             // inputs and canonicalizes both signed zeros to positive zero.
-            if v == 0. { 0. } else if v > 0. { v.sqrt() } else { -(-v).sqrt() }
+            if v == 0. {
+                0.
+            } else if v > 0. {
+                v.sqrt()
+            } else {
+                -(-v).sqrt()
+            }
         }
         Unary::Floor => v.floor(),
         Unary::Ceil => v.ceil(),
@@ -1751,19 +2173,34 @@ mod reciprocal_tests {
             let doc = serde_json::json!({"settings":{"legacy_random_source":false,"noise_router":{
                 "final_density":{"type":"lithostitched:sqrt","argument":value}
             }}});
-            let graph = Graph::from_document(0,&doc).unwrap();
+            let graph = Graph::from_document(0, &doc).unwrap();
             let id = graph.root("final_density").unwrap();
-            let expected = if value == 0. {0.} else if value > 0. {value.sqrt()} else {-(-value).sqrt()};
-            for mode in [Mode::Raw,Mode::Single,Mode::Block,Mode::Cell,Mode::Slice] {
-                let mut scratch = graph.scratch(-16,0,4,8).unwrap();
-                assert_eq!(graph.compute(id,[-1,13,2],mode,&mut scratch).to_bits(),expected.to_bits());
-                let values = graph.fill_array(id,&[[-1,13,2],[0,-64,0]],mode,&mut scratch);
-                assert!(values.iter().all(|v| v.to_bits()==expected.to_bits()));
+            let expected = if value == 0. {
+                0.
+            } else if value > 0. {
+                value.sqrt()
+            } else {
+                -(-value).sqrt()
+            };
+            for mode in [
+                Mode::Raw,
+                Mode::Single,
+                Mode::Block,
+                Mode::Cell,
+                Mode::Slice,
+            ] {
+                let mut scratch = graph.scratch(-16, 0, 4, 8).unwrap();
+                assert_eq!(
+                    graph.compute(id, [-1, 13, 2], mode, &mut scratch).to_bits(),
+                    expected.to_bits()
+                );
+                let values = graph.fill_array(id, &[[-1, 13, 2], [0, -64, 0]], mode, &mut scratch);
+                assert!(values.iter().all(|v| v.to_bits() == expected.to_bits()));
             }
         }
-        assert_eq!(unary(Unary::Sqrt, f64::INFINITY),f64::INFINITY);
-        assert_eq!(unary(Unary::Sqrt, f64::NEG_INFINITY),f64::NEG_INFINITY);
-        assert!(unary(Unary::Sqrt,f64::NAN).is_nan());
+        assert_eq!(unary(Unary::Sqrt, f64::INFINITY), f64::INFINITY);
+        assert_eq!(unary(Unary::Sqrt, f64::NEG_INFINITY), f64::NEG_INFINITY);
+        assert!(unary(Unary::Sqrt, f64::NAN).is_nan());
     }
 
     #[test]
@@ -1849,7 +2286,6 @@ pub fn end_islands(noise: &SimplexNoise, x: i32, z: i32) -> f64 {
     (value as f64 - 8.) / 128.
 }
 
-
 #[cfg(test)]
 mod preliminary_surface_tests {
     use super::*;
@@ -1860,63 +2296,162 @@ mod preliminary_surface_tests {
                "from_value":-128.0,"to_value":128.0})
     }
     fn graph(density: Value, upper: Value, lower: i32, step: i32) -> Result<Graph> {
-        Graph::from_document(91, &json!({"settings":{"legacy_random_source":false,"noise_router":{
-            "final_density":0.0,"preliminary_surface_level":{"type":"minecraft:find_top_surface",
-            "density":density,"upper_bound":upper,"lower_bound":lower,"cell_height":step}
-        }}}))
+        Graph::from_document(
+            91,
+            &json!({"settings":{"legacy_random_source":false,"noise_router":{
+                "final_density":0.0,"preliminary_surface_level":{"type":"minecraft:find_top_surface",
+                "density":density,"upper_bound":upper,"lower_bound":lower,"cell_height":step}
+            }}}),
+        )
     }
-    fn verify(g: &Graph, points: &[[i32;3]], expected: &[f64]) {
-        let root=g.root("preliminary_surface_level").unwrap();
-        for mode in [Mode::Raw,Mode::Single,Mode::Block,Mode::Cell,Mode::Slice] {
-            let mut scratch=g.scratch(-16,0,4,8).unwrap();
-            for (&p,&value) in points.iter().zip(expected) {
-                assert_eq!(g.compute(root,p,mode,&mut scratch),value,"point {p:?} mode {mode:?}");
+    fn verify(g: &Graph, points: &[[i32; 3]], expected: &[f64]) {
+        let root = g.root("preliminary_surface_level").unwrap();
+        for mode in [
+            Mode::Raw,
+            Mode::Single,
+            Mode::Block,
+            Mode::Cell,
+            Mode::Slice,
+        ] {
+            let mut scratch = g.scratch(-16, 0, 4, 8).unwrap();
+            for (&p, &value) in points.iter().zip(expected) {
+                assert_eq!(
+                    g.compute(root, p, mode, &mut scratch),
+                    value,
+                    "point {p:?} mode {mode:?}"
+                );
             }
-            let values=g.fill_array(root,points,mode,&mut scratch);
-            assert_eq!(values,expected);
+            let values = g.fill_array(root, points, mode, &mut scratch);
+            assert_eq!(values, expected);
         }
     }
     #[test]
     fn top_surface_uses_strict_positive_downward_cell_lattice() {
         // density=12-Y: Y16 is negative, Y8 is the first strictly positive probe.
-        let density=json!({"type":"minecraft:add","argument1":12.0,
+        let density = json!({"type":"minecraft:add","argument1":12.0,
             "argument2":{"type":"minecraft:mul","argument1":-1.0,"argument2":gradient()}});
-        verify(&graph(density,json!(31.0),-63,8).unwrap(),&[[-1,-95,2],[0,100,0]],&[8.,8.]);
+        verify(
+            &graph(density, json!(31.0), -63, 8).unwrap(),
+            &[[-1, -95, 2], [0, 100, 0]],
+            &[8., 8.],
+        );
         // Exactly zero is not a hit. A lower bound need not align with the lattice.
-        verify(&graph(json!(0.0),json!(31.0),-63,8).unwrap(),&[[0,0,0]],&[-63.]);
-        verify(&graph(json!(1.0),json!(-1.0),-63,8).unwrap(),&[[0,0,0]],&[-8.]);
-        verify(&graph(json!(1.0),json!(-64.0),-63,8).unwrap(),&[[0,0,0]],&[-63.]);
+        verify(
+            &graph(json!(0.0), json!(31.0), -63, 8).unwrap(),
+            &[[0, 0, 0]],
+            &[-63.],
+        );
+        verify(
+            &graph(json!(1.0), json!(-1.0), -63, 8).unwrap(),
+            &[[0, 0, 0]],
+            &[-8.],
+        );
+        verify(
+            &graph(json!(1.0), json!(-64.0), -63, 8).unwrap(),
+            &[[0, 0, 0]],
+            &[-63.],
+        );
     }
     #[test]
     fn upper_bound_keeps_original_context_but_probe_density_uses_replacement_y() {
         // The same XZ has distinct results when caller Y supplies upper_bound.
-        let density=json!({"type":"minecraft:add","argument1":1.0,"argument2":gradient()});
-        let g=graph(density,gradient(),-64,8).unwrap();
-        verify(&g,&[[0,23,0],[0,7,0],[0,-1,0],[0,31,0]],&[16.,0.,-64.,24.]);
+        let density = json!({"type":"minecraft:add","argument1":1.0,"argument2":gradient()});
+        let g = graph(density, gradient(), -64, 8).unwrap();
+        verify(
+            &g,
+            &[[0, 23, 0], [0, 7, 0], [0, -1, 0], [0, 31, 0]],
+            &[16., 0., -64., 24.],
+        );
     }
     #[test]
     fn top_surface_rejects_nonpositive_cell_height() {
-        for step in [0,-1,-8] { assert!(graph(json!(1.),json!(32.),-64,step).is_err()); }
+        for step in [0, -1, -8] {
+            assert!(graph(json!(1.), json!(32.), -64, step).is_err());
+        }
     }
     #[test]
     fn vanilla_invert_preserves_ieee_signs_and_matches_arrays() {
-        let d=json!({"settings":{"legacy_random_source":false,"noise_router":{
+        let d = json!({"settings":{"legacy_random_source":false,"noise_router":{
             "final_density":{"type":"minecraft:invert","argument":gradient()}
         }}});
-        let g=Graph::from_document(91,&d).unwrap();
-        let root=g.root("final_density").unwrap();
-        let points=[[0,-5,0],[0,0,0],[0,7,0]];
-        let mut scratch=g.scratch(0,0,4,8).unwrap();
-        let batch=g.fill_array(root,&points,Mode::Cell,&mut scratch);
-        for (p,value) in points.into_iter().zip(batch) {
-            assert_eq!(value.to_bits(),(1.0/p[1] as f64).to_bits());
+        let g = Graph::from_document(91, &d).unwrap();
+        let root = g.root("final_density").unwrap();
+        let points = [[0, -5, 0], [0, 0, 0], [0, 7, 0]];
+        let mut scratch = g.scratch(0, 0, 4, 8).unwrap();
+        let batch = g.fill_array(root, &points, Mode::Cell, &mut scratch);
+        for (p, value) in points.into_iter().zip(batch) {
+            assert_eq!(value.to_bits(), (1.0 / p[1] as f64).to_bits());
         }
-        for zero in [0.0_f64,-0.0_f64] {
-            let d=json!({"settings":{"legacy_random_source":false,"noise_router":{
+        for zero in [0.0_f64, -0.0_f64] {
+            let d = json!({"settings":{"legacy_random_source":false,"noise_router":{
                 "final_density":{"type":"minecraft:invert","argument":zero}}}});
-            let g=Graph::from_document(0,&d).unwrap();
-            let mut scratch=g.scratch(0,0,4,8).unwrap();
-            assert_eq!(g.compute(g.root("final_density").unwrap(),[0,0,0],Mode::Single,&mut scratch).to_bits(),(1.0/zero).to_bits());
+            let g = Graph::from_document(0, &d).unwrap();
+            let mut scratch = g.scratch(0, 0, 4, 8).unwrap();
+            assert_eq!(
+                g.compute(
+                    g.root("final_density").unwrap(),
+                    [0, 0, 0],
+                    Mode::Single,
+                    &mut scratch
+                )
+                .to_bits(),
+                (1.0 / zero).to_bits()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod interval_select_tests {
+    use super::*;
+    use serde_json::json;
+    fn doc(thresholds: Value, functions: Value) -> Value {
+        json!({"settings":{"legacy_random_source":false,"noise_router":{
+            "final_density":{"type":"minecraft:interval_select",
+                "input":{"type":"minecraft:y_clamped_gradient","from_y":-32,"to_y":32,
+                         "from_value":-32.,"to_value":32.},
+                "thresholds":thresholds,"functions":functions}}}})
+    }
+    #[test]
+    fn strict_thresholds_and_duplicate_intervals_match_scalar_and_arrays() {
+        let g = Graph::from_document(
+            11,
+            &doc(json!([-3., 0., 0., 7.]), json!([10., 20., 30., 40., 50.])),
+        )
+        .unwrap();
+        let root = g.root("final_density").unwrap();
+        let points = [
+            [-1, -4, 2],
+            [-1, -3, 2],
+            [-1, -1, 2],
+            [-1, 0, 2],
+            [-1, 6, 2],
+            [-1, 7, 2],
+        ];
+        let expected = [10., 20., 20., 40., 40., 50.];
+        for mode in [
+            Mode::Raw,
+            Mode::Single,
+            Mode::Block,
+            Mode::Cell,
+            Mode::Slice,
+        ] {
+            let mut scratch = g.scratch(-16, 0, 4, 8).unwrap();
+            for (&p, &v) in points.iter().zip(&expected) {
+                assert_eq!(g.compute(root, p, mode, &mut scratch), v);
+            }
+            assert_eq!(g.fill_array(root, &points, mode, &mut scratch), expected);
+        }
+    }
+    #[test]
+    fn validates_arity_order_and_finiteness() {
+        for (thresholds, functions) in [
+            (json!([]), json!([1.])),
+            (json!([1., 0.]), json!([1., 2., 3.])),
+            (json!([0.]), json!([1., 2., 3.])),
+            (json!(["NaN"]), json!([1., 2.])),
+        ] {
+            assert!(Graph::from_document(11, &doc(thresholds, functions)).is_err());
         }
     }
 }

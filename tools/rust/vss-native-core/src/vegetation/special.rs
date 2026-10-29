@@ -78,7 +78,7 @@ pub(super) struct Roots {
     skew: f32,
 }
 impl Roots {
-    pub fn parse(v: &Value, p: &mut Palette) -> Result<Self> {
+    pub fn parse(v: &Value, doc: &Value, p: &mut Palette) -> Result<Self> {
         if minecraft_type(v)? != "mangrove_root_placer" {
             return Err("unsupported root placer".into());
         }
@@ -92,18 +92,22 @@ impl Roots {
             .get("above_root_placement")
             .map(|v| -> Result<_> {
                 Ok((
-                    StateProvider::parse(&v["above_root_provider"], p)?,
+                    StateProvider::parse_with_registries(&v["above_root_provider"], doc, p)?,
                     number(v, "above_root_placement_chance")? as f32,
                 ))
             })
             .transpose()?;
         Ok(Self {
             offset: IntProvider::parse(&v["trunk_offset_y"])?,
-            provider: StateProvider::parse(&v["root_provider"], p)?,
+            provider: StateProvider::parse_with_registries(&v["root_provider"], doc, p)?,
             above,
             through: BlockSet::parse(&m["can_grow_through"])?,
             muddy: BlockSet::parse(&m["muddy_roots_in"])?,
-            muddy_provider: StateProvider::parse(&m["muddy_roots_provider"], p)?,
+            muddy_provider: StateProvider::parse_with_registries(
+                &m["muddy_roots_provider"],
+                doc,
+                p,
+            )?,
             width,
             length,
             skew: number(m, "random_skew_chance")? as f32,
@@ -178,17 +182,17 @@ impl Roots {
         for q in list {
             let b = w.get(q);
             if self.muddy.contains(&w.palette, b) {
-                let state = self.muddy_provider.state(r, q, &mut w.palette)?;
+                let state = self.muddy_provider.state_in(r, q, w)?;
                 set_root(w, q, state, out)?;
             } else if self.can_place(w, q) {
-                let state = self.provider.state(r, q, &mut w.palette)?;
+                let state = self.provider.state_in(r, q, w)?;
                 set_root(w, q, state, out)?;
                 if let Some((provider, chance)) = &self.above {
                     let above = offset(q, 0, 1, 0);
                     if r.next_float() < *chance {
                         let b = w.get(above);
                         if w.palette.is_air(b) {
-                            let state = provider.state(r, above, &mut w.palette)?;
+                            let state = provider.state_in(r, above, w)?;
                             set_root(w, above, state, out)?;
                         }
                     }
@@ -362,7 +366,7 @@ impl Tree {
         if !self.valid_trunk(&w.palette, b) {
             return Ok(());
         }
-        let mut state = self.trunk.state(r, p, &mut w.palette)?;
+        let mut state = self.trunk.state_in(r, p, w)?;
         if w.palette.state(state).properties.contains_key("axis") {
             state = w.palette.with(state, "axis", axis)?;
         }

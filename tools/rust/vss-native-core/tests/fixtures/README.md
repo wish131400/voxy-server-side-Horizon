@@ -32,3 +32,30 @@ No world capture or native library is read by this generator.
 the stream consumption and cache states exactly. On the measured Windows x64
 run 7,167 of 7,168 Gaussians were exact and the maximum difference was 1 ULP.
 This is a reported limit, not a claim of cross-platform feature equivalence.
+
+## Minecraft 26.3 references
+
+`worldgen263` is a separate set generated with Java 25 and the actual Minecraft
+26.3 classes. It does not reinterpret the legacy 1.21.1 fixtures as modern data.
+The portable exporters are `tools/verification/Minecraft263NativeReference.java`
+and `tools/verification/Minecraft263VegetationReference.java` in the repository.
+They use the corresponding compiled Java test runtime and actual registries.
+
+The overworld, Nether and End files contain float density and complete base
+column references across three seeds, negative and distant coordinates, bulk
+queries, partial height ranges and differing cell sizes. `beard.json` contains
+the original structure contribution results, including piece and junction data.
+
+`features.json` uses the production snapshot corrections and complete block
+definitions, provider registries, placed features and actual block tags.
+`providers.jsonl` contains 960 optional/state/RNG comparisons;
+`vegetation.jsonl` contains 176 Nether feature cases; `modern.jsonl` contains
+496 composition and boundary cases; `trees263.jsonl` contains 80 tree/mushroom
+cases. The two state palettes are independent. Complete final states and the
+next random long are checked, including obstructions, null providers, column
+truncation, zero-length pillars and sequence/overlay evaluation order.
+
+The CherryFoliagePlacer codec exports its corner probability using the wrong
+getter. These fixtures apply `VanillaFeatureSnapshot.correct`, exactly as the
+production server snapshot does, while the expected placement still calls the
+unmodified original Minecraft feature implementation.

@@ -90,6 +90,56 @@ impl Beard {
         }
         result
     }
+    /// 26.3 rounds contributions and their accumulated sum as floats.
+    /// The kernel itself retains its original double-precision construction.
+    pub fn compute_float(&self, p: Pos) -> f32 {
+        let mut result = 0f32;
+        for piece in &self.pieces {
+            let b = piece.bounds;
+            let x = 0.max(b[0] - p[0]).max(p[0] - b[3]);
+            let z = 0.max(b[2] - p[2]).max(p[2] - b[5]);
+            let base = b[1] + piece.ground;
+            let delta = p[1] - base;
+            let y = match piece.kind {
+                Adjustment::None => 0,
+                Adjustment::Bury | Adjustment::Thin => delta,
+                Adjustment::Box => 0.max(base - p[1]).max(p[1] - b[4]),
+                Adjustment::Encapsulate => 0.max(b[1] - p[1]).max(p[1] - b[4]),
+            };
+            result += match piece.kind {
+                Adjustment::None => 0.,
+                Adjustment::Bury => bury_float(x as f32, y as f32 / 2., z as f32),
+                Adjustment::Thin | Adjustment::Box => beard_float(x, y, z, delta) * 0.8,
+                Adjustment::Encapsulate => {
+                    bury_float(x as f32 / 2., y as f32 / 2., z as f32 / 2.) * 0.8
+                }
+            };
+        }
+        for q in &self.junctions {
+            result += beard_float(p[0] - q[0], p[1] - q[1], p[2] - q[2], p[1] - q[1]) * 0.4;
+        }
+        result
+    }
+}
+fn bury_float(x: f32, y: f32, z: f32) -> f32 {
+    let distance = x * x + y * y + z * z;
+    if distance >= 36. {
+        0.
+    } else {
+        1. - (distance as f64).sqrt() as f32 / 6.
+    }
+}
+fn beard_float(x: i32, y: i32, z: i32, delta: i32) -> f32 {
+    if !(-12..12).contains(&x) || !(-12..12).contains(&y) || !(-12..12).contains(&z) {
+        return 0.;
+    }
+    let d = delta as f32 + 0.5;
+    let length = (x as f32 * x as f32 + d * d + z as f32 * z as f32) / 2.;
+    let length = length as f64;
+    let half = 0.5 * length;
+    let approx = f64::from_bits((6910469410427058090i64 - ((length.to_bits() as i64) >> 1)) as u64);
+    let inverse = (approx * (1.5 - half * approx * approx)) as f32;
+    (-d * inverse / 2.) * kernel()[((z + 12) * 24 * 24 + (x + 12) * 24 + y + 12) as usize]
 }
 fn bury(x: f64, y: f64, z: f64) -> f64 {
     let d2 = x * x + y * y + z * z;
@@ -108,8 +158,17 @@ fn beard(x: i32, y: i32, z: i32, delta: i32) -> f64 {
     if !(-12..12).contains(&x) || !(-12..12).contains(&y) || !(-12..12).contains(&z) {
         return 0.;
     }
+    let table = kernel();
+    let d = delta as f64 + 0.5;
+    let length = ((x * x) as f64 + d * d + (z * z) as f64) / 2.;
+    let half = 0.5 * length;
+    let approx = f64::from_bits((6910469410427058090i64 - ((length.to_bits() as i64) >> 1)) as u64);
+    let inverse = approx * (1.5 - half * approx * approx);
+    -d * inverse / 2. * table[((z + 12) * 24 * 24 + (x + 12) * 24 + y + 12) as usize] as f64
+}
+fn kernel() -> &'static [f32] {
     static KERNEL: OnceLock<Vec<f32>> = OnceLock::new();
-    let table = KERNEL.get_or_init(|| {
+    KERNEL.get_or_init(|| {
         let mut v = vec![];
         for z in -12..12 {
             for x in -12..12 {
@@ -123,11 +182,24 @@ fn beard(x: i32, y: i32, z: i32, delta: i32) -> f64 {
             }
         }
         v
-    });
-    let d = delta as f64 + 0.5;
-    let length = ((x * x) as f64 + d * d + (z * z) as f64) / 2.;
-    let half = 0.5 * length;
-    let approx = f64::from_bits((6910469410427058090i64 - ((length.to_bits() as i64) >> 1)) as u64);
-    let inverse = approx * (1.5 - half * approx * approx);
-    -d * inverse / 2. * table[((z + 12) * 24 * 24 + (x + 12) * 24 + y + 12) as usize] as f64
+    })
+}
+
+#[cfg(test)]
+mod modern_tests {
+    use super::*;
+    #[test]
+    fn float_adjustments_match_real_minecraft_263() {
+        let doc: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/worldgen263/beard.json")).unwrap();
+        let beard = Beard::parse(&doc).unwrap();
+        for sample in doc["samples"].as_array().unwrap() {
+            let p = std::array::from_fn(|i| sample["p"][i].as_i64().unwrap() as i32);
+            assert_eq!(
+                sample["bits"].as_i64().unwrap() as u32,
+                beard.compute_float(p).to_bits(),
+                "at {p:?}"
+            );
+        }
+    }
 }

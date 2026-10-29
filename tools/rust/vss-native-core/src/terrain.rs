@@ -1,7 +1,7 @@
 //! Vanilla NoiseBasedChunkGenerator base columns, Aquifer and OreVeinifier.
 //! No structure starts, carvers or decoration are implied by a base column.
 use crate::{
-    density::{clamped_lerp, integer, string, Graph, Id, Mode, Result, Scratch},
+    density::{clamped_lerp, integer, Graph, Id, Mode, Result, Scratch},
     random::Positional,
 };
 use serde_json::Value;
@@ -68,6 +68,7 @@ pub struct Terrain {
     pub default_block: String,
     fluid: Substance,
     aquifers: bool,
+    modern_aquifer: Option<crate::aquifer::Config>,
     ores: bool,
     final_density: Id,
     initial: Id,
@@ -124,7 +125,9 @@ pub struct Job<'a> {
     ///
     /// A top is a pure function of `(x, z)` given the world's fixed
     /// `adjustments`, so sharing it across columns cannot change any result.
-    pub shared_tops: Option<&'a std::sync::Mutex<std::collections::HashMap<(i32, i32), Option<(i32, Substance)>>>>,
+    pub shared_tops: Option<
+        &'a std::sync::Mutex<std::collections::HashMap<(i32, i32), Option<(i32, Substance)>>>,
+    >,
 }
 /// Owned query context, parked only within its immutable World and chunk.
 /// No borrowed terrain or structure pointers cross a call boundary.
@@ -143,9 +146,15 @@ pub(crate) struct SurfaceWork {
 impl SurfaceWork {
     pub(crate) fn retained_bytes(&self) -> usize {
         self.scratch.retained_bytes()
-            + self.density_cells.capacity()*64
-            + self.density_ceiling.capacity()*64
-            + (self.levels.capacity()+self.locations.capacity()+self.fluids.capacity()+self.tops.capacity()+self.proven_air_cells.capacity()+self.display_tops.capacity())*64
+            + self.density_cells.capacity() * 64
+            + self.density_ceiling.capacity() * 64
+            + (self.levels.capacity()
+                + self.locations.capacity()
+                + self.fluids.capacity()
+                + self.tops.capacity()
+                + self.proven_air_cells.capacity()
+                + self.display_tops.capacity())
+                * 64
     }
 }
 const WAY_BELOW_MIN_Y: i32 = -32512;
@@ -157,11 +166,19 @@ impl Terrain {
         let mut air = top + 1;
         let mut y = top;
         loop {
-            if self.graph.compute(self.final_density, [x, y, z], Mode::Raw, scratch) > 0. {
+            if self
+                .graph
+                .compute(self.final_density, [x, y, z], Mode::Raw, scratch)
+                > 0.
+            {
                 let mut solid = y;
                 while air - solid > 4 {
                     let middle = solid + (air - solid) / 2;
-                    if self.graph.compute(self.final_density, [x, middle, z], Mode::Raw, scratch) > 0. {
+                    if self
+                        .graph
+                        .compute(self.final_density, [x, middle, z], Mode::Raw, scratch)
+                        > 0.
+                    {
                         solid = middle;
                     } else {
                         air = middle;
@@ -169,7 +186,9 @@ impl Terrain {
                 }
                 return solid + 1;
             }
-            if y == self.min_y { return self.min_y; }
+            if y == self.min_y {
+                return self.min_y;
+            }
             air = y;
             y = (y - 16).max(self.min_y);
         }
@@ -177,7 +196,9 @@ impl Terrain {
 
     pub fn preview_fluid(&self, floor: i32) -> (i32, i32) {
         // Empty End columns must stay empty. This deliberately omits aquifers.
-        if floor == self.min_y || floor >= self.sea_level { return (floor, 0); }
+        if floor == self.min_y || floor >= self.sea_level {
+            return (floor, 0);
+        }
         match self.fluid {
             Substance::Water => (self.sea_level, 1),
             Substance::Lava => (self.sea_level, 2),
@@ -186,17 +207,31 @@ impl Terrain {
     }
 
     pub fn from_document(seed: i64, doc: &Value) -> Result<Self> {
-        let graph = Graph::from_document(seed, doc)?;
+        let mut graph = Graph::from_document(seed, doc)?;
+        let modern = graph.is_modern();
+        let modern_aquifer = if modern {
+            crate::aquifer::Config::from_document(&mut graph, doc)?
+        } else {
+            None
+        };
         let s = &doc["settings"];
         let n = &s["noise"];
         let min_y = integer(n, "min_y")?;
         let height = integer(n, "height")?;
-        let cell_width = integer(n, "size_horizontal")?
-            .checked_mul(4)
-            .ok_or("cell width overflow")?;
-        let cell_height = integer(n, "size_vertical")?
-            .checked_mul(4)
-            .ok_or("cell height overflow")?;
+        let cell_width = if modern {
+            4
+        } else {
+            integer(n, "size_horizontal")?
+                .checked_mul(4)
+                .ok_or("cell width overflow")?
+        };
+        let cell_height = if modern {
+            8
+        } else {
+            integer(n, "size_vertical")?
+                .checked_mul(4)
+                .ok_or("cell height overflow")?
+        };
         if !(4..=64).contains(&cell_width)
             || !(4..=64).contains(&cell_height)
             || height <= 0
@@ -208,7 +243,19 @@ impl Terrain {
         {
             return Err("unsupported noise dimensions".into());
         }
-        let fluid = match string(&s["default_fluid"], "Name")? {
+        let state_name = |v: &Value| -> Result<String> {
+            Ok(if let Some(name) = v.as_str() {
+                name.to_owned()
+            } else {
+                v.get("Name")
+                    .or_else(|| v.get("id"))
+                    .and_then(Value::as_str)
+                    .ok_or("missing default block Name/id")?
+                    .to_owned()
+            })
+        };
+        let fluid_name = state_name(&s["default_fluid"])?;
+        let fluid = match fluid_name.as_str() {
             "minecraft:water" => Substance::Water,
             "minecraft:lava" => Substance::Lava,
             "minecraft:air" => Substance::Air,
@@ -220,28 +267,86 @@ impl Terrain {
             cell_width,
             cell_height,
             sea_level: integer(s, "sea_level")?,
-            default_block: string(&s["default_block"], "Name")?.into(),
+            default_block: state_name(&s["default_block"])?,
             fluid,
-            aquifers: s["aquifers_enabled"]
-                .as_bool()
-                .ok_or("missing aquifer flag")?,
-            ores: s["ore_veins_enabled"].as_bool().ok_or("missing ore flag")?,
+            aquifers: if modern {
+                modern_aquifer.is_some()
+            } else {
+                s["aquifers_enabled"]
+                    .as_bool()
+                    .ok_or("missing aquifer flag")?
+            },
+            ores: if modern {
+                false
+            } else {
+                s["ore_veins_enabled"].as_bool().ok_or("missing ore flag")?
+            },
             final_density: graph.root("final_density")?,
-            initial: graph.root(if graph.roots.contains_key("preliminary_surface_level") {
-                "preliminary_surface_level"
-            } else { "initial_density_without_jaggedness" })?,
-            preliminary_height: graph.roots.contains_key("preliminary_surface_level"),
-            barrier: graph.root("barrier")?,
-            floodedness: graph.root("fluid_level_floodedness")?,
-            spread: graph.root("fluid_level_spread")?,
-            lava: graph.root("lava")?,
+            initial: if modern {
+                modern_aquifer
+                    .as_ref()
+                    .map(|v| v.surface_level)
+                    .unwrap_or(graph.root("chunk_surface_level")?)
+            } else {
+                graph.root(if graph.roots.contains_key("preliminary_surface_level") {
+                    "preliminary_surface_level"
+                } else {
+                    "initial_density_without_jaggedness"
+                })?
+            },
+            preliminary_height: modern || graph.roots.contains_key("preliminary_surface_level"),
+            barrier: if modern {
+                modern_aquifer
+                    .as_ref()
+                    .map(|v| v.barrier)
+                    .unwrap_or(graph.root("final_density")?)
+            } else {
+                graph.root("barrier")?
+            },
+            floodedness: if modern {
+                modern_aquifer
+                    .as_ref()
+                    .map(|v| v.floodedness)
+                    .unwrap_or(graph.root("final_density")?)
+            } else {
+                graph.root("fluid_level_floodedness")?
+            },
+            spread: if modern {
+                modern_aquifer
+                    .as_ref()
+                    .map(|v| v.spread)
+                    .unwrap_or(graph.root("final_density")?)
+            } else {
+                graph.root("fluid_level_spread")?
+            },
+            lava: if modern {
+                modern_aquifer
+                    .as_ref()
+                    .map(|v| v.lava)
+                    .unwrap_or(graph.root("final_density")?)
+            } else {
+                graph.root("lava")?
+            },
             erosion: graph.root("erosion")?,
             depth: graph.root("depth")?,
-            vein_toggle: graph.root("vein_toggle")?,
-            vein_ridged: graph.root("vein_ridged")?,
-            vein_gap: graph.root("vein_gap")?,
+            vein_toggle: if modern {
+                graph.root("final_density")?
+            } else {
+                graph.root("vein_toggle")?
+            },
+            vein_ridged: if modern {
+                graph.root("final_density")?
+            } else {
+                graph.root("vein_ridged")?
+            },
+            vein_gap: if modern {
+                graph.root("final_density")?
+            } else {
+                graph.root("vein_gap")?
+            },
             aquifer_random: graph.random.from_hash("minecraft:aquifer").positional(),
             ore_random: graph.random.from_hash("minecraft:ore").positional(),
+            modern_aquifer,
             graph,
         })
     }
@@ -249,6 +354,7 @@ impl Terrain {
         if !(-30_000_000..=30_000_000).contains(&x) || !(-30_000_000..=30_000_000).contains(&z) {
             return Err("outside supported world coordinates".into());
         }
+        let requested = (x, z);
         let width = if base_column { self.cell_width } else { 16 };
         let x = x.div_euclid(width) * width;
         let z = z.div_euclid(width) * width;
@@ -256,6 +362,19 @@ impl Terrain {
             .graph
             .scratch(x & !3, z & !3, self.cell_width, self.cell_height)?;
         scratch.span = width & !3;
+        if self.graph.is_modern() {
+            let size = if base_column {
+                [1, self.height, 1]
+            } else {
+                [16, self.height, 16]
+            };
+            let origin = if base_column {
+                [requested.0, self.min_y, requested.1]
+            } else {
+                [x, self.min_y, z]
+            };
+            scratch.set_modern_volume(crate::density::ModernVolume::blocks(size, origin));
+        }
         // Exposed stateful caches retain the original initialization order.
         // Caches sheltered by Flat are filled lazily at its fixed height.
         self.graph.initialize_column_caches(&mut scratch);
@@ -285,9 +404,23 @@ impl Terrain {
     }
     /// Exact air proof for a coarse exterior cell. Stateful graphs keep their
     /// full descending columns, including ore evaluation and fresh cache scope.
-    pub fn exterior_footprint(&self, x: i32, z: i32, step: i32, bottom: i32, top: i32) -> Result<Option<Vec<u8>>> {
-        if ![1, 2, 4].contains(&step) || bottom < self.min_y || top > self.min_y + self.height || bottom >= top
-            || x < -30_000_000 || z < -30_000_000 || x > 30_000_000 - step || z > 30_000_000 - step {
+    pub fn exterior_footprint(
+        &self,
+        x: i32,
+        z: i32,
+        step: i32,
+        bottom: i32,
+        top: i32,
+    ) -> Result<Option<Vec<u8>>> {
+        if ![1, 2, 4].contains(&step)
+            || bottom < self.min_y
+            || top > self.min_y + self.height
+            || bottom >= top
+            || x < -30_000_000
+            || z < -30_000_000
+            || x > 30_000_000 - step
+            || z > 30_000_000 - step
+        {
             return Err("exterior footprint bounds".into());
         }
         let ordered = self.graph.requires_complete_column_order();
@@ -295,44 +428,69 @@ impl Terrain {
         let mut missing = occupied.len();
         let mut job = None;
         let mut scope = None;
-        for dz in 0..step { for dx in 0..step {
-            let (xx, zz) = (x + dx, z + dz);
-            if ordered {
-                let column = self.base_column(xx, zz)?;
-                if dx == 0 && dz == 0 && column.blocks[(top - 1 - self.min_y) as usize] == Substance::Air {
-                    return Ok(None);
-                }
-                for y in bottom..top {
-                    let i = (y - bottom) as usize;
-                    if occupied[i] == 0 && column.blocks[(y - self.min_y) as usize] != Substance::Air {
-                        occupied[i] = 1; missing -= 1;
+        for dz in 0..step {
+            for dx in 0..step {
+                let (xx, zz) = (x + dx, z + dz);
+                if ordered {
+                    let column = self.base_column(xx, zz)?;
+                    if dx == 0
+                        && dz == 0
+                        && column.blocks[(top - 1 - self.min_y) as usize] == Substance::Air
+                    {
+                        return Ok(None);
+                    }
+                    for y in bottom..top {
+                        let i = (y - bottom) as usize;
+                        if occupied[i] == 0
+                            && column.blocks[(y - self.min_y) as usize] != Substance::Air
+                        {
+                            occupied[i] = 1;
+                            missing -= 1;
+                        }
+                    }
+                } else {
+                    let cell = (
+                        xx.div_euclid(self.cell_width),
+                        zz.div_euclid(self.cell_width),
+                    );
+                    if scope != Some(cell) {
+                        job = Some(self.job(xx, zz, true)?);
+                        scope = Some(cell);
+                    }
+                    let job = job.as_mut().unwrap();
+                    for y in (bottom..top).rev() {
+                        let i = (y - bottom) as usize;
+                        // One solid block proves this height in the union forever.
+                        if occupied[i] != 0 {
+                            continue;
+                        }
+                        let solid = job.base_substance([xx, y, zz]) != Substance::Air;
+                        if dx == 0 && dz == 0 && y == top - 1 && !solid {
+                            return Ok(None);
+                        }
+                        if solid {
+                            occupied[i] = 1;
+                            missing -= 1;
+                        }
                     }
                 }
-            } else {
-                let cell = (xx.div_euclid(self.cell_width), zz.div_euclid(self.cell_width));
-                if scope != Some(cell) {
-                    job = Some(self.job(xx, zz, true)?);
-                    scope = Some(cell);
-                }
-                let job = job.as_mut().unwrap();
-                for y in (bottom..top).rev() {
-                    let i = (y - bottom) as usize;
-                    // One solid block proves this height in the union forever.
-                    if occupied[i] != 0 { continue; }
-                    let solid = job.base_substance([xx, y, zz]) != Substance::Air;
-                    if dx == 0 && dz == 0 && y == top - 1 && !solid { return Ok(None); }
-                    if solid { occupied[i] = 1; missing -= 1; }
+                if missing == 0 {
+                    return Ok(Some(occupied));
                 }
             }
-            if missing == 0 { return Ok(Some(occupied)); }
-        }}
+        }
         Ok(Some(occupied))
     }
 
     /// Work remains local to one bounded batch; no proof survives the caller.
-    pub fn exterior_footprints(&self, requests: &[(i32, i32, i32, i32, i32)]) -> Result<Option<Vec<Option<Vec<u8>>>>> {
+    pub fn exterior_footprints(
+        &self,
+        requests: &[(i32, i32, i32, i32, i32)],
+    ) -> Result<Option<Vec<Option<Vec<u8>>>>> {
         let _scope = crate::prof::Scope::new(&crate::prof::FOOTPRINT);
-        if requests.len() > 8 { return Err("exterior batch size".into()); }
+        if requests.len() > 8 {
+            return Err("exterior batch size".into());
+        }
         if self.graph.requires_complete_column_order() {
             return Ok(None);
         }
@@ -342,23 +500,45 @@ impl Terrain {
         let mut overlap = false;
         let mut scope_overlap = false;
         for &(x, z, step, bottom, top) in requests {
-            if ![1, 2, 4].contains(&step) || bottom < self.min_y || top > self.min_y + self.height || bottom >= top
-                || x < -30_000_000 || z < -30_000_000 || x > 30_000_000 - step || z > 30_000_000 - step {
+            if ![1, 2, 4].contains(&step)
+                || bottom < self.min_y
+                || top > self.min_y + self.height
+                || bottom >= top
+                || x < -30_000_000
+                || z < -30_000_000
+                || x > 30_000_000 - step
+                || z > 30_000_000 - step
+            {
                 return Err("exterior batch bounds".into());
             }
             let mut request_cells = FxHashSet::default();
             let mut request_scopes = FxHashSet::default();
-            for dz in 0..step { for dx in 0..step {
-                let cell = ((x + dx).div_euclid(self.cell_width), (z + dz).div_euclid(self.cell_width));
-                let scope = ((x + dx).div_euclid(width), (z + dz).div_euclid(width));
-                if request_cells.insert(cell) && !cells.insert(cell) { overlap = true; }
-                if request_scopes.insert(scope) && !scopes.insert(scope) { scope_overlap = true; }
-                if scopes.len() > 8 { return Ok(None); }
-            }}
+            for dz in 0..step {
+                for dx in 0..step {
+                    let cell = (
+                        (x + dx).div_euclid(self.cell_width),
+                        (z + dz).div_euclid(self.cell_width),
+                    );
+                    let scope = ((x + dx).div_euclid(width), (z + dz).div_euclid(width));
+                    if request_cells.insert(cell) && !cells.insert(cell) {
+                        overlap = true;
+                    }
+                    if request_scopes.insert(scope) && !scopes.insert(scope) {
+                        scope_overlap = true;
+                    }
+                    if scopes.len() > 8 {
+                        return Ok(None);
+                    }
+                }
+            }
         }
         let chunk_scope = self.graph.has_stateful_queries() || cells.len() > 8 || !overlap;
-        if chunk_scope && !scope_overlap { return Ok(None); }
-        if chunk_scope && self.cell_width < 16 && 16 % self.cell_width != 0 { return Ok(None); }
+        if chunk_scope && !scope_overlap {
+            return Ok(None);
+        }
+        if chunk_scope && self.cell_width < 16 && 16 % self.cell_width != 0 {
+            return Ok(None);
+        }
         // Sheltered Flat caches and adjacent noise cells can share one covered
         // chunk lattice. Exposed stateful graphs retain their scalar ordering.
         let width = if chunk_scope { width } else { self.cell_width };
@@ -368,23 +548,39 @@ impl Terrain {
             let mut occupied = vec![0; (top - bottom) as usize];
             let mut missing = occupied.len();
             let mut rejected = false;
-            for dz in 0..step { for dx in 0..step {
-                let (xx, zz) = (x + dx, z + dz);
-                let cell = (xx.div_euclid(width), zz.div_euclid(width));
-                if !jobs.contains_key(&cell) {
-                    jobs.insert(cell, self.job(xx, zz, !chunk_scope || self.cell_width >= 16)?);
+            for dz in 0..step {
+                for dx in 0..step {
+                    let (xx, zz) = (x + dx, z + dz);
+                    let cell = (xx.div_euclid(width), zz.div_euclid(width));
+                    if !jobs.contains_key(&cell) {
+                        jobs.insert(
+                            cell,
+                            self.job(xx, zz, !chunk_scope || self.cell_width >= 16)?,
+                        );
+                    }
+                    let job = jobs.get_mut(&cell).unwrap();
+                    for y in (bottom..top).rev() {
+                        let index = (y - bottom) as usize;
+                        if occupied[index] != 0 {
+                            continue;
+                        }
+                        let solid = job.base_substance([xx, y, zz]) != Substance::Air;
+                        if dx == 0 && dz == 0 && y == top - 1 && !solid {
+                            rejected = true;
+                            break;
+                        }
+                        if solid {
+                            occupied[index] = 1;
+                            missing -= 1;
+                        }
+                    }
+                    if rejected || missing == 0 {
+                        break;
+                    }
                 }
-                let job = jobs.get_mut(&cell).unwrap();
-                for y in (bottom..top).rev() {
-                    let index = (y - bottom) as usize;
-                    if occupied[index] != 0 { continue; }
-                    let solid = job.base_substance([xx, y, zz]) != Substance::Air;
-                    if dx == 0 && dz == 0 && y == top - 1 && !solid { rejected = true; break; }
-                    if solid { occupied[index] = 1; missing -= 1; }
+                if rejected || missing == 0 {
+                    break;
                 }
-                if rejected || missing == 0 { break; }
-            }
-                if rejected || missing == 0 { break; }
             }
             results.push(if rejected { None } else { Some(occupied) });
         }
@@ -412,7 +608,16 @@ impl Job<'_> {
             return Err("outside supported world coordinates".into());
         }
         self.scratch.reset_chunk(x & !15, z & !15);
-        self.terrain.graph.initialize_column_caches(&mut self.scratch);
+        if self.terrain.graph.is_modern() {
+            self.scratch
+                .set_modern_volume(crate::density::ModernVolume::blocks(
+                    [16, self.terrain.height, 16],
+                    [x & !15, self.terrain.min_y, z & !15],
+                ));
+        }
+        self.terrain
+            .graph
+            .initialize_column_caches(&mut self.scratch);
         self.beard = None;
         self.display = false;
         self.reuse_density_cells = false;
@@ -433,11 +638,18 @@ impl Job<'_> {
     }
 
     pub(crate) fn park(self) -> SurfaceWork {
-        SurfaceWork { scratch: self.scratch, density_cells: self.density_cells, density_ceiling: self.density_ceiling,
+        SurfaceWork {
+            scratch: self.scratch,
+            density_cells: self.density_cells,
+            density_ceiling: self.density_ceiling,
             density_height: self.density_height,
-            display_tops: self.display_tops, levels: self.levels,
-            locations: self.locations, fluids: self.fluids, tops: self.neighbour_tops,
-            proven_air_cells: self.proven_air_cells }
+            display_tops: self.display_tops,
+            levels: self.levels,
+            locations: self.locations,
+            fluids: self.fluids,
+            tops: self.neighbour_tops,
+            proven_air_cells: self.proven_air_cells,
+        }
     }
 
     /// Sparse surface requests share NoiseChunk cells too. Visit each needed
@@ -669,13 +881,65 @@ impl Job<'_> {
         let mut h = i32::MAX;
         let t = self.terrain;
         if t.preliminary_height {
-            h = self.compute(t.initial, [key.0, 0, key.1], Mode::Single).floor() as i32;
-            if self.levels.len() < 16384 { self.levels.insert(key, h); }
+            h = if t.graph.is_modern() {
+                // Aquifer pre-fills a quart-grid surface volume around its
+                // actual NoiseChunk request. Outside it vanilla samples once.
+                let source = self.scratch.modern_volume.unwrap();
+                let mut origin = [0; 3];
+                let mut size = [1; 3];
+                for axis in [0, 2] {
+                    let min_grid = (source.origin[axis] - 5).div_euclid(16);
+                    let max = source.origin[axis] + (source.size[axis] - 1) * source.step[axis];
+                    let max_grid = (max - 5).div_euclid(16) + 1;
+                    origin[axis] = min_grid * 16;
+                    size[axis] = max_grid * 4 + 2 - min_grid * 4 + 1;
+                }
+                let volume = crate::density::ModernVolume {
+                    size,
+                    origin,
+                    step: [4, 1, 4],
+                };
+                if key.0 >= origin[0]
+                    && key.0 <= origin[0] + (size[0] - 1) * 4
+                    && key.1 >= origin[2]
+                    && key.1 <= origin[2] + (size[2] - 1) * 4
+                {
+                    t.graph.compute_in_volume(
+                        t.initial,
+                        [key.0, 0, key.1],
+                        Mode::Block,
+                        volume,
+                        &mut self.scratch,
+                    )
+                } else {
+                    self.compute(t.initial, [key.0, 0, key.1], Mode::Single)
+                }
+            } else {
+                self.compute(t.initial, [key.0, 0, key.1], Mode::Single)
+            }
+            .floor() as i32;
+            if self.levels.len() < 16384 {
+                self.levels.insert(key, h);
+            }
             return h;
         }
         if !t.graph.has_stateful_queries() || t.graph.has_initial_height_plan() {
-            h=t.graph.first_above(t.initial,key.0,key.1,t.min_y,t.min_y+t.height,t.cell_height,0.390625,&mut self.scratch).unwrap_or(i32::MAX);
-            if self.levels.len()<16384 {self.levels.insert(key,h);}
+            h = t
+                .graph
+                .first_above(
+                    t.initial,
+                    key.0,
+                    key.1,
+                    t.min_y,
+                    t.min_y + t.height,
+                    t.cell_height,
+                    0.390625,
+                    &mut self.scratch,
+                )
+                .unwrap_or(i32::MAX);
+            if self.levels.len() < 16384 {
+                self.levels.insert(key, h);
+            }
             return h;
         }
         let mut y = t.min_y + t.height;
@@ -725,9 +989,11 @@ impl Job<'_> {
     /// steepness must not pay for ores, aquifers and caves below that block.
     pub fn surface_top(&mut self, x: i32, z: i32) -> Option<(i32, Substance)> {
         if self.display {
-            if let Some(top) = self.display_tops.get(&(x,z)) { return *top; }
-            let top = self.display_top(x,z);
-            self.display_tops.insert((x,z),top);
+            if let Some(top) = self.display_tops.get(&(x, z)) {
+                return *top;
+            }
+            let top = self.display_top(x, z);
+            self.display_tops.insert((x, z), top);
             return top;
         }
         if let Some(top) = self.neighbour_tops.get(&(x, z)) {
@@ -773,64 +1039,97 @@ impl Job<'_> {
         self.neighbour_tops.insert((x, z), found);
         found
     }
-    fn display_top(&mut self, x:i32,z:i32) -> Option<(i32,Substance)> {
-        let t=self.terrain;
+    fn display_top(&mut self, x: i32, z: i32) -> Option<(i32, Substance)> {
+        let t = self.terrain;
         // This is a route hint only, never a bound used to discard geometry.
         // Likely coasts skip the speculative density walk and use exact fluid
         // semantics immediately; otherwise they would pay for both traversals.
-        let likely_land=self.preliminary(x,z)>t.sea_level+24;
-        if let Some(y)=if likely_land {self.density_surface(x,z)} else {None} {
+        let likely_land = self.preliminary(x, z) > t.sea_level + 24;
+        if let Some(y) = if likely_land {
+            self.density_surface(x, z)
+        } else {
+            None
+        } {
             // Keep shorelines and low/underwater terrain on the complete fluid
             // query. Check the surface band for wet aquifer boundaries too.
-            if y >= t.sea_level+t.cell_height {
-                let mut dry=true;
-                for yy in y+1..=(y+t.cell_height).min(t.min_y+t.height-1) {
-                    if self.block([x,yy,z])!=Substance::Air {dry=false;break;}
+            if y >= t.sea_level + t.cell_height {
+                let mut dry = true;
+                for yy in y + 1..=(y + t.cell_height).min(t.min_y + t.height - 1) {
+                    if self.block([x, yy, z]) != Substance::Air {
+                        dry = false;
+                        break;
+                    }
                 }
-                if dry {return Some((y,self.block([x,y,z])));}
+                if dry {
+                    return Some((y, self.block([x, y, z])));
+                }
             }
         }
-        self.display=false;
-        let result=self.surface_top(x,z);
-        self.display=true;
+        self.display = false;
+        let result = self.surface_top(x, z);
+        self.display = true;
         result
     }
     /// Validate the proposed visible liquid band with the world's actual
     /// aquifer. Avoid traversing the entire sky or the whole water column.
     /// Detached fluids outside the checked band remain a visual approximation.
-    pub(crate) fn display_fluid_band_matches(&mut self, x:i32, z:i32,
-        floor:i32, fluid_y:i32, fluid:i32) -> bool {
+    pub(crate) fn display_fluid_band_matches(
+        &mut self,
+        x: i32,
+        z: i32,
+        floor: i32,
+        fluid_y: i32,
+        fluid: i32,
+    ) -> bool {
         let t = self.terrain;
         if fluid != 0 {
-            let expected = if fluid == 2 { Substance::Lava } else { Substance::Water };
-            if self.block([x, floor, z]) != expected
-                || self.block([x, fluid_y - 1, z]) != expected { return false; }
+            let expected = if fluid == 2 {
+                Substance::Lava
+            } else {
+                Substance::Water
+            };
+            if self.block([x, floor, z]) != expected || self.block([x, fluid_y - 1, z]) != expected
+            {
+                return false;
+            }
         }
         let top = if fluid == 0 { floor } else { fluid_y };
         (top..(top + t.cell_height).min(t.min_y + t.height))
             .all(|y| self.block([x, y, z]) == Substance::Air)
     }
 
-    pub(crate) fn display_steep(&mut self,x:i32,y:i32,z:i32)->bool {
-        let t=self.terrain;
-        let high=(y+2).min(t.min_y+t.height-1);
-        let low=(y-2).max(t.min_y);
-        let solid=|job:&mut Self,p|{job.scratch.advance_block();job.compute(t.final_density,p,Mode::Cell)>0.};
-        (solid(self,[x,high,(z+1).min((z&!15)+15)]) && !solid(self,[x,low,(z-1).max(z&!15)]))
-            || (solid(self,[(x-1).max(x&!15),high,z]) && !solid(self,[(x+1).min((x&!15)+15),low,z]))
+    pub(crate) fn display_steep(&mut self, x: i32, y: i32, z: i32) -> bool {
+        let t = self.terrain;
+        let high = (y + 2).min(t.min_y + t.height - 1);
+        let low = (y - 2).max(t.min_y);
+        let solid = |job: &mut Self, p| {
+            job.scratch.advance_block();
+            job.compute(t.final_density, p, Mode::Cell) > 0.
+        };
+        (solid(self, [x, high, (z + 1).min((z & !15) + 15)])
+            && !solid(self, [x, low, (z - 1).max(z & !15)]))
+            || (solid(self, [(x - 1).max(x & !15), high, z])
+                && !solid(self, [(x + 1).min((x & !15) + 15), low, z]))
     }
     /// Highest positive final-density integer. Unknown intervals are searched
     /// in descending order; this does not assume a monotone vertical column.
     pub fn density_surface(&mut self, x: i32, z: i32) -> Option<i32> {
         let t = self.terrain;
-        if t.graph.requires_complete_column_order() || self.beard.is_some() || self.scratch.beard != 0. { return None; }
-        if let Some((point, height)) = self.density_height {
-            if point == (x,z) { return height; }
+        if t.graph.requires_complete_column_order()
+            || self.beard.is_some()
+            || self.scratch.beard != 0.
+        {
+            return None;
         }
-        let height = self.search_density_surface(x,z);
+        if let Some((point, height)) = self.density_height {
+            if point == (x, z) {
+                return height;
+            }
+        }
+        let height = self.search_density_surface(x, z);
         // Both a top and a fully empty column are proven by the descending
         // search. Reuse only at exactly the same coordinate, never next door.
-        self.density_height = Some(((x,z), height));
+        self.density_height = Some(((x, z), height));
         height
     }
 
@@ -840,30 +1139,52 @@ impl Job<'_> {
         // Every cell above this ceiling was proven non-positive at every X/Z;
         // lower unknown cells still use the original descending interval search.
         let horizontal = (x.div_euclid(t.cell_width), z.div_euclid(t.cell_width));
-        let ceiling = self.reuse_density_cells.then(|| self.density_ceiling.get(&horizontal).copied()).flatten();
+        let ceiling = self
+            .reuse_density_cells
+            .then(|| self.density_ceiling.get(&horizontal).copied())
+            .flatten();
         let mut proved_ceiling = ceiling.is_some();
-        for bottom in (t.min_y..ceiling.unwrap_or(t.min_y+t.height)).step_by(t.cell_height as usize).rev() {
+        for bottom in (t.min_y..ceiling.unwrap_or(t.min_y + t.height))
+            .step_by(t.cell_height as usize)
+            .rev()
+        {
             if self.reuse_density_cells {
-                let base = [x.div_euclid(t.cell_width)*t.cell_width, bottom,
-                    z.div_euclid(t.cell_width)*t.cell_width];
-                let empty = if let Some(&empty) = self.density_cells.get(&base) { empty } else {
-                    let sign = t.graph.surface_cell_sign(base, bottom+t.cell_height-1, &mut self.scratch);
+                let base = [
+                    x.div_euclid(t.cell_width) * t.cell_width,
+                    bottom,
+                    z.div_euclid(t.cell_width) * t.cell_width,
+                ];
+                let empty = if let Some(&empty) = self.density_cells.get(&base) {
+                    empty
+                } else {
+                    let sign = t.graph.surface_cell_sign(
+                        base,
+                        bottom + t.cell_height - 1,
+                        &mut self.scratch,
+                    );
                     #[cfg(test)]
                     exterior_batch_probe::record_cell(sign);
                     let empty = sign == crate::density::SurfaceSign::NonPositive;
                     // Bound retained work even when a caller visits many cells.
-                    if self.density_cells.len() < 16384 { self.density_cells.insert(base, empty); }
+                    if self.density_cells.len() < 16384 {
+                        self.density_cells.insert(base, empty);
+                    }
                     empty
                 };
-                if empty { continue; }
+                if empty {
+                    continue;
+                }
                 if !proved_ceiling {
                     if self.density_ceiling.len() < 256 {
-                        self.density_ceiling.insert(horizontal, bottom+t.cell_height);
+                        self.density_ceiling
+                            .insert(horizontal, bottom + t.cell_height);
                     }
                     proved_ceiling = true;
                 }
             }
-            if let Some(y) = self.density_interval(x, z, bottom, bottom+t.cell_height-1) { return Some(y); }
+            if let Some(y) = self.density_interval(x, z, bottom, bottom + t.cell_height - 1) {
+                return Some(y);
+            }
         }
         if self.reuse_density_cells && !proved_ceiling && self.density_ceiling.len() < 256 {
             self.density_ceiling.insert(horizontal, t.min_y);
@@ -874,50 +1195,75 @@ impl Job<'_> {
         let t = self.terrain;
         if bottom == top {
             self.scratch.advance_block();
-            return (self.compute(t.final_density,[x,top,z],Mode::Cell)>0.).then_some(top);
+            return (self.compute(t.final_density, [x, top, z], Mode::Cell) > 0.).then_some(top);
         }
-        let sign = t.graph.surface_sign([x,bottom,z],top,&mut self.scratch);
+        let sign = t.graph.surface_sign([x, bottom, z], top, &mut self.scratch);
         #[cfg(test)]
         exterior_batch_probe::record_range(sign);
         match sign {
-            crate::density::SurfaceSign::NonPositive=>return None,
-            crate::density::SurfaceSign::Positive=>return Some(top),
-            crate::density::SurfaceSign::Unknown=>{}
+            crate::density::SurfaceSign::NonPositive => return None,
+            crate::density::SurfaceSign::Positive => return Some(top),
+            crate::density::SurfaceSign::Unknown => {}
         }
-        if top-bottom<=2 {
+        if top - bottom <= 2 {
             for y in (bottom..=top).rev() {
                 self.scratch.advance_block();
-                if self.compute(t.final_density,[x,y,z],Mode::Cell)>0. { return Some(y); }
+                if self.compute(t.final_density, [x, y, z], Mode::Cell) > 0. {
+                    return Some(y);
+                }
             }
             return None;
         }
-        let middle = bottom+(top-bottom)/2;
-        self.density_interval(x,z,middle+1,top).or_else(||self.density_interval(x,z,bottom,middle))
+        let middle = bottom + (top - bottom) / 2;
+        self.density_interval(x, z, middle + 1, top)
+            .or_else(|| self.density_interval(x, z, bottom, middle))
     }
     /// Prove the rest of this interpolation cell is entirely air. No height
     /// monotonicity assumption: unbounded density nodes or unequal aquifer
     /// levels keep the original per-block query. Only exterior scans call it.
     pub fn proven_air_bottom(&mut self, p: [i32; 3]) -> Option<i32> {
         let t = self.terrain;
-        if t.graph.requires_complete_column_order() || self.beard.is_some() || self.scratch.beard != 0. {
+        if t.graph.requires_complete_column_order()
+            || self.beard.is_some()
+            || self.scratch.beard != 0.
+        {
             return None;
         }
         let bottom = p[1].div_euclid(t.cell_height) * t.cell_height;
         // Try once per cell. Unproven cells use the normal block loop.
-        if p[1] != bottom + t.cell_height - 1 || bottom < t.min_y { return None; }
-        let base = [p[0].div_euclid(t.cell_width) * t.cell_width,
-            bottom, p[2].div_euclid(t.cell_width) * t.cell_width];
-        if self.proven_air_cells.contains(&base) { return Some(bottom); }
-        if self.prove_air_cell(base) {
-            if self.proven_air_cells.len() < 16384 { self.proven_air_cells.insert(base); }
+        if p[1] != bottom + t.cell_height - 1 || bottom < t.min_y {
+            return None;
+        }
+        let base = [
+            p[0].div_euclid(t.cell_width) * t.cell_width,
+            bottom,
+            p[2].div_euclid(t.cell_width) * t.cell_width,
+        ];
+        if self.proven_air_cells.contains(&base) {
             return Some(bottom);
         }
-        if t.graph.column_range(t.final_density, [p[0], bottom, p[2]], p[1], &mut self.scratch).1 >= 0. {
+        if self.prove_air_cell(base) {
+            if self.proven_air_cells.len() < 16384 {
+                self.proven_air_cells.insert(base);
+            }
+            return Some(bottom);
+        }
+        if t.graph
+            .column_range(
+                t.final_density,
+                [p[0], bottom, p[2]],
+                p[1],
+                &mut self.scratch,
+            )
+            .1
+            >= 0.
+        {
             return None;
         }
         if !t.aquifers {
             return (t.global(bottom).at(bottom) == Substance::Air
-                && t.global(p[1]).at(p[1]) == Substance::Air).then_some(bottom);
+                && t.global(p[1]).at(p[1]) == Substance::Air)
+                .then_some(bottom);
         }
         // Every possible nearest-three candidate must have the SAME level.
         // Then pressure() is exactly zero, and none may contain fluid anywhere
@@ -925,11 +1271,13 @@ impl Job<'_> {
         let gx = (p[0] - 5).div_euclid(16);
         let gz = (p[2] - 5).div_euclid(16);
         let mut level = None;
-        if t.global(bottom).at(bottom) == Substance::Lava { return None; }
+        if t.global(bottom).at(bottom) == Substance::Lava {
+            return None;
+        }
         for dx in 0..=1 {
-            for gy in (bottom + 1).div_euclid(12)-1..=(p[1]+1).div_euclid(12)+1 {
+            for gy in (bottom + 1).div_euclid(12) - 1..=(p[1] + 1).div_euclid(12) + 1 {
                 for dz in 0..=1 {
-                    let q = self.aquifer_location([gx+dx, gy, gz+dz]);
+                    let q = self.aquifer_location([gx + dx, gy, gz + dz]);
                     let f = self.status(q);
                     if f.at(bottom) != Substance::Air || level.is_some_and(|l| l != f.level) {
                         return None;
@@ -944,22 +1292,32 @@ impl Job<'_> {
     fn prove_air_cell(&mut self, base: [i32; 3]) -> bool {
         let t = self.terrain;
         let top = base[1] + t.cell_height - 1;
-        if !(t.graph.cell_range(t.final_density, base, top, &mut self.scratch).1 < 0.) {
+        if !(t
+            .graph
+            .cell_range(t.final_density, base, top, &mut self.scratch)
+            .1
+            < 0.)
+        {
             return false;
         }
         if !t.aquifers {
             return t.global(base[1]).at(base[1]) == Substance::Air
                 && t.global(top).at(top) == Substance::Air;
         }
-        if t.global(base[1]).at(base[1]) == Substance::Lava { return false; }
+        if t.global(base[1]).at(base[1]) == Substance::Lava {
+            return false;
+        }
         // Union of every nearest-three candidate over the entire cell.
         // Equal levels make all pressure terms zero; dry at the lowest Y
         // means dry everywhere above it. Different levels fall back unchanged.
         let mut level = None;
-        for gx in (base[0]-5).div_euclid(16)..=(base[0]+t.cell_width-1-5).div_euclid(16)+1 {
-            for gy in (base[1]+1).div_euclid(12)-1..=(top+1).div_euclid(12)+1 {
-                for gz in (base[2]-5).div_euclid(16)..=(base[2]+t.cell_width-1-5).div_euclid(16)+1 {
-                    let q = self.aquifer_location([gx,gy,gz]);
+        for gx in (base[0] - 5).div_euclid(16)..=(base[0] + t.cell_width - 1 - 5).div_euclid(16) + 1
+        {
+            for gy in (base[1] + 1).div_euclid(12) - 1..=(top + 1).div_euclid(12) + 1 {
+                for gz in (base[2] - 5).div_euclid(16)
+                    ..=(base[2] + t.cell_width - 1 - 5).div_euclid(16) + 1
+                {
+                    let q = self.aquifer_location([gx, gy, gz]);
                     let f = self.status(q);
                     if f.at(base[1]) != Substance::Air || level.is_some_and(|l| l != f.level) {
                         return false;
@@ -972,16 +1330,35 @@ impl Job<'_> {
     }
 
     fn aquifer_location(&mut self, g: [i32; 3]) -> [i32; 3] {
-        if let Some(&q) = self.locations.get(&g) { return q; }
+        if let Some(&q) = self.locations.get(&g) {
+            return q;
+        }
         let mut r = self.terrain.aquifer_random.at(g[0], g[1], g[2]);
-        let q = [g[0]*16 + r.next_bounded(10), g[1]*12 + r.next_bounded(9), g[2]*16 + r.next_bounded(10)];
-        if self.locations.len() < 16384 { self.locations.insert(g, q); }
+        let q = [
+            g[0] * 16 + r.next_bounded(10),
+            g[1] * 12 + r.next_bounded(9),
+            g[2] * 16 + r.next_bounded(10),
+        ];
+        if self.locations.len() < 16384 {
+            self.locations.insert(g, q);
+        }
         q
     }
 
     fn base_substance(&mut self, p: [i32; 3]) -> Substance {
         crate::prof::hit(&crate::prof::SURFACE.block_calls);
         let t = self.terrain;
+        if t.graph.is_modern() {
+            if let Some(mut volume) = self.scratch.modern_volume {
+                // An exterior union may visit several base columns through
+                // one Job; each retains vanilla's one-column volume shape.
+                if volume.size[0] == 1 && volume.size[2] == 1 {
+                    volume.origin[0] = p[0];
+                    volume.origin[2] = p[2];
+                    self.scratch.set_modern_volume(volume);
+                }
+            }
+        }
         {
             let _prof = crate::prof::Scope::new(&crate::prof::SURFACE.block_prepare);
             t.graph
@@ -991,10 +1368,22 @@ impl Job<'_> {
         let d = {
             let _prof = crate::prof::Scope::new(&crate::prof::SURFACE.block_density);
             // NoiseChunk wraps finalDensity+beardifier in CacheAllInCell.
-            t.graph
+            let density = t
+                .graph
                 .final_cell_value(p, &self.scratch)
-                .unwrap_or_else(|| self.compute(t.final_density, p, Mode::Cell))
-                + self.beard.map_or(self.scratch.beard, |b| b.compute(p))
+                .unwrap_or_else(|| self.compute(t.final_density, p, Mode::Cell));
+            let beard = self.beard.map_or(self.scratch.beard, |b| {
+                if t.graph.is_modern() {
+                    b.compute_float(p) as f64
+                } else {
+                    b.compute(p)
+                }
+            });
+            if t.graph.is_modern() {
+                (density as f32 + beard as f32) as f64
+            } else {
+                density + beard
+            }
         };
         {
             let _prof = crate::prof::Scope::new(&crate::prof::SURFACE.block_substance);
@@ -1140,15 +1529,23 @@ impl Job<'_> {
         crate::prof::hit(&crate::prof::SURFACE.fluid_calls);
         let t = self.terrain;
         let key = (p[0] & !3, p[2] & !3);
-        if !t.preliminary_height && (!t.graph.has_stateful_queries() || t.graph.has_initial_height_plan()) && !self.levels.contains_key(&key) {
+        if !t.preliminary_height
+            && (!t.graph.has_stateful_queries() || t.graph.has_initial_height_plan())
+            && !self.levels.contains_key(&key)
+        {
             // The centre aquifer test returns global when h < y - 20. Prove
             // only that inequality; finding h itself would search the ground
             // even for candidates hundreds of blocks above it. No monotonic
             // assumption: bound the entire remaining initial-density range.
             let bottom = (p[1] - 20 + t.cell_height - 1).div_euclid(t.cell_height) * t.cell_height;
             let top = t.min_y + t.height;
-            if bottom > top || (bottom >= t.min_y && t.graph.single_range(
-                t.initial, [key.0, bottom, key.1], top, &mut self.scratch).1 <= 0.390625) {
+            if bottom > top
+                || (bottom >= t.min_y
+                    && t.graph
+                        .single_range(t.initial, [key.0, bottom, key.1], top, &mut self.scratch)
+                        .1
+                        <= 0.390625)
+            {
                 return t.global(p[1]);
             }
         }
@@ -1198,8 +1595,12 @@ impl Job<'_> {
             }
             min = min.min(h);
         }
-        let deep_dark = self.compute(t.erosion, p, Mode::Single) < -0.225f32 as f64
-            && self.compute(t.depth, p, Mode::Single) > 0.9f32 as f64;
+        let deep_dark = if let Some(config) = &t.modern_aquifer {
+            self.compute(config.exclusion, p, Mode::Single) > 0.
+        } else {
+            self.compute(t.erosion, p, Mode::Single) < -0.225f32 as f64
+                && self.compute(t.depth, p, Mode::Single) > 0.9f32 as f64
+        };
         let (lower, upper) = if deep_dark {
             (-1., -1.)
         } else {
@@ -1221,8 +1622,12 @@ impl Job<'_> {
             let gx = x.div_euclid(16);
             let gy = y.div_euclid(40);
             let gz = z.div_euclid(16);
-            let spread = self.compute(t.spread, [gx, gy, gz], Mode::Single) * 10.;
-            min.min(gy * 40 + 20 + (spread / 3.).floor() as i32 * 3)
+            let spread = self.compute(t.spread, [gx, gy, gz], Mode::Single);
+            if t.graph.is_modern() {
+                crate::aquifer::randomized_level(p, min, spread)
+            } else {
+                min.min(gy * 40 + 20 + (spread * 10. / 3.).floor() as i32 * 3)
+            }
         } else {
             WAY_BELOW_MIN_Y
         };
@@ -1290,14 +1695,26 @@ impl Job<'_> {
 }
 impl<'a> Job<'a> {
     pub(crate) fn resume(terrain: &'a Terrain, work: SurfaceWork) -> Self {
-        Self { terrain, scratch: work.scratch, beard: None, display: false,
-            reuse_density_cells: false, density_cells: work.density_cells, density_ceiling: work.density_ceiling,
+        Self {
+            terrain,
+            scratch: work.scratch,
+            beard: None,
+            display: false,
+            reuse_density_cells: false,
+            density_cells: work.density_cells,
+            density_ceiling: work.density_ceiling,
             density_height: work.density_height,
-            display_tops: work.display_tops, levels: work.levels,
-            locations: work.locations, fluids: work.fluids, neighbour_tops: work.tops,
+            display_tops: work.display_tops,
+            levels: work.levels,
+            locations: work.locations,
+            fluids: work.fluids,
+            neighbour_tops: work.tops,
             proven_air_cells: work.proven_air_cells,
-            surface_columns: HashMap::default(), surface_bottoms: HashMap::default(),
-            surface_tops: HashMap::default(), shared_tops: None }
+            surface_columns: HashMap::default(),
+            surface_bottoms: HashMap::default(),
+            surface_tops: HashMap::default(),
+            shared_tops: None,
+        }
     }
 }
 fn similarity(a: i32, b: i32) -> f64 {
@@ -1339,13 +1756,22 @@ mod exterior_batch_probe {
             job.reuse_density_cells = true;
             std::hint::black_box(job.density_surface(x, z));
         }
-        let cell: Vec<_> = CELL_COUNTS.iter().map(|count| count.load(Ordering::Relaxed)).collect();
-        let range: Vec<_> = RANGE_COUNTS.iter().map(|count| count.load(Ordering::Relaxed)).collect();
+        let cell: Vec<_> = CELL_COUNTS
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect();
+        let range: Vec<_> = RANGE_COUNTS
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect();
         eprintln!("BOUND_COUNTS requests={} cell_nonpositive={} cell_positive={} cell_unknown={} interval_nonpositive={} interval_positive={} interval_unknown={}",
             requests.len(), cell[0], cell[1], cell[2], range[0], range[1], range[2]);
     }
 
-    fn shared_footprints(t: &Terrain, requests: &[Request]) -> Result<(Vec<Option<Vec<u8>>>, usize)> {
+    fn shared_footprints(
+        t: &Terrain,
+        requests: &[Request],
+    ) -> Result<(Vec<Option<Vec<u8>>>, usize)> {
         let mut jobs = HashMap::default();
         let mut results = Vec::with_capacity(requests.len());
         for &(x, z, step, bottom, top) in requests {
@@ -1386,27 +1812,46 @@ mod exterior_batch_probe {
             }
             results.push(if rejected { None } else { Some(occupied) });
         }
-        let retained_scratch = jobs.values().map(|job: &Job<'_>| job.scratch.retained_bytes()).sum();
+        let retained_scratch = jobs
+            .values()
+            .map(|job: &Job<'_>| job.scratch.retained_bytes())
+            .sum();
         Ok((results, retained_scratch))
     }
 
     fn legacy_batch(t: &Terrain, requests: &[Request]) -> Result<Option<Vec<Option<Vec<u8>>>>> {
-        if t.graph.requires_complete_column_order() || t.graph.has_stateful_queries() { return Ok(None); }
+        if t.graph.requires_complete_column_order() || t.graph.has_stateful_queries() {
+            return Ok(None);
+        }
         let mut cells = FxHashSet::default();
         let mut overlap = false;
         for &(x, z, step, _, _) in requests {
             let mut local = FxHashSet::default();
-            for dz in 0..step { for dx in 0..step {
-                let cell = ((x + dx).div_euclid(t.cell_width), (z + dz).div_euclid(t.cell_width));
-                if local.insert(cell) && !cells.insert(cell) { overlap = true; }
-                if cells.len() > 8 { return Ok(None); }
-            }}
+            for dz in 0..step {
+                for dx in 0..step {
+                    let cell = (
+                        (x + dx).div_euclid(t.cell_width),
+                        (z + dz).div_euclid(t.cell_width),
+                    );
+                    if local.insert(cell) && !cells.insert(cell) {
+                        overlap = true;
+                    }
+                    if cells.len() > 8 {
+                        return Ok(None);
+                    }
+                }
+            }
         }
-        if !overlap { return Ok(None); }
+        if !overlap {
+            return Ok(None);
+        }
         Ok(Some(shared_footprints(t, requests)?.0))
     }
 
-    fn chunk_footprints(t: &Terrain, requests: &[Request]) -> Result<(Vec<Option<Vec<u8>>>, usize)> {
+    fn chunk_footprints(
+        t: &Terrain,
+        requests: &[Request],
+    ) -> Result<(Vec<Option<Vec<u8>>>, usize)> {
         let width = t.cell_width.max(16);
         let mut jobs = HashMap::default();
         let mut results = Vec::with_capacity(requests.len());
@@ -1424,18 +1869,33 @@ mod exterior_batch_probe {
                     let job = jobs.get_mut(&scope).unwrap();
                     for y in (bottom..top).rev() {
                         let i = (y - bottom) as usize;
-                        if occupied[i] != 0 { continue; }
+                        if occupied[i] != 0 {
+                            continue;
+                        }
                         let solid = job.base_substance([xx, y, zz]) != Substance::Air;
-                        if dx == 0 && dz == 0 && y == top - 1 && !solid { rejected = true; break; }
-                        if solid { occupied[i] = 1; missing -= 1; }
+                        if dx == 0 && dz == 0 && y == top - 1 && !solid {
+                            rejected = true;
+                            break;
+                        }
+                        if solid {
+                            occupied[i] = 1;
+                            missing -= 1;
+                        }
                     }
-                    if rejected || missing == 0 { break; }
+                    if rejected || missing == 0 {
+                        break;
+                    }
                 }
-                if rejected || missing == 0 { break; }
+                if rejected || missing == 0 {
+                    break;
+                }
             }
             results.push(if rejected { None } else { Some(occupied) });
         }
-        let bytes = jobs.values().map(|job: &Job<'_>| job.scratch.retained_bytes()).sum();
+        let bytes = jobs
+            .values()
+            .map(|job: &Job<'_>| job.scratch.retained_bytes())
+            .sum();
         Ok((results, bytes))
     }
 
@@ -1457,9 +1917,16 @@ mod exterior_batch_probe {
                 let top = terrain.base_column(x, 33).unwrap().surface_height;
                 requests.push((x, 33, step, terrain.sea_level - 16, top));
             }
-            let expected: Vec<_> = requests.iter().map(|&(x,z,step,bottom,top)|
-                terrain.exterior_footprint(x,z,step,bottom,top).unwrap()).collect();
-            assert_eq!(terrain.exterior_footprints(&requests).unwrap(), Some(expected));
+            let expected: Vec<_> = requests
+                .iter()
+                .map(|&(x, z, step, bottom, top)| {
+                    terrain.exterior_footprint(x, z, step, bottom, top).unwrap()
+                })
+                .collect();
+            assert_eq!(
+                terrain.exterior_footprints(&requests).unwrap(),
+                Some(expected)
+            );
         }
         let scattered: Vec<_> = (0..8).map(|index| (index * 64, 0, 1, 47, 64)).collect();
         assert!(terrain.exterior_footprints(&scattered).unwrap().is_none());
@@ -1472,26 +1939,43 @@ mod exterior_batch_probe {
     fn adjacent_footprint_reuse() {
         let (document, seed, centres) = match std::env::var("VSS_SAMPLING_DOCUMENT") {
             Ok(path) => {
-                let mut value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
                 if let Ok(registries) = std::env::var("VSS_SAMPLING_REGISTRIES") {
-                    let registries: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(registries).unwrap()).unwrap();
+                    let registries: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(registries).unwrap())
+                            .unwrap();
                     for (key, item) in registries.as_object().unwrap() {
-                        if value.get(key).is_none() { value[key] = item.clone(); }
+                        if value.get(key).is_none() {
+                            value[key] = item.clone();
+                        }
                     }
                 }
-                let seed = std::env::var("VSS_SAMPLING_SEED").ok().map(|value| value.parse().unwrap())
+                let seed = std::env::var("VSS_SAMPLING_SEED")
+                    .ok()
+                    .map(|value| value.parse().unwrap())
                     .unwrap_or(5052304137288917019_i64);
-                (value, seed, vec![(424, -348), (448, -479), (-4588, -1531), (1605, -1456)])
+                (
+                    value,
+                    seed,
+                    vec![(424, -348), (448, -479), (-4588, -1531), (1605, -1456)],
+                )
             }
             Err(_) => {
                 let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("tests/fixtures/worldgen/overworld.json");
-                (serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap(), 917,
-                    vec![(-49, 33), (127, -65)])
+                (
+                    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap(),
+                    917,
+                    vec![(-49, 33), (127, -65)],
+                )
             }
         };
         let terrain = Terrain::from_document(seed, &document).unwrap();
-        assert!(!terrain.graph.requires_complete_column_order(), "full-column graph cannot share jobs");
+        assert!(
+            !terrain.graph.requires_complete_column_order(),
+            "full-column graph cannot share jobs"
+        );
         for step in [1, 2, 4] {
             let mut requests = Vec::new();
             for &(center_x, center_z) in &centres {
@@ -1516,26 +2000,43 @@ mod exterior_batch_probe {
             for round in 0..14 {
                 let mut baseline = None;
                 let mut shared = None;
-                for candidate in if round % 2 == 0 { [false, true] } else { [true, false] } {
+                for candidate in if round % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
                     crate::prof::reset();
                     let start = Instant::now();
                     if candidate {
                         let (result, retained) = shared_footprints(&terrain, &requests).unwrap();
                         shared_times.push(start.elapsed());
-                        shared_counts = (crate::prof::block_calls(), crate::prof::noise_evals(),
-                            crate::prof::evals().into_iter().sum());
+                        shared_counts = (
+                            crate::prof::block_calls(),
+                            crate::prof::noise_evals(),
+                            crate::prof::evals().into_iter().sum(),
+                        );
                         memory_bytes = retained;
                         shared = Some(result);
                     } else {
-                        let result: Vec<_> = requests.iter().map(|&(x, z, step, bottom, top)|
-                            terrain.exterior_footprint(x, z, step, bottom, top).unwrap()).collect();
+                        let result: Vec<_> = requests
+                            .iter()
+                            .map(|&(x, z, step, bottom, top)| {
+                                terrain.exterior_footprint(x, z, step, bottom, top).unwrap()
+                            })
+                            .collect();
                         baseline_times.push(start.elapsed());
-                        baseline_counts = (crate::prof::block_calls(), crate::prof::noise_evals(),
-                            crate::prof::evals().into_iter().sum());
+                        baseline_counts = (
+                            crate::prof::block_calls(),
+                            crate::prof::noise_evals(),
+                            crate::prof::evals().into_iter().sum(),
+                        );
                         baseline = Some(result);
                     }
                 }
-                assert_eq!(baseline, shared, "footprint changed at step {step}, round {round}");
+                assert_eq!(
+                    baseline, shared,
+                    "footprint changed at step {step}, round {round}"
+                );
             }
             let baseline_ms = median(&mut baseline_times[1..]);
             let shared_ms = median(&mut shared_times[1..]);
@@ -1561,42 +2062,60 @@ mod exterior_batch_probe {
                                 result.extend(values);
                                 hits += 1;
                             } else {
-                                result.extend(batch.iter().map(|&(x, z, step, bottom, top)|
-                                    terrain.exterior_footprint(x, z, step, bottom, top).unwrap()));
+                                result.extend(batch.iter().map(|&(x, z, step, bottom, top)| {
+                                    terrain.exterior_footprint(x, z, step, bottom, top).unwrap()
+                                }));
                             }
                         }
                         production_times.push(start.elapsed());
                         reused_batches = hits;
                         batched = Some(result);
                     } else if candidate == 0 {
-                        let result: Vec<_> = requests.iter().map(|&(x, z, step, bottom, top)|
-                            terrain.exterior_footprint(x, z, step, bottom, top).unwrap()).collect();
+                        let result: Vec<_> = requests
+                            .iter()
+                            .map(|&(x, z, step, bottom, top)| {
+                                terrain.exterior_footprint(x, z, step, bottom, top).unwrap()
+                            })
+                            .collect();
                         scalar_times.push(start.elapsed());
                         scalar = Some(result);
                     } else {
                         let mut result = Vec::with_capacity(requests.len());
                         for batch in requests.chunks(8) {
-                            if let Some(values) = terrain.exterior_footprints(batch).unwrap() { result.extend(values); }
-                            else { result.extend(batch.iter().map(|&(x,z,step,bottom,top)|
-                                terrain.exterior_footprint(x,z,step,bottom,top).unwrap())); }
+                            if let Some(values) = terrain.exterior_footprints(batch).unwrap() {
+                                result.extend(values);
+                            } else {
+                                result.extend(batch.iter().map(|&(x, z, step, bottom, top)| {
+                                    terrain.exterior_footprint(x, z, step, bottom, top).unwrap()
+                                }));
+                            }
                         }
                         chunk_times.push(start.elapsed());
                         chunked = Some(result);
                     }
                 }
-                assert_eq!(scalar, batched, "production batch changed footprint at step {step}, round {round}");
+                assert_eq!(
+                    scalar, batched,
+                    "production batch changed footprint at step {step}, round {round}"
+                );
                 for batch in requests.chunks(8) {
                     let (_, bytes) = chunk_footprints(&terrain, batch).unwrap();
                     chunk_bytes = chunk_bytes.max(bytes);
                 }
-                assert_eq!(scalar, chunked, "chunk batch changed footprint at step {step}, round {round}");
+                assert_eq!(
+                    scalar, chunked,
+                    "chunk batch changed footprint at step {step}, round {round}"
+                );
             }
             let scalar_ms = median(&mut scalar_times[1..]);
             let production_ms = median(&mut production_times[1..]);
             eprintln!("FOOTPRINT_PRODUCTION step={step} requests={} reused_batches={reused_batches} total_batches={} scalar_ms={scalar_ms:.3} production_ms={production_ms:.3} ratio={:.3}",
                 requests.len(), requests.len().div_ceil(8), scalar_ms / production_ms);
             let chunk_ms = median(&mut chunk_times[1..]);
-            let reused = requests.chunks(8).filter(|batch| terrain.exterior_footprints(batch).unwrap().is_some()).count();
+            let reused = requests
+                .chunks(8)
+                .filter(|batch| terrain.exterior_footprints(batch).unwrap().is_some())
+                .count();
             eprintln!("FOOTPRINT_CHUNK step={step} requests={} production_ms={production_ms:.3} chunk_ms={chunk_ms:.3} ratio={:.3} reused_batches={reused} scratch_upper_bound_bytes={chunk_bytes}", requests.len(), production_ms / chunk_ms);
             profile_bounds(&terrain, &requests);
         }
@@ -1606,8 +2125,14 @@ mod exterior_batch_probe {
     fn bounded_batch_preserves_full_depth_roofs_fluids_and_sheltered_caches() {
         use serde_json::json;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/worldgen");
-        for file in ["overworld.json", "amplified.json", "nether.json", "end.json"] {
-            let original: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join(file)).unwrap()).unwrap();
+        for file in [
+            "overworld.json",
+            "amplified.json",
+            "nether.json",
+            "end.json",
+        ] {
+            let original: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(root.join(file)).unwrap()).unwrap();
             for horizontal in [1, 2, 3, 4, 5, 8, 16] {
                 for sheltered in [false, true] {
                     let mut doc = original.clone();
@@ -1621,12 +2146,43 @@ mod exterior_batch_probe {
                     }
                     let t = Terrain::from_document(-917, &doc).unwrap();
                     for step in [1, 2, 4] {
-                        let requests: Vec<_> = [(15,-17),(16,-16),(12,-16),(28,-16),(-17,15),(-16,16),(-20,16),(-4,16)]
-                            .into_iter().map(|(x,z)| (x,z,step,t.min_y,t.base_column(x,z).unwrap().surface_height.max(t.min_y+1))).collect();
-                        let expected: Vec<_> = requests.iter().map(|&(x,z,step,bottom,top)|
-                            t.exterior_footprint(x,z,step,bottom,top).unwrap()).collect();
-                        if let Some(actual) = t.exterior_footprints(&requests).unwrap() { assert_eq!(actual,expected,"{file} width={horizontal} sheltered={sheltered} step={step}"); }
-                        else { assert!(t.graph.requires_complete_column_order() || 16 % t.cell_width != 0); }
+                        let requests: Vec<_> = [
+                            (15, -17),
+                            (16, -16),
+                            (12, -16),
+                            (28, -16),
+                            (-17, 15),
+                            (-16, 16),
+                            (-20, 16),
+                            (-4, 16),
+                        ]
+                        .into_iter()
+                        .map(|(x, z)| {
+                            (
+                                x,
+                                z,
+                                step,
+                                t.min_y,
+                                t.base_column(x, z).unwrap().surface_height.max(t.min_y + 1),
+                            )
+                        })
+                        .collect();
+                        let expected: Vec<_> = requests
+                            .iter()
+                            .map(|&(x, z, step, bottom, top)| {
+                                t.exterior_footprint(x, z, step, bottom, top).unwrap()
+                            })
+                            .collect();
+                        if let Some(actual) = t.exterior_footprints(&requests).unwrap() {
+                            assert_eq!(
+                                actual, expected,
+                                "{file} width={horizontal} sheltered={sheltered} step={step}"
+                            );
+                        } else {
+                            assert!(
+                                t.graph.requires_complete_column_order() || 16 % t.cell_width != 0
+                            );
+                        }
                     }
                 }
             }
@@ -1636,21 +2192,37 @@ mod exterior_batch_probe {
     #[test]
     fn shared_chunk_checks_keep_thin_solid_sheets_and_invalid_roofs() {
         use serde_json::json;
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/worldgen/overworld.json");
-        let mut doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root).unwrap()).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/worldgen/overworld.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root).unwrap()).unwrap();
         doc["settings"]["aquifers_enabled"] = json!(false);
         doc["settings"]["noise_router"]["final_density"] = json!({"type":"minecraft:range_choice",
             "input":{"type":"minecraft:y_clamped_gradient","from_y":-64,"to_y":320,"from_value":-64.,"to_value":320.},
             "min_inclusive":105,"max_exclusive":106,"when_out_of_range":-1.,
             "when_in_range":{"type":"minecraft:range_choice","input":{"type":"lithostitched:axis","axis":"x"},
                 "min_inclusive":-2,"max_exclusive":-1,"when_in_range":1.,"when_out_of_range":-1.}});
-        let t = Terrain::from_document(0,&doc).unwrap();
-        for step in [1,2,4] {
-            let requests: Vec<_> = [-4,-3,-2,-1,-2,-4,-3,-2].into_iter().map(|x| (x,-4,step,64,106)).collect();
-            let expected: Vec<_> = requests.iter().map(|&(x,z,step,bottom,top)| t.exterior_footprint(x,z,step,bottom,top).unwrap()).collect();
-            assert_eq!(t.exterior_footprints(&requests).unwrap(),Some(expected));
-            let incorrect: Vec<_> = requests.iter().map(|&(x,z,s,b,_)| (x,z,s,b,107)).collect();
-            assert_eq!(t.exterior_footprints(&incorrect).unwrap(),Some(vec![None;8]));
+        let t = Terrain::from_document(0, &doc).unwrap();
+        for step in [1, 2, 4] {
+            let requests: Vec<_> = [-4, -3, -2, -1, -2, -4, -3, -2]
+                .into_iter()
+                .map(|x| (x, -4, step, 64, 106))
+                .collect();
+            let expected: Vec<_> = requests
+                .iter()
+                .map(|&(x, z, step, bottom, top)| {
+                    t.exterior_footprint(x, z, step, bottom, top).unwrap()
+                })
+                .collect();
+            assert_eq!(t.exterior_footprints(&requests).unwrap(), Some(expected));
+            let incorrect: Vec<_> = requests
+                .iter()
+                .map(|&(x, z, s, b, _)| (x, z, s, b, 107))
+                .collect();
+            assert_eq!(
+                t.exterior_footprints(&incorrect).unwrap(),
+                Some(vec![None; 8])
+            );
         }
     }
 }
@@ -1661,32 +2233,47 @@ mod fluid_bound_tests {
     use serde_json::json;
 
     fn fixture(name: &str) -> Value {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/worldgen");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/worldgen");
         serde_json::from_str(&std::fs::read_to_string(root.join(name)).unwrap()).unwrap()
     }
 
     fn verify_exterior(t: &Terrain) {
-        for (x,z) in [(-49,33),(-4,-4),(0,0),(127,-65)] {
-            for step in [1,2,4] {
-                let roof = t.base_column(x,z).unwrap().surface_height;
+        for (x, z) in [(-49, 33), (-4, -4), (0, 0), (127, -65)] {
+            for step in [1, 2, 4] {
+                let roof = t.base_column(x, z).unwrap().surface_height;
                 // A true roof, a deliberately wrong roof, and aquifer depth.
-                for (bottom,top) in [(t.min_y,roof), (t.min_y,t.min_y+t.height),
-                    (t.min_y.max(roof-90),roof), (t.min_y,(t.min_y+40).min(t.min_y+t.height))] {
-                    if top<=bottom { continue; }
-                    let mut reference=vec![0;(top-bottom) as usize];
-                    let anchor=t.base_column(x,z).unwrap();
-                    let expected=if anchor.blocks[(top-1-t.min_y) as usize]==Substance::Air { None } else {
-                        for dz in 0..step { for dx in 0..step {
-                            let col=t.base_column(x+dx,z+dz).unwrap();
-                            for y in bottom..top {
-                                reference[(y-bottom) as usize] |= u8::from(col.blocks[(y-t.min_y) as usize]!=Substance::Air);
+                for (bottom, top) in [
+                    (t.min_y, roof),
+                    (t.min_y, t.min_y + t.height),
+                    (t.min_y.max(roof - 90), roof),
+                    (t.min_y, (t.min_y + 40).min(t.min_y + t.height)),
+                ] {
+                    if top <= bottom {
+                        continue;
+                    }
+                    let mut reference = vec![0; (top - bottom) as usize];
+                    let anchor = t.base_column(x, z).unwrap();
+                    let expected = if anchor.blocks[(top - 1 - t.min_y) as usize] == Substance::Air
+                    {
+                        None
+                    } else {
+                        for dz in 0..step {
+                            for dx in 0..step {
+                                let col = t.base_column(x + dx, z + dz).unwrap();
+                                for y in bottom..top {
+                                    reference[(y - bottom) as usize] |= u8::from(
+                                        col.blocks[(y - t.min_y) as usize] != Substance::Air,
+                                    );
+                                }
                             }
-                        }}
+                        }
                         Some(reference)
                     };
-                    assert_eq!(t.exterior_footprint(x,z,step,bottom,top).unwrap(),expected,
-                        "footprint {x},{z} step {step} range {bottom}..{top}");
+                    assert_eq!(
+                        t.exterior_footprint(x, z, step, bottom, top).unwrap(),
+                        expected,
+                        "footprint {x},{z} step {step} range {bottom}..{top}"
+                    );
                 }
             }
         }
@@ -1694,20 +2281,29 @@ mod fluid_bound_tests {
 
     #[test]
     fn exterior_union_matches_full_columns_in_every_dimension_and_negative_cell_crossings() {
-        for file in ["overworld.json","amplified.json","nether.json","end.json"] {
-            verify_exterior(&Terrain::from_document(917,&fixture(file)).unwrap());
+        for file in [
+            "overworld.json",
+            "amplified.json",
+            "nether.json",
+            "end.json",
+        ] {
+            verify_exterior(&Terrain::from_document(917, &fixture(file)).unwrap());
         }
     }
 
     #[test]
     fn exterior_union_preserves_thin_layers_and_stateful_fallback() {
-        for wrapper in ["minecraft:cache_once","minecraft:cache_2d","minecraft:flat_cache"] {
-            let mut d=fixture("overworld.json");
-            d["settings"]["noise_router"]["final_density"]=json!({"type":wrapper,"argument":{
+        for wrapper in [
+            "minecraft:cache_once",
+            "minecraft:cache_2d",
+            "minecraft:flat_cache",
+        ] {
+            let mut d = fixture("overworld.json");
+            d["settings"]["noise_router"]["final_density"] = json!({"type":wrapper,"argument":{
                 "type":"minecraft:range_choice",
                 "input":{"type":"minecraft:y_clamped_gradient","from_y":-64,"to_y":320,"from_value":-64.,"to_value":320.},
                 "min_inclusive":89,"max_exclusive":90,"when_in_range":1.,"when_out_of_range":-1.}});
-            verify_exterior(&Terrain::from_document(0,&d).unwrap());
+            verify_exterior(&Terrain::from_document(0, &d).unwrap());
         }
     }
 
@@ -1731,13 +2327,13 @@ mod fluid_bound_tests {
         assert!(fast.density_ceiling[&(-1, -1)] < t.min_y + t.height);
         let mut fast = Job::resume(&t, fast.park());
         fast.reuse_density_cells = true;
-        for (x, z) in [(-2,-4), (-1,-4), (-4,-4), (-2,-1), (0,0)] {
+        for (x, z) in [(-2, -4), (-1, -4), (-4, -4), (-2, -1), (0, 0)] {
             let mut full = t.job(x, z, false).unwrap();
-            let expected = (t.min_y..t.min_y+t.height).rev().find(|&y| {
+            let expected = (t.min_y..t.min_y + t.height).rev().find(|&y| {
                 full.scratch.advance_block();
-                full.compute(t.final_density, [x,y,z], Mode::Cell) > 0.
+                full.compute(t.final_density, [x, y, z], Mode::Cell) > 0.
             });
-            assert_eq!(fast.density_surface(x,z), expected, "{x},{z}");
+            assert_eq!(fast.density_surface(x, z), expected, "{x},{z}");
         }
     }
 
@@ -1747,17 +2343,27 @@ mod fluid_bound_tests {
         let t = Terrain::from_document(917, &d).unwrap();
         let mut reused = t.job(0, 0, false).unwrap();
         let allocation = reused.scratch.retained_bytes();
-        for (x,z) in [(0,0),(-17,-65),(4096,8192),(-4096,0),(16,-16),(0,0)] {
-            reused.reset_display_chunk(x,z).unwrap();
+        for (x, z) in [
+            (0, 0),
+            (-17, -65),
+            (4096, 8192),
+            (-4096, 0),
+            (16, -16),
+            (0, 0),
+        ] {
+            reused.reset_display_chunk(x, z).unwrap();
             assert!(reused.density_cells.is_empty() && reused.density_ceiling.is_empty());
             assert!(reused.surface_columns.is_empty() && reused.neighbour_tops.is_empty());
             assert!(reused.scratch.retained_bytes() >= allocation);
-            let mut fresh = t.job(x,z,false).unwrap();
-            assert_eq!(reused.density_surface(x,z), fresh.density_surface(x,z));
+            let mut fresh = t.job(x, z, false).unwrap();
+            assert_eq!(reused.density_surface(x, z), fresh.density_surface(x, z));
             // Fill exact fallback aquifer/ore/cache state before the next rebase.
-            assert_eq!(reused.column(x,z).unwrap().blocks, fresh.column(x,z).unwrap().blocks);
+            assert_eq!(
+                reused.column(x, z).unwrap().blocks,
+                fresh.column(x, z).unwrap().blocks
+            );
             reused.reuse_density_cells = true;
-            reused.density_surface(x,z);
+            reused.density_surface(x, z);
         }
     }
 
@@ -1766,17 +2372,19 @@ mod fluid_bound_tests {
         let mut d = fixture("overworld.json");
         d["settings"]["noise_router"]["final_density"] = json!(-1.);
         let t = Terrain::from_document(0, &d).unwrap();
-        let mut job = t.job(0,0,false).unwrap();
+        let mut job = t.job(0, 0, false).unwrap();
         job.reuse_density_cells = true;
-        for x in -300..300 { assert_eq!(job.density_surface(x*4,0), None); }
-        assert_eq!(job.density_ceiling.len(),256);
+        for x in -300..300 {
+            assert_eq!(job.density_surface(x * 4, 0), None);
+        }
+        assert_eq!(job.density_ceiling.len(), 256);
         assert!(job.density_ceiling.values().all(|&y| y == t.min_y));
         let work = job.park();
-        assert!(work.retained_bytes() >= work.density_ceiling.capacity()*64);
+        assert!(work.retained_bytes() >= work.density_ceiling.capacity() * 64);
         let mut job = Job::resume(&t, work);
         job.reuse_density_cells = true;
-        assert_eq!(job.density_surface(-1200,0),None);
-        assert_eq!(job.density_surface(4096,0),None);
+        assert_eq!(job.density_surface(-1200, 0), None);
+        assert_eq!(job.density_surface(4096, 0), None);
     }
 
     fn compare(t: &Terrain, reverse: bool) {
@@ -1785,7 +2393,9 @@ mod fluid_bound_tests {
         for i in 0..16 {
             let x = -97 + i * 17;
             let z = 101 - i * 31;
-            let ys: Vec<_> = (t.min_y - 16..=t.min_y + t.height + 24).step_by(5).collect();
+            let ys: Vec<_> = (t.min_y - 16..=t.min_y + t.height + 24)
+                .step_by(5)
+                .collect();
             for k in 0..ys.len() {
                 let y = ys[if reverse { ys.len() - 1 - k } else { k }];
                 let p = [x, y, z];
@@ -1798,9 +2408,17 @@ mod fluid_bound_tests {
 
     #[test]
     fn high_aquifer_candidates_match_full_height_search() {
-        for file in ["overworld.json", "amplified.json", "nether.json", "end.json"] {
+        for file in [
+            "overworld.json",
+            "amplified.json",
+            "nether.json",
+            "end.json",
+        ] {
             for seed in [0, -917] {
-                compare(&Terrain::from_document(seed, &fixture(file)).unwrap(), seed == 0);
+                compare(
+                    &Terrain::from_document(seed, &fixture(file)).unwrap(),
+                    seed == 0,
+                );
             }
         }
     }
@@ -1830,22 +2448,22 @@ mod fluid_bound_tests {
     }
 }
 
-
 #[cfg(test)]
 mod preliminary_height_format_tests {
     use super::*;
     use serde_json::json;
     #[test]
     fn height_root_is_floored_directly_and_wins_over_legacy_density_root() {
-        let path=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/worldgen/overworld.json");
-        let mut d:Value=serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        for (height,expected) in [(72.9,72),(-7.1,-8),(0.0,0)] {
-            d["settings"]["noise_router"]["preliminary_surface_level"]=json!(height);
-            d["settings"]["noise_router"]["initial_density_without_jaggedness"]=json!(1.0);
-            let t=Terrain::from_document(91,&d).unwrap();
-            let mut job=t.job(0,0,true).unwrap();
-            for (x,z) in [(0,0),(1,1),(-1,15),(-4,12)] {
-                assert_eq!(job.preliminary(x,z),expected);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/worldgen/overworld.json");
+        let mut d: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for (height, expected) in [(72.9, 72), (-7.1, -8), (0.0, 0)] {
+            d["settings"]["noise_router"]["preliminary_surface_level"] = json!(height);
+            d["settings"]["noise_router"]["initial_density_without_jaggedness"] = json!(1.0);
+            let t = Terrain::from_document(91, &d).unwrap();
+            let mut job = t.job(0, 0, true).unwrap();
+            for (x, z) in [(0, 0), (1, 1), (-1, 15), (-4, 12)] {
+                assert_eq!(job.preliminary(x, z), expected);
             }
         }
     }

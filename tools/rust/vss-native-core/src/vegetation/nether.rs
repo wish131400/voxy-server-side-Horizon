@@ -148,7 +148,7 @@ fn bounded(v: &Value, key: &str) -> Result<i32> {
     Ok(n)
 }
 impl NetherFeature {
-    pub fn parse(kind: &str, v: &Value, p: &mut Palette) -> Result<Self> {
+    pub fn parse(kind: &str, v: &Value, doc: &Value, p: &mut Palette) -> Result<Self> {
         Ok(match kind {
             "huge_fungus" => Self::Fungus {
                 base: p.intern(&v["valid_base_block"])?,
@@ -159,7 +159,7 @@ impl NetherFeature {
                 replace: Predicate::parse(&v["replaceable_blocks"], p, 0)?,
             },
             "nether_forest_vegetation" => Self::Forest(
-                StateProvider::parse(&v["state_provider"], p)?,
+                StateProvider::parse_with_registries(&v["state_provider"], doc, p)?,
                 bounded(v, "spread_width")?,
                 bounded(v, "spread_height")?,
             ),
@@ -171,11 +171,23 @@ impl NetherFeature {
                 bounded(v, "max_height")?,
             ),
             "spring_feature" => {
-                let name = string(&v["state"], "Name")?;
-                if !matches!(name, "minecraft:lava" | "minecraft:water") {
+                // This codec stores a FluidState, whose modern `falling`
+                // property is not a property of the resulting BlockState.
+                let fluid = &v["state"];
+                let name = fluid
+                    .as_str()
+                    .or_else(|| fluid["Name"].as_str())
+                    .or_else(|| fluid["id"].as_str())
+                    .ok_or("missing spring fluid")?;
+                let name = if name.contains(':') {
+                    name.into()
+                } else {
+                    format!("minecraft:{name}")
+                };
+                if !matches!(name.as_str(), "minecraft:lava" | "minecraft:water") {
                     return Err("unsupported spring fluid".into());
                 }
-                let base = p.named(name)?;
+                let base = p.named(&name)?;
                 // SourceFluid creates a level-zero block even if its falling property is true.
                 let state = p.with(base, "level", "0")?;
                 let test = serde_json::json!({"type":"minecraft:matching_blocks","blocks":v["valid_blocks"]});
@@ -307,7 +319,7 @@ impl NetherFeature {
                         r.next_bounded(*height) - r.next_bounded(*height),
                         r.next_bounded(*width) - r.next_bounded(*width),
                     );
-                    let id = provider.state(r, q, &mut w.palette)?;
+                    let id = provider.state_in(r, q, w)?;
                     if air(w, q) && q[1] > w.origin[1] && survives(w, q, id)? {
                         w.set(q, id);
                         placed = true;

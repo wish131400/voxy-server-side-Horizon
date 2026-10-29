@@ -24,9 +24,11 @@ mod jni_noise;
 mod jni_worldgen;
 pub mod lithostitched;
 pub mod noise;
-pub mod providers;
 pub mod prof;
+pub mod providers;
 pub mod random;
 pub mod surface;
 pub mod terrain;
 pub mod vegetation;
+
+pub mod aquifer;

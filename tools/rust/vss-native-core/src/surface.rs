@@ -3,18 +3,20 @@
 use crate::{
     biome::{Biome, ClimateColors},
     blocks::{Palette, Pos, StateId, Volume},
-    density::{integer, lerp, minecraft_type, number, string, Graph, Result},
+    density::{integer, lerp, minecraft_type, number, string, Graph, Mode, Result, Scratch},
     random::{Positional, Random},
     terrain::{Job, Terrain},
 };
 use serde_json::Value;
 mod exterior;
+mod material;
 pub(crate) use exterior::ExteriorColumn;
 enum Rule {
     Block(StateId),
     Sequence(Vec<Rule>),
     Condition(Condition, Box<Rule>),
     Bands,
+    Ore(material::OreRule),
     /// TerraBlender `terrablender:merged`. `NamespacedSurfaceRuleSource`
     /// dispatches on the biome's namespace and falls back to `base` whenever
     /// the namespaced rule answers with nothing.
@@ -25,7 +27,7 @@ enum Rule {
 }
 enum Condition {
     Biome(Vec<String>),
-    Noise(usize, f64, f64),
+    Noise(usize, f64, f64, bool),
     Gradient(Positional, i32, i32),
     Y(i32, i32, bool),
     Water(i32, i32, bool),
@@ -69,6 +71,8 @@ struct Context<'a> {
 }
 pub struct Surface {
     rule: Rule,
+    modern: bool,
+    uses_density: bool,
     bands: [StateId; 192],
     band_offset: usize,
     depth: usize,
@@ -99,7 +103,7 @@ fn anchor(v: &Value, min: i32, height: i32) -> Result<i32> {
 impl Surface {
     pub fn new(terrain: &mut Terrain, doc: &Value, palette: &mut Palette) -> Result<Self> {
         let rule = parse_rule(
-            &doc["settings"]["surface_rule"],
+            doc["settings"].get("material_rule").unwrap_or(&doc["settings"]["surface_rule"]),
             &mut terrain.graph,
             doc,
             palette,
@@ -157,7 +161,18 @@ impl Surface {
             }
             i += r.next_bounded(16) as usize + 4;
         }
+        fn uses_density(rule: &Rule) -> bool {
+            match rule {
+                Rule::Ore(_) => true,
+                Rule::Sequence(rules) => rules.iter().any(uses_density),
+                Rule::Condition(_, rule) => uses_density(rule),
+                Rule::Namespaced { base, sources } => uses_density(base) || sources.iter().any(|(_, r)| uses_density(r)),
+                _ => false,
+            }
+        }
         Ok(Self {
+            modern: doc["settings"].get("material_rule").is_some(),
+            uses_density: uses_density(&rule),
             rule,
             bands,
             band_offset,
@@ -165,7 +180,7 @@ impl Surface {
             secondary,
             badlands,
             iceberg,
-            default: palette.intern(&doc["settings"]["default_block"])?,
+            default: material::state(&doc["settings"]["default_block"], palette)?,
             water: palette.named("minecraft:water")?,
             packed_ice: palette.named("minecraft:packed_ice")?,
             snow: palette.named("minecraft:snow_block")?,
@@ -182,6 +197,12 @@ impl Surface {
         self.bands[(p[1] + offset + 192).rem_euclid(192) as usize]
     }
     pub fn min_surface(&self, job: &mut Job<'_>, x: i32, z: i32, depth: i32) -> i32 {
+        if self.modern {
+            let root = job.terrain.graph.root("chunk_surface_level")
+                .expect("26.3 material system requires its chunk surface root");
+            return (job.terrain.graph.compute(root, [x, 0, z], Mode::Block, &mut job.scratch).floor() as i32)
+                .wrapping_add(depth).wrapping_sub(8);
+        }
         let xx = x & !15;
         let zz = z & !15;
         let a = job.preliminary(xx, zz) as f64;
@@ -245,6 +266,8 @@ impl Surface {
             match rule {
                 Rule::Block(id) => !p.is_air(*id) && (!dry || !p.fluid(*id)),
                 Rule::Bands => true,
+                Rule::Ore(rule) => [rule.ore, rule.raw, rule.filler].iter()
+                    .all(|&id| !p.is_air(id) && (!dry || !p.fluid(id))),
                 Rule::Sequence(r) => r.iter().all(|r| safe(r, p, biome,dry,hole)),
                 Rule::Condition(c, r) => known(c, biome,hole) == Some(false) || safe(r, p, biome,dry,hole),
                 Rule::Namespaced { base, sources } => match biome {
@@ -397,7 +420,7 @@ impl Surface {
                     }
                 }
                 above += 1;
-                if state == self.default {
+                if self.modern || state == self.default {
                     let (biome_name, biome_data) = biome(p)?;
                     let context = Context {
                         p,
@@ -411,7 +434,7 @@ impl Surface {
                         water,
                         min_surface,
                     };
-                    if let Some(id) = self.rule(&self.rule, graph, &context) {
+                    if let Some(id) = self.rule(&self.rule, graph, &context, &mut Some(&mut job.scratch)) {
                         world.set(p, id);
                     }
                 }
@@ -447,33 +470,44 @@ impl Surface {
     fn summary_materials(&self,t:&Terrain,x:i32,z:i32,floor:i32,water:i32,name:&str,biome:&Biome,colors:&ClimateColors,steep:bool)->[StateId;3] {
         let depth = self.depth(&t.graph, x, z);
         let secondary = t.graph.noise(self.secondary, x as f64, 0., z as f64);
+        let mut owned_scratch = (self.modern || self.uses_density).then(|| t.graph.scratch(x & !3, z & !3, t.cell_width, t.cell_height)
+            .expect("validated terrain dimensions"));
+        if let Some(scratch) = owned_scratch.as_mut() { t.graph.initialize_column_caches(scratch); }
+        let min_surface = if self.modern {
+            let root = t.graph.root("chunk_surface_level").expect("26.3 material surface root");
+            (t.graph.compute(root, [x, 0, z], Mode::Block, owned_scratch.as_mut().unwrap()).floor() as i32)
+                .wrapping_add(depth).wrapping_sub(8)
+        } else { floor - depth - 8 };
+        let mut scratch = owned_scratch.as_mut();
         [1, 2, 7].map(|offset| {
             let p = [x, floor - offset, z];
             let c = Context { p, biome: name, cold: colors.temperature_with_sea_level(biome, p, t.sea_level) < 0.15,
                 steep, depth, secondary, above: offset,
                 below: (floor - offset - t.min_y + 1).max(1), water,
-                min_surface: floor - depth - 8 };
-            self.rule(&self.rule, &t.graph, &c).unwrap_or(self.default)
+                min_surface };
+            self.rule(&self.rule, &t.graph, &c, &mut scratch).unwrap_or(self.default)
         })
     }
 
-    fn rule(&self, rule: &Rule, graph: &Graph, c: &Context<'_>) -> Option<StateId> {
+    fn rule(&self, rule: &Rule, graph: &Graph, c: &Context<'_>, scratch: &mut Option<&mut Scratch>) -> Option<StateId> {
         match rule {
             Rule::Block(id) => Some(*id),
             Rule::Bands => Some(self.band(graph, c.p)),
-            Rule::Sequence(rules) => rules.iter().find_map(|r| self.rule(r, graph, c)),
+            Rule::Ore(rule) => rule.sample(graph, c.p, scratch.as_deref_mut()
+                .expect("material density scratch must be initialized")),
+            Rule::Sequence(rules) => rules.iter().find_map(|r| self.rule(r, graph, c, scratch)),
             Rule::Namespaced { base, sources } => {
                 let namespace = c.biome.split(':').next().unwrap_or("");
                 if let Some((_, rule)) = sources.iter().find(|(name, _)| name == namespace) {
-                    if let Some(state) = self.rule(rule, graph, c) {
+                    if let Some(state) = self.rule(rule, graph, c, scratch) {
                         return Some(state);
                     }
                 }
-                self.rule(base, graph, c)
+                self.rule(base, graph, c, scratch)
             }
             Rule::Condition(test, then) => {
                 if test.matches(graph, c) {
-                    self.rule(then, graph, c)
+                    self.rule(then, graph, c, scratch)
                 } else {
                     None
                 }
@@ -571,8 +605,8 @@ impl Condition {
     fn matches(&self, g: &Graph, c: &Context<'_>) -> bool {
         match self {
             Self::Biome(names) => names.iter().any(|name| name == c.biome),
-            Self::Noise(id, a, b) => {
-                let v = g.noise(*id, c.p[0] as f64, 0., c.p[2] as f64);
+            Self::Noise(id, a, b, is_3d) => {
+                let v = g.noise(*id, c.p[0] as f64, if *is_3d { c.p[1] as f64 } else { 0. }, c.p[2] as f64);
                 v >= *a && v <= *b
             }
             Self::Gradient(r, a, b) => {
@@ -648,6 +682,9 @@ fn parse_rule(
     if depth > 128 {
         return Err("surface rule depth exceeded".into());
     }
+    if let Some(resolved) = material::reference(v, doc, "material_rules")? {
+        return parse_rule(resolved, g, doc, p, min, height, depth + 1);
+    }
     // `minecraft_type` only accepts the `minecraft:` prefix, so mod codecs have
     // to be matched on the raw type string before it runs.
     if string(v, "type")? == "terrablender:merged" {
@@ -670,11 +707,12 @@ fn parse_rule(
         });
     }
     Ok(match minecraft_type(v)? {
-        "block" => Rule::Block(p.intern(&v["result_state"])?),
+        "block" => Rule::Block(material::state(&v["result_state"], p)?),
+        "ore_vein" => Rule::Ore(material::OreRule::parse(v, g, doc, p)?),
         "bandlands" => Rule::Bands,
         "sequence" => {
             let values = v["sequence"].as_array().ok_or("missing surface sequence")?;
-            if values.is_empty() || values.len() > 4096 {
+            if values.len() > 4096 {
                 return Err("surface sequence budget".into());
             }
             Rule::Sequence(
@@ -710,6 +748,9 @@ fn parse_condition(
     if depth > 128 {
         return Err("surface condition depth exceeded".into());
     }
+    if let Some(resolved) = material::reference(v, doc, "material_conditions")? {
+        return parse_condition(resolved, g, doc, min, height, depth + 1);
+    }
     // As with rules, `minecraft_type` rejects anything outside the vanilla
     // namespace, so mod conditions are matched on the raw type first.
     match string(v, "type")? {
@@ -740,6 +781,7 @@ fn parse_condition(
             g.registered_noise(string(v, "noise")?, doc)?,
             number(v, "min_threshold")?,
             number(v, "max_threshold")?,
+            v.get("is_3d").map_or(Ok(false), |value| value.as_bool().ok_or("invalid noise dimensionality"))?,
         ),
         "vertical_gradient" => Condition::Gradient(
             g.random.from_hash(string(v, "random_name")?).positional(),
