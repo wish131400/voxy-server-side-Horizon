@@ -65,6 +65,11 @@ jobs:
       - name: Build Linux library with the supported glibc baseline
         if: runner.os == 'Linux'
         run: cargo zigbuild --locked --release --lib --target '${{ matrix.rust_target }}.2.28'
+      - name: Give the macOS library a portable install name and signature
+        if: runner.os == 'macOS'
+        run: |
+          install_name_tool -id '@rpath/libvss_native_core.dylib' '${{ matrix.artifact }}'
+          codesign --force --sign - '${{ matrix.artifact }}'
       - uses: actions/upload-artifact@v4
         with:
           name: native-${{ matrix.platform }}
