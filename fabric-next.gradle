@@ -1,0 +1,144 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version '1.16.3'
+    id 'maven-publish'
+}
+
+apply from: 'gradle/minecraft-targets.gradle'
+ext.minecraft_version = selectedMinecraft
+ext.java_version = selectedTarget.java.toString()
+ext.fabric_version = selectedTarget.api
+layout.buildDirectory = layout.projectDirectory.dir('build/' + selectedMinecraft)
+version = "${vss_version}-fabric-${selectedMinecraft}"
+group = mod_group_id
+base { archivesName = 'vss' }
+
+repositories {
+    mavenCentral()
+    exclusiveContent {
+        forRepository { maven { name = 'Modrinth'; url = 'https://api.modrinth.com/maven' } }
+        filter { includeGroup 'maven.modrinth' }
+    }
+}
+
+// New Minecraft releases ship unobfuscated names and use Loom without remapping.
+dependencies {
+    minecraft "com.mojang:minecraft:${selectedMinecraft}"
+    implementation "net.fabricmc:fabric-loader:${loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${selectedTarget.api}"
+    compileOnly "maven.modrinth:modmenu:${selectedTarget.menu}"
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testImplementation 'org.mockito:mockito-core:5.23.0'
+    testImplementation 'com.tngtech.archunit:archunit:1.4.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    // 26.3 uses SDL in production. Independent offscreen GPU contracts still
+    // create their own GLFW context, so this remains a test-only dependency.
+    if (selectedMinecraft == '26.3') {
+        testImplementation 'org.lwjgl:lwjgl-glfw:3.4.3'
+        testRuntimeOnly 'org.lwjgl:lwjgl-glfw:3.4.3:natives-windows'
+        testRuntimeOnly 'org.lwjgl:lwjgl-glfw:3.4.3:natives-linux'
+        testRuntimeOnly 'org.lwjgl:lwjgl-glfw:3.4.3:natives-macos'
+        testRuntimeOnly 'org.lwjgl:lwjgl-glfw:3.4.3:natives-macos-arm64'
+    }
+}
+
+def overlays = selectedTarget.overlays.collect { file('src/versions/' + it) }.reverse()
+def wireSources = layout.buildDirectory.dir('generated/wire-format')
+def generateWireFormat = tasks.register('generateWireFormat') {
+    def template = file('src/main/java/dev/xantha/vss/common/VSSWireFormat.java')
+    inputs.file(template)
+    inputs.properties(protocol: selectedTarget.protocol, columnSchema: selectedTarget.columnSchema)
+    outputs.dir(wireSources)
+    doLast {
+        def output = wireSources.get().file('dev/xantha/vss/common/VSSWireFormat.java').asFile
+        output.parentFile.mkdirs()
+        output.setText(template.getText('UTF-8')
+                .replace('PROTOCOL_VERSION = 54', 'PROTOCOL_VERSION = ' + selectedTarget.protocol)
+                .replace('COLUMN_SCHEMA = 6', 'COLUMN_SCHEMA = ' + selectedTarget.columnSchema), 'UTF-8')
+    }
+}
+def activeWidener = (overlays.collect { new File(it, 'resources/vss.accesswidener') }
+        + [file('src/main/resources/vss.accesswidener')]).find { it.isFile() }
+loom {
+    accessWidenerPath = activeWidener
+    runs {
+        client { client(); runDir 'run/client-' + selectedMinecraft }
+        server { server(); runDir providers.gradleProperty('serverRunDir').getOrElse('run/server-' + selectedMinecraft); programArgs '--nogui' }
+    }
+}
+
+// Select one complete implementation per class, with the most specific version first.
+['main': 'java', 'test': 'test'].each { setName, overlayDirectory ->
+    def excluded = overlays.collect { new File(it, 'excluded-' + setName + '.txt') }
+            .findAll { it.isFile() }.collectMany { it.readLines('UTF-8') }
+            .collect { it.trim() }.findAll { it && !it.startsWith('#') }
+    def destination = layout.buildDirectory.dir('generated/sources/' + setName)
+    def assemble = tasks.register('assemble' + setName.capitalize() + 'Sources', Sync) {
+        if (setName == 'main') {
+            dependsOn generateWireFormat
+            from(wireSources)
+        }
+        overlays.each { from(new File(it, overlayDirectory)) { exclude excluded } }
+        from('src/' + setName + '/java') { exclude excluded }
+        into(destination)
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    }
+    sourceSets[setName].java.setSrcDirs([destination])
+    tasks.named(setName == 'main' ? 'compileJava' : 'compileTestJava').configure { dependsOn assemble }
+}
+
+sourceSets.main.resources.setSrcDirs(overlays.collect { new File(it, 'resources') } + [file('src/main/resources')])
+tasks.named('processResources', ProcessResources).configure {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    inputs.properties(version: project.version, minecraft_version: selectedMinecraft,
+            loader_version: loader_version, fabric_version: selectedTarget.api, java_version: java_version)
+    filesMatching('fabric.mod.json') {
+        expand(version: project.version, minecraft_version: selectedMinecraft,
+                loader_version: loader_version, fabric_version: selectedTarget.api, java_version: java_version)
+    }
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(selectedTarget.java)
+    withSourcesJar()
+}
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = selectedTarget.java
+    options.compilerArgs += ['-Xmaxerrs', '1500']
+}
+tasks.named('jar', Jar).configure {
+    destinationDirectory = layout.projectDirectory.dir('lib')
+    from('LICENSE') { rename { 'LICENSE_vss' } }
+    def productionInputs = files(fileTree('src/main'), fileTree('src/versions'),
+            'build.gradle', 'fabric-next.gradle', 'settings.gradle', 'gradle.properties', 'gradle/minecraft-targets.gradle')
+    inputs.files(productionInputs)
+    doFirst {
+        def digest = java.security.MessageDigest.getInstance('SHA-256')
+        productionInputs.files.findAll { it.isFile() }.sort { a, b ->
+            relativePath(a).replace('\\', '/') <=> relativePath(b).replace('\\', '/')
+        }.each { input ->
+            digest.update(relativePath(input).replace('\\', '/').getBytes('UTF-8'))
+            digest.update((byte) 0)
+            digest.update(input.bytes)
+            digest.update((byte) 0)
+        }
+        manifest.attributes('VSS-Source-SHA256': java.util.HexFormat.of().formatHex(digest.digest()))
+    }
+    manifest.attributes('Specification-Title': 'vss', 'Specification-Vendor': 'Xantha',
+            'Implementation-Title': project.name, 'Implementation-Version': project.version,
+            'VSS-Build-Id': providers.gradleProperty('vssBuildId').getOrElse('dev'),
+            'VSS-Source-Baseline': '9fc910393ad5b1fac35d69393adab26ffdf77e74',
+            'VSS-Platform': 'fabric', 'VSS-Minecraft': selectedMinecraft,
+            'VSS-Protocol': selectedTarget.protocol,
+            'VSS-Column-Schema': selectedTarget.columnSchema)
+}
+tasks.withType(Test).configureEach {
+    systemProperty 'vss.minecraftTarget', selectedMinecraft
+    useJUnitPlatform()
+    testLogging { events 'failed', 'skipped'; exceptionFormat 'full' }
+}
+tasks.named('runServer', JavaExec).configure { standardInput = System.in }
+apply from: 'tools/prediction/compat-tests.gradle'
+apply from: 'tools/verification/modules.gradle'
+apply from: 'tools/verification/fabric-contracts.gradle'
+apply from: 'tools/verification/client-smoke.gradle'

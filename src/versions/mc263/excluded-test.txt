@@ -1,0 +1,10 @@
+# Replaced in 26.3 by the actual Minecraft float compiler and its independent
+# FloatDensityCompilerTest / PredictionClimateSamplerTest / JavaExterior contracts.
+# Keep these double-optimizer regressions active for every earlier target.
+dev/xantha/vss/client/prediction/C2meDensityMemoCompatTest.java
+dev/xantha/vss/client/prediction/DensityFunctionTraitsTest.java
+dev/xantha/vss/client/prediction/DensityGraphCompilerTest.java
+dev/xantha/vss/client/prediction/DensityMemoCompatTest.java
+dev/xantha/vss/client/prediction/JavaDensityCompilationBenchmark.java
+dev/xantha/vss/client/prediction/JavaDensityOptimizationTest.java
+dev/xantha/vss/client/prediction/PackagedDensityCompilerTest.java

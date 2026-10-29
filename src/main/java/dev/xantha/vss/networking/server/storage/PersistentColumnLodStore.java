@@ -1,0 +1,1264 @@
+package dev.xantha.vss.networking.server.storage;
+
+import dev.xantha.vss.common.VSSLogger;
+import dev.xantha.vss.api.column.ColumnFilters;
+import dev.xantha.vss.common.processing.ColumnCoverage;
+import dev.xantha.vss.common.processing.EncodedColumnData;
+import dev.xantha.vss.common.processing.LodByteCompression;
+import dev.xantha.vss.config.VSSServerConfig;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.FileTime;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.stream.Stream;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.storage.LevelResource;
+
+public final class PersistentColumnLodStore {
+    private static final int FILE_MAGIC = 0x5653534C;
+    private static final int FILE_VERSION_CURRENT = 8;
+    private static final int INDEX_MAGIC = 0x56535349;
+    private static final int INDEX_VERSION_CURRENT = 3;
+    private static final int REGION_SIZE = 32;
+    private static final int REGION_SLOT_COUNT = REGION_SIZE * REGION_SIZE;
+    private static final int REGION_BITMAP_LONGS = REGION_SLOT_COUNT / Long.SIZE;
+    private static final int MAX_COLUMN_BYTES = 2 * 1024 * 1024;
+    private static final int MAX_ENCODED_COLUMN_BYTES = MAX_COLUMN_BYTES + 65536;
+    private static final int MIN_REGION_INDEX_CACHE_ENTRIES = 512;
+    private static final int MAX_REGION_INDEX_CACHE_ENTRIES = 8192;
+    private static final int COLUMN_LOCK_STRIPES = 1024;
+    private static final int REGION_LOCK_STRIPES = 256;
+    private static final String CACHE_DIR = "vss-column-cache";
+    private static final String COLUMN_EXTENSION = ".vcl";
+    private static final String INDEX_FILE_NAME = "index.vci";
+
+    private final VSSServerConfig config;
+    private final Map<RegionKey, RegionIndex> regionIndexes = new LinkedHashMap<>(128, 0.75F, true);
+    private final Set<RegionKey> dirtyIndexes = new HashSet<>();
+    private final Object[] columnLocks = createLocks(COLUMN_LOCK_STRIPES);
+    private final Object[] regionLocks = createLocks(REGION_LOCK_STRIPES);
+    private long reads;
+    private long hits;
+    private long misses;
+    private long writes;
+    private long writeFailures;
+    private long invalidations;
+    private long corruptions;
+    private long cleanupRuns;
+    private long cleanupDeleted;
+    private long indexScans;
+    private long indexMissSkips;
+    private long indexEvictions;
+    private volatile long nextCleanupMillis;
+    private final java.util.concurrent.atomic.AtomicBoolean cleanupRunning = new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile long nextExpiryMillis;
+    private long cacheMutation;
+    private int observedRetentionDays;
+    private long knownCacheBytes = -1L;
+    private int knownCacheEntries = -1;
+    private volatile boolean indexedZstdAvailable = LodByteCompression.isZstdAvailable();
+
+    public PersistentColumnLodStore(VSSServerConfig config) {
+        this.config = config;
+    }
+
+    public boolean enabled() {
+        return config.enablePersistentColumnCache;
+    }
+
+    public static int regionSize() {
+        return REGION_SIZE;
+    }
+
+    public void clearMemory() {
+        clearRegionIndexes();
+        synchronized (this) {
+            dirtyIndexes.clear();
+        }
+        nextCleanupMillis = 0L;
+        nextExpiryMillis = 0L;
+        knownCacheBytes = -1L;
+        knownCacheEntries = -1;
+        indexedZstdAvailable = LodByteCompression.isZstdAvailable();
+    }
+
+    public Entry read(MinecraftServer server, ResourceKey<Level> dimension, int cx, int cz, long minimumTimestamp) {
+        if (!config.enablePersistentColumnCache) {
+            return null;
+        }
+
+        synchronized (columnLock(dimension, cx, cz)) {
+            return readLocked(server, dimension, cx, cz, minimumTimestamp);
+        }
+    }
+
+    private Entry readLocked(MinecraftServer server, ResourceKey<Level> dimension, int cx, int cz, long minimumTimestamp) {
+        reads++;
+        refreshCompressionState();
+        RegionIndex index = regionIndex(server, dimension, cx, cz);
+        IndexSlot indexedSlot = index.slot(cx, cz);
+        if (!isReadableSlot(indexedSlot, minimumTimestamp)) {
+            misses++;
+            indexMissSkips++;
+            if (indexedSlot != null && indexedSlot.timestamp() < minimumTimestamp) {
+                deleteQuietly(columnPath(server, dimension, cx, cz));
+                markIndexed(server, dimension, cx, cz, null);
+            }
+            return null;
+        }
+
+        Path path = columnPath(server, dimension, cx, cz);
+        if (!Files.isRegularFile(path)) {
+            misses++;
+            markIndexed(server, dimension, cx, cz, null);
+            return null;
+        }
+
+        if (expiredFile(path, System.currentTimeMillis())) {
+            deleteColumn(server, dimension, cx, cz);
+            misses++;
+            return null;
+        }
+        try (InputStream fileIn = Files.newInputStream(path);
+             DataInputStream in = new DataInputStream(fileIn)) {
+            IndexSlot header = readColumnHeader(in, cx, cz);
+            if (header == null) {
+                misses++;
+                deleteQuietly(path);
+                markIndexed(server, dimension, cx, cz, null);
+                return null;
+            }
+            if (!isReadableSlot(header, minimumTimestamp)) {
+                misses++;
+                if (header.timestamp() < minimumTimestamp) {
+                    deleteQuietly(path);
+                    markIndexed(server, dimension, cx, cz, null);
+                } else {
+                    markIndexed(server, dimension, cx, cz, header);
+                }
+                return null;
+            }
+
+            byte[] encodedBytes = in.readNBytes(header.length());
+            if (encodedBytes.length != header.length()) {
+                misses++;
+                deleteQuietly(path);
+                markIndexed(server, dimension, cx, cz, null);
+                return null;
+            }
+
+            if (EncodedColumnData.crc32c(encodedBytes) != header.encodedCrc32c()) {
+                misses++;
+                corruptions++;
+                deleteColumn(server, dimension, cx, cz);
+                VSSLogger.warn("Discarded corrupt persistent LOD column " + cx + "," + cz
+                        + ": compressed-frame CRC32C mismatch");
+                return null;
+            }
+
+            hits++;
+            markIndexed(server, dimension, cx, cz, header);
+            return new Entry(new EncodedColumnData(
+                    cx,
+                    cz,
+                    header.method(),
+                    header.rawSize(),
+                    encodedBytes,
+                    header.timestamp(),
+                    header.schemaVersion(),
+                    ColumnFilters.snapshot().isEmpty(),
+                    header.sectionYs(),
+                    header.sectionLengths(),
+                    header.encodedCrc32c(), new ColumnCoverage(ColumnFilters.snapshot().cacheKey())));
+        } catch (Exception e) {
+            misses++;
+            deleteQuietly(path);
+            markIndexed(server, dimension, cx, cz, null);
+            VSSLogger.debug("Failed to read persistent LOD column " + cx + "," + cz + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    public ArrayList<ExistingColumn> findExistingColumnsInRegion(
+            MinecraftServer server,
+            ResourceKey<Level> dimension,
+            int regionX,
+            int regionZ,
+            int centerCx,
+            int centerCz,
+            int minDistance,
+            int maxDistance,
+            int limit) {
+        ArrayList<ExistingColumn> columns = new ArrayList<>(Math.min(Math.max(0, limit), REGION_SLOT_COUNT));
+        if (!config.enablePersistentColumnCache || limit <= 0 || maxDistance < minDistance) {
+            return columns;
+        }
+
+        refreshCompressionState();
+        RegionKey key = new RegionKey(safeDimension(dimension.identifier()), regionX, regionZ);
+        RegionIndex index = regionIndex(server, key);
+        index.collectReadable(columns, regionX, regionZ, centerCx, centerCz, minDistance, maxDistance);
+        columns.sort(Comparator
+                .comparingInt(ExistingColumn::distance)
+                .thenComparingLong(ExistingColumn::distanceSquared)
+                .thenComparingInt(ExistingColumn::chunkX)
+                .thenComparingInt(ExistingColumn::chunkZ));
+        if (columns.size() > limit) {
+            columns.subList(limit, columns.size()).clear();
+        }
+        return columns;
+    }
+
+    public void write(MinecraftServer server, ResourceKey<Level> dimension, EncodedColumnData columnData) {
+        writeConfirmed(server, dimension, columnData);
+    }
+
+    public boolean writeConfirmed(MinecraftServer server, ResourceKey<Level> dimension, EncodedColumnData columnData) {
+        if (!config.enablePersistentColumnCache
+                || columnData == null
+                || columnData.encodedBytes() == null
+                || !columnData.isDeliverable()
+                || !columnData.coverage().filterKey().equals(ColumnFilters.snapshot().cacheKey())
+                || !isPersistentCompression(columnData.compression())
+                || columnData.rawSize() <= 0
+                || columnData.rawSize() > MAX_COLUMN_BYTES
+                || columnData.encodedBytes().length <= 0
+                || columnData.encodedBytes().length > MAX_ENCODED_COLUMN_BYTES
+                || columnData.schemaVersion() != EncodedColumnData.SCHEMA_VERSION
+                || !columnData.hasValidEncodedCrc32c()) {
+            return false;
+        }
+
+        synchronized (columnLock(dimension, columnData.chunkX(), columnData.chunkZ())) {
+            Path path = columnPath(server, dimension, columnData.chunkX(), columnData.chunkZ());
+            IndexSlot existingSlot = readColumnHeader(path, columnData.chunkX(), columnData.chunkZ());
+            if (existingSlot != null && existingSlot.timestamp() > columnData.columnStamp()) {
+                return true;
+            }
+            Path tmp = path.resolveSibling(path.getFileName() + ".tmp");
+            long previousSize = sizeIfRegular(path);
+            try {
+                Files.createDirectories(path.getParent());
+                try (OutputStream fileOut = Files.newOutputStream(tmp);
+                    DataOutputStream out = new DataOutputStream(fileOut)) {
+                    out.writeInt(FILE_MAGIC);
+                    out.writeInt(FILE_VERSION_CURRENT);
+                    out.writeInt(columnData.chunkX());
+                    out.writeInt(columnData.chunkZ());
+                    out.writeLong(columnData.columnStamp());
+                    out.writeBoolean(columnData.completeColumn());
+                    out.writeInt(columnData.compression());
+                    out.writeInt(columnData.rawSize());
+                    out.writeInt(columnData.schemaVersion());
+                    int[] sectionYs = columnData.sectionYs();
+                    int[] sectionLengths = columnData.sectionLengths();
+                    out.writeInt(sectionYs.length);
+                    for (int i = 0; i < sectionYs.length; i++) {
+                        out.writeByte(sectionYs[i]);
+                        out.writeInt(sectionLengths[i]);
+                    }
+                    out.writeInt(columnData.encodedCrc32c());
+                    out.writeInt(columnData.encodedBytes().length);
+                    out.write(columnData.encodedBytes());
+                }
+                moveIntoPlace(tmp, path);
+                markRegionModified(path.getParent());
+                recordColumnWrite(previousSize, sizeIfRegular(path));
+                markIndexed(server, dimension, columnData.chunkX(), columnData.chunkZ(), IndexSlot.from(columnData));
+                writes++;
+                nextExpiryMillis = Math.min(nextExpiryMillis, System.currentTimeMillis() + retentionMillis());
+                return true;
+            } catch (Exception e) {
+                writeFailures++;
+                deleteQuietly(tmp);
+                VSSLogger.debug("Failed to write persistent LOD column " + columnData.chunkX() + ","
+                        + columnData.chunkZ() + ": " + e.getMessage());
+                return false;
+            }
+        }
+    }
+
+    public void invalidate(MinecraftServer server, ResourceKey<Level> dimension, int cx, int cz) {
+        if (!config.enablePersistentColumnCache) {
+            return;
+        }
+
+        synchronized (columnLock(dimension, cx, cz)) {
+            invalidateInactiveNamespaces(server, dimension, cx, cz, 0L);
+            deleteColumn(server, dimension, cx, cz);
+        }
+    }
+
+    public void invalidateOlderThan(MinecraftServer server, ResourceKey<Level> dimension, int cx, int cz, long minimumInvalidTimestamp) {
+        if (!config.enablePersistentColumnCache) {
+            return;
+        }
+        synchronized (columnLock(dimension, cx, cz)) {
+            // A real world edit invalidates every policy's view of this column.
+            // Otherwise restarting without a filter could resurrect stale full data.
+            invalidateInactiveNamespaces(server, dimension, cx, cz, minimumInvalidTimestamp);
+            if (minimumInvalidTimestamp <= 0L) {
+                deleteColumn(server, dimension, cx, cz);
+                return;
+            }
+
+            RegionIndex index = regionIndex(server, dimension, cx, cz);
+            IndexSlot indexedSlot = index.slot(cx, cz);
+            if (indexedSlot != null && indexedSlot.timestamp() >= minimumInvalidTimestamp) {
+                return;
+            }
+
+            Path path = columnPath(server, dimension, cx, cz);
+            IndexSlot fileSlot = readColumnHeader(path, cx, cz);
+            if (fileSlot != null && fileSlot.timestamp() >= minimumInvalidTimestamp) {
+                markIndexed(server, dimension, cx, cz, fileSlot);
+                return;
+            }
+            deleteColumn(server, dimension, cx, cz);
+            return;
+        }
+    }
+
+    private void invalidateInactiveNamespaces(MinecraftServer server, ResourceKey<Level> dimension,
+            int cx, int cz, long minimumInvalidTimestamp) {
+        Path active = root(server);
+        Path data = server.getWorldPath(LevelResource.ROOT).resolve("data");
+        Path relativeColumn = active.relativize(columnPath(server, dimension, cx, cz));
+        ArrayList<Path> namespaces = new ArrayList<>();
+        namespaces.add(data.resolve(CACHE_DIR));
+        Path filtered = data.resolve(CACHE_DIR + "-filtered");
+        if (Files.isDirectory(filtered, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            try (Stream<Path> children = Files.list(filtered)) {
+                children.filter(path -> path.getFileName().toString().matches("[0-9a-f]{64}"))
+                        .filter(path -> Files.isDirectory(path, java.nio.file.LinkOption.NOFOLLOW_LINKS))
+                        .forEach(namespaces::add);
+            } catch (IOException failure) {
+                VSSLogger.warn("Failed to invalidate inactive column cache namespaces", failure);
+            }
+        }
+        for (Path namespace : namespaces) {
+            if (namespace.equals(active)) continue;
+            Path path = namespace.resolve(relativeColumn);
+            if (!Files.isRegularFile(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) continue;
+            if (minimumInvalidTimestamp > 0L) {
+                // The fixed prefix is shared by full and filtered cache files. Do
+                // not validate an inactive header against the active policy's mode.
+                try (DataInputStream in = new DataInputStream(Files.newInputStream(path))) {
+                    if (in.readInt() == FILE_MAGIC && in.readInt() == FILE_VERSION_CURRENT
+                            && in.readInt() == cx && in.readInt() == cz
+                            && in.readLong() >= minimumInvalidTimestamp) continue;
+                } catch (IOException ignored) {
+                    // A broken old entry must not survive invalidation either.
+                }
+            }
+            if (deleteQuietly(path)) {
+                // Inactive indexes have no in-memory owner; rebuild the region on
+                // next activation rather than editing an index under another mode.
+                deleteQuietly(path.getParent().resolve(INDEX_FILE_NAME));
+            }
+        }
+    }
+
+    private void deleteColumn(MinecraftServer server, ResourceKey<Level> dimension, int cx, int cz) {
+        Path path = columnPath(server, dimension, cx, cz);
+        long previousSize = sizeIfRegular(path);
+        if (deleteQuietly(path)) {
+            recordColumnDelete(previousSize);
+            markIndexed(server, dimension, cx, cz, null);
+            invalidations++;
+        } else if (previousSize == 0L) {
+            markIndexed(server, dimension, cx, cz, null);
+        }
+    }
+
+    public String diagnostics() {
+        return String.format(
+                Locale.ROOT,
+                "persistent={enabled=%s, reads=%d, hits=%d, misses=%d, writes=%d, writeFailures=%d, invalidations=%d, corruptions=%d, cleanupRuns=%d, cleanupDeleted=%d, indexRegions=%d/%d, dirtyIndexes=%d, indexScans=%d, indexMissSkips=%d, indexEvictions=%d}",
+                config.enablePersistentColumnCache,
+                reads,
+                hits,
+                misses,
+                writes,
+                writeFailures,
+                invalidations,
+                corruptions,
+                cleanupRuns,
+                cleanupDeleted,
+                regionIndexCount(),
+                maxRegionIndexCacheEntries(),
+                dirtyIndexCount(),
+                indexScans,
+                indexMissSkips,
+                indexEvictions);
+    }
+
+    public int dirtyIndexCount() {
+        synchronized (this) {
+            return dirtyIndexes.size();
+        }
+    }
+
+    public void flushDirtyIndexes(MinecraftServer server, int limit) {
+        ArrayList<RegionKey> batch = drainDirtyIndexes(limit);
+        for (RegionKey key : batch) {
+            RegionIndex index = cachedRegionIndex(key);
+            if (index != null) {
+                saveIndex(server, key, index);
+            }
+        }
+    }
+
+    public void flushDirtyIndexesBlocking(MinecraftServer server) {
+        while (dirtyIndexCount() > 0) {
+            flushDirtyIndexes(server, Integer.MAX_VALUE);
+        }
+    }
+
+    private synchronized ArrayList<RegionKey> drainDirtyIndexes(int limit) {
+        ArrayList<RegionKey> batch = new ArrayList<>(Math.min(Math.max(1, limit), dirtyIndexes.size()));
+        var iterator = dirtyIndexes.iterator();
+        while (iterator.hasNext() && batch.size() < Math.max(1, limit)) {
+            batch.add(iterator.next());
+            iterator.remove();
+        }
+        return batch;
+    }
+
+    static byte[] decodeStoredBody(byte[] encodedBytes, int method, int rawSize) throws IOException {
+        return LodByteCompression.decompress(encodedBytes, method, rawSize, MAX_COLUMN_BYTES);
+    }
+
+    private static boolean isReadableCompression(int method) {
+        return method == LodByteCompression.METHOD_DEFLATE
+                || method == LodByteCompression.METHOD_ZSTD && LodByteCompression.isZstdAvailable();
+    }
+
+    private static boolean isPersistentCompression(int method) {
+        return method == LodByteCompression.METHOD_DEFLATE
+                || method == LodByteCompression.METHOD_ZSTD;
+    }
+
+    private static boolean isPersistentSlot(IndexSlot slot) {
+        return slot != null
+                && isPersistentCompression(slot.method())
+                && slot.rawSize() > 0
+                && slot.rawSize() <= MAX_COLUMN_BYTES
+                && slot.schemaVersion() == EncodedColumnData.SCHEMA_VERSION
+                && slot.length() > 0
+                && slot.length() <= MAX_ENCODED_COLUMN_BYTES
+                && validSectionManifest(slot);
+    }
+
+    private static boolean validSectionManifest(IndexSlot slot) {
+        int[] sectionYs = slot.sectionYs();
+        int[] sectionLengths = slot.sectionLengths();
+        if (sectionYs.length != sectionLengths.length || sectionYs.length > 64) {
+            return false;
+        }
+        long rawSize = varIntSize(sectionYs.length);
+        for (int i = 0; i < sectionYs.length; i++) {
+            if (i > 0 && sectionYs[i] <= sectionYs[i - 1] || sectionLengths[i] <= 0) {
+                return false;
+            }
+            rawSize += sectionLengths[i];
+        }
+        return rawSize == slot.rawSize();
+    }
+
+    private static int varIntSize(int value) {
+        int bytes = 1;
+        while ((value & ~0x7F) != 0) {
+            value >>>= 7;
+            bytes++;
+        }
+        return bytes;
+    }
+
+    private static boolean isReadableSlot(IndexSlot slot, long minimumTimestamp) {
+        return isPersistentSlot(slot)
+                && slot.timestamp() >= minimumTimestamp
+                && isReadableCompression(slot.method());
+    }
+
+    private long retentionMillis() {
+        return java.util.concurrent.TimeUnit.DAYS.toMillis(Math.max(1, Math.min(7, config.persistentColumnCacheRetentionDays)));
+    }
+
+    private boolean expiredFile(Path path, long now) {
+        try { return now - Files.getLastModifiedTime(path).toMillis() >= retentionMillis(); }
+        catch (IOException e) { return true; }
+    }
+
+    /** Called by the disk maintenance task, including when no columns are being written. */
+    public void maintain(MinecraftServer server) {
+        long now = System.currentTimeMillis();
+        if (!enabled() || now < nextCleanupMillis || !cleanupRunning.compareAndSet(false, true)) return;
+        try {
+            nextCleanupMillis = now + 60_000L;
+            if (observedRetentionDays != config.persistentColumnCacheRetentionDays) {
+                observedRetentionDays = config.persistentColumnCacheRetentionDays;
+                nextExpiryMillis = 0L;
+            }
+            if (isKnownCacheWithinLimits() && now < nextExpiryMillis) return;
+            cleanupRoot(root(server), now, path -> removeIndexedPath(server, path));
+        } finally { cleanupRunning.set(false); }
+    }
+
+    // Kept independent of a live MinecraftServer so actual file eviction can be tested.
+    void cleanupRoot(Path root, long now, java.util.function.Consumer<Path> removed) {
+        if (!Files.isDirectory(root)) return;
+        long maxBytes = (long) config.persistentColumnCacheMaxMiB * VSSServerConfig.BYTES_PER_MIB;
+        int maxEntries = config.persistentColumnCacheMaxEntries;
+        ArrayList<FileEntry> entries = new ArrayList<>();
+        long scanMutation;
+        synchronized (this) { scanMutation = cacheMutation; }
+        long totalBytes = 0L;
+        long earliestExpiry = Long.MAX_VALUE;
+        try (Stream<Path> stream = Files.walk(root)) {
+            var iterator = stream.filter(path -> Files.isRegularFile(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    && path.getFileName().toString().endsWith(COLUMN_EXTENSION)).iterator();
+            while (iterator.hasNext()) {
+                Path path = iterator.next();
+                try {
+                    long size = Files.size(path), modified = Files.getLastModifiedTime(path).toMillis();
+                    entries.add(new FileEntry(path, size, modified));
+                    totalBytes += size;
+                    earliestExpiry = Math.min(earliestExpiry, modified + retentionMillis());
+                } catch (java.nio.file.NoSuchFileException ignored) { }
+            }
+        } catch (IOException | java.io.UncheckedIOException e) {
+            invalidateCacheLedger();
+            VSSLogger.debug("Failed to scan persistent LOD cache: " + e.getMessage());
+            return;
+        }
+        entries.sort(Comparator.comparingLong(FileEntry::lastAccessMillis));
+        long bytes = totalBytes;
+        int count = entries.size();
+        cleanupRuns++;
+        for (FileEntry entry : entries) {
+            if (bytes <= maxBytes && count <= maxEntries && now - entry.lastAccessMillis() < retentionMillis()) break;
+            // Match the writer's stripe, then revalidate: a rewrite during the scan
+            // must not let maintenance delete freshly generated data.
+            synchronized (columnLockForPath(root, entry.path())) {
+                try {
+                    if (!Files.isRegularFile(entry.path())
+                            || Files.getLastModifiedTime(entry.path()).toMillis() != entry.lastAccessMillis()
+                            || Files.size(entry.path()) != entry.sizeBytes()) continue;
+                    if (Files.deleteIfExists(entry.path())) {
+                        bytes -= entry.sizeBytes(); count--; cleanupDeleted++;
+                        removed.accept(entry.path());
+                    }
+                } catch (IOException e) { VSSLogger.debug("Persistent LOD cleanup failed: " + e.getMessage()); }
+            }
+        }
+        synchronized (this) {
+            // Keep an accurate fast path while idle; concurrent writes force a later rescan.
+            if (cacheMutation == scanMutation) setCacheLedger(bytes, count);
+            else invalidateCacheLedger();
+            nextExpiryMillis = earliestExpiry;
+        }
+    }
+
+    private Object columnLockForPath(Path root, Path path) {
+        Path relative = root.relativize(path);
+        String name = path.getFileName().toString();
+        int split = name.lastIndexOf('_');
+        try {
+            int cx = Integer.parseInt(name.substring(0, split));
+            int cz = Integer.parseInt(name.substring(split + 1, name.length() - COLUMN_EXTENSION.length()));
+            int hash = 31 * (31 * relative.getName(0).toString().hashCode() + cx) + cz;
+            return columnLocks[Math.floorMod(hash, columnLocks.length)];
+        } catch (RuntimeException e) { return columnLocks[0]; }
+    }
+
+    private synchronized boolean isKnownCacheWithinLimits() {
+        if (knownCacheBytes < 0L || knownCacheEntries < 0) {
+            return false;
+        }
+        long maxBytes = (long) config.persistentColumnCacheMaxMiB * VSSServerConfig.BYTES_PER_MIB;
+        return knownCacheBytes <= maxBytes && knownCacheEntries <= config.persistentColumnCacheMaxEntries;
+    }
+
+    private synchronized void setCacheLedger(long bytes, int entries) {
+        knownCacheBytes = Math.max(0L, bytes);
+        knownCacheEntries = Math.max(0, entries);
+    }
+
+    private synchronized void recordColumnWrite(long previousSize, long newSize) {
+        cacheMutation++;
+        if (previousSize < 0L || newSize < 0L || knownCacheBytes < 0L || knownCacheEntries < 0) {
+            invalidateCacheLedger();
+            return;
+        }
+        knownCacheBytes = Math.max(0L, knownCacheBytes - previousSize + newSize);
+        if (previousSize == 0L && newSize > 0L) {
+            knownCacheEntries++;
+        }
+    }
+
+    private synchronized void recordColumnDelete(long previousSize) {
+        cacheMutation++;
+        if (previousSize < 0L || knownCacheBytes < 0L || knownCacheEntries < 0) {
+            invalidateCacheLedger();
+            return;
+        }
+        if (previousSize > 0L) {
+            knownCacheBytes = Math.max(0L, knownCacheBytes - previousSize);
+            knownCacheEntries = Math.max(0, knownCacheEntries - 1);
+        }
+    }
+
+    private synchronized void invalidateCacheLedger() {
+        cacheMutation++;
+        knownCacheBytes = -1L;
+        knownCacheEntries = -1;
+    }
+
+    private void refreshCompressionState() {
+        boolean zstdAvailable = LodByteCompression.isZstdAvailable();
+        if (indexedZstdAvailable != zstdAvailable) {
+            synchronized (this) {
+                if (indexedZstdAvailable != zstdAvailable) {
+                    regionIndexes.clear();
+                    indexedZstdAvailable = zstdAvailable;
+                }
+            }
+        }
+    }
+
+    private void markIndexed(MinecraftServer server, ResourceKey<Level> dimension, int cx, int cz, IndexSlot slot) {
+        RegionKey key = RegionKey.of(dimension.identifier(), cx, cz);
+        synchronized (regionLock(key)) {
+            RegionIndex index = regionIndex(server, key);
+            boolean changed = slot == null ? index.remove(cx, cz) : index.put(cx, cz, slot);
+            if (changed) {
+                synchronized (this) {
+                    dirtyIndexes.add(key);
+                }
+            }
+        }
+    }
+
+    private RegionIndex regionIndex(MinecraftServer server, ResourceKey<Level> dimension, int cx, int cz) {
+        return regionIndex(server, RegionKey.of(dimension.identifier(), cx, cz));
+    }
+
+    private RegionIndex regionIndex(MinecraftServer server, RegionKey key) {
+        synchronized (regionLock(key)) {
+            refreshCompressionState();
+            RegionIndex cached = cachedRegionIndex(key);
+            if (cached != null) {
+                return cached;
+            }
+
+            RegionIndex loaded = loadOrScanRegion(server, key);
+            return cacheRegionIndex(key, loaded);
+        }
+    }
+
+    private synchronized RegionIndex cachedRegionIndex(RegionKey key) {
+        return regionIndexes.get(key);
+    }
+
+    private synchronized RegionIndex cacheRegionIndex(RegionKey key, RegionIndex index) {
+        RegionIndex cached = regionIndexes.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        regionIndexes.put(key, index);
+        int maxEntries = maxRegionIndexCacheEntries();
+        while (regionIndexes.size() > maxEntries) {
+            var iterator = regionIndexes.entrySet().iterator();
+            if (!iterator.hasNext()) {
+                return index;
+            }
+            iterator.next();
+            iterator.remove();
+            indexEvictions++;
+        }
+        return index;
+    }
+
+    private int maxRegionIndexCacheEntries() {
+        int regionRing = Math.max(0, (config.effectiveColumnSyncDistanceChunks() + REGION_SIZE - 1) / REGION_SIZE);
+        long windowDiameter = (long) regionRing * 2L + 1L;
+        long activeWindow = windowDiameter * windowDiameter;
+        long target = activeWindow * 3L / 2L + 64L;
+        return (int) Math.max(
+                MIN_REGION_INDEX_CACHE_ENTRIES,
+                Math.min(MAX_REGION_INDEX_CACHE_ENTRIES, target));
+    }
+
+    private Object columnLock(ResourceKey<Level> dimension, int cx, int cz) {
+        int hash = safeDimension(dimension.identifier()).hashCode();
+        hash = 31 * hash + cx;
+        hash = 31 * hash + cz;
+        return columnLocks[Math.floorMod(hash, columnLocks.length)];
+    }
+
+    private Object regionLock(RegionKey key) {
+        int hash = key.dimension().hashCode();
+        hash = 31 * hash + key.regionX();
+        hash = 31 * hash + key.regionZ();
+        return regionLocks[Math.floorMod(hash, regionLocks.length)];
+    }
+
+    private static Object[] createLocks(int count) {
+        Object[] locks = new Object[count];
+        for (int i = 0; i < locks.length; i++) {
+            locks[i] = new Object();
+        }
+        return locks;
+    }
+
+    private synchronized void clearRegionIndexes() {
+        regionIndexes.clear();
+    }
+
+    private synchronized int regionIndexCount() {
+        return regionIndexes.size();
+    }
+
+    private RegionIndex loadOrScanRegion(MinecraftServer server, RegionKey key) {
+        RegionIndex loaded = loadIndex(server, key);
+        if (loaded != null) {
+            return loaded;
+        }
+
+        indexScans++;
+        RegionIndex scanned = scanRegion(server, key);
+        if (Files.isDirectory(regionDir(server, key))) {
+            saveIndex(server, key, scanned);
+        }
+        return scanned;
+    }
+
+    private RegionIndex loadIndex(MinecraftServer server, RegionKey key) {
+        Path path = regionIndexPath(server, key);
+        if (!Files.isRegularFile(path)) {
+            return null;
+        }
+        if (isIndexOlderThanRegionDirectory(path, regionDir(server, key))) {
+            deleteQuietly(path);
+            return null;
+        }
+
+        try (InputStream fileIn = Files.newInputStream(path);
+             DataInputStream in = new DataInputStream(fileIn)) {
+            if (in.readInt() != INDEX_MAGIC
+                    || in.readInt() != INDEX_VERSION_CURRENT
+                    || in.readInt() != FILE_VERSION_CURRENT
+                    || in.readInt() != EncodedColumnData.SCHEMA_VERSION
+                    || in.readInt() != key.regionX()
+                    || in.readInt() != key.regionZ()) {
+                deleteQuietly(path);
+                return null;
+            }
+
+            long[] bitmap = new long[REGION_BITMAP_LONGS];
+            for (int i = 0; i < REGION_BITMAP_LONGS; i++) {
+                bitmap[i] = in.readLong();
+            }
+
+            RegionIndex index = new RegionIndex();
+            for (int localIndex = 0; localIndex < REGION_SLOT_COUNT; localIndex++) {
+                if (!RegionIndex.hasBit(bitmap, localIndex)) {
+                    continue;
+                }
+                long timestamp = in.readLong();
+                int method = in.readInt();
+                int rawSize = in.readInt();
+                int schemaVersion = in.readInt();
+                int sectionCount = in.readUnsignedByte();
+                SectionManifest manifest = readSectionManifest(in, sectionCount);
+                int encodedCrc32c = in.readInt();
+                int length = in.readInt();
+                IndexSlot slot = new IndexSlot(
+                        timestamp,
+                        method,
+                        rawSize,
+                        schemaVersion,
+                        length,
+                        manifest.sectionYs(),
+                        manifest.sectionLengths(),
+                        encodedCrc32c);
+                if (!isPersistentSlot(slot)) {
+                    deleteQuietly(path);
+                    return null;
+                }
+                index.putLocal(localIndex, slot);
+            }
+            return index;
+        } catch (Exception e) {
+            deleteQuietly(path);
+            return null;
+        }
+    }
+
+    private void saveIndex(MinecraftServer server, RegionKey key, RegionIndex index) {
+        Path path = regionIndexPath(server, key);
+        Path tmp = path.resolveSibling(path.getFileName() + ".tmp");
+        try {
+            Files.createDirectories(path.getParent());
+            try (OutputStream fileOut = Files.newOutputStream(tmp);
+                 DataOutputStream out = new DataOutputStream(fileOut)) {
+                out.writeInt(INDEX_MAGIC);
+                out.writeInt(INDEX_VERSION_CURRENT);
+                out.writeInt(FILE_VERSION_CURRENT);
+                out.writeInt(EncodedColumnData.SCHEMA_VERSION);
+                out.writeInt(key.regionX());
+                out.writeInt(key.regionZ());
+                index.writeTo(out);
+            }
+            moveIntoPlace(tmp, path);
+            markIndexFresh(path, path.getParent());
+        } catch (IOException e) {
+            deleteQuietly(tmp);
+            VSSLogger.debug("Failed to write persistent LOD region index " + key.regionX() + ","
+                    + key.regionZ() + ": " + e.getMessage());
+        }
+    }
+
+    private RegionIndex scanRegion(MinecraftServer server, RegionKey key) {
+        RegionIndex index = new RegionIndex();
+        Path regionDir = regionDir(server, key);
+        if (!Files.isDirectory(regionDir)) {
+            return index;
+        }
+
+        try (Stream<Path> stream = Files.list(regionDir)) {
+            var iterator = stream.filter(Files::isRegularFile).iterator();
+            while (iterator.hasNext()) {
+                Path path = iterator.next();
+                String fileName = path.getFileName().toString();
+                if (!fileName.endsWith(COLUMN_EXTENSION)) {
+                    if (!fileName.equals(INDEX_FILE_NAME) && !fileName.endsWith(".tmp")) {
+                        deleteQuietly(path);
+                    }
+                    continue;
+                }
+
+                PositionKey position = parsePositionKey(fileName);
+                if (position == null) {
+                    continue;
+                }
+                IndexSlot slot = readColumnHeader(path, position.chunkX(), position.chunkZ());
+                if (isPersistentSlot(slot)) {
+                    index.put(position.chunkX(), position.chunkZ(), slot);
+                }
+            }
+        } catch (IOException e) {
+            VSSLogger.debug("Failed to index persistent LOD region " + key.regionX() + "," + key.regionZ()
+                    + ": " + e.getMessage());
+        }
+        return index;
+    }
+
+    private void removeIndexedPath(MinecraftServer server, Path path) {
+        Path root = root(server);
+        Path relative;
+        try {
+            relative = root.relativize(path);
+        } catch (IllegalArgumentException e) {
+            return;
+        }
+        if (relative.getNameCount() < 3) {
+            return;
+        }
+
+        String dimensionName = relative.getName(0).toString();
+        String regionName = relative.getName(1).toString();
+        String fileName = relative.getName(2).toString();
+        int separator = regionName.lastIndexOf('_');
+        if (separator <= 0) {
+            return;
+        }
+        try {
+            int regionX = Integer.parseInt(regionName.substring(0, separator));
+            int regionZ = Integer.parseInt(regionName.substring(separator + 1));
+            PositionKey position = parsePositionKey(fileName);
+            if (position == null) {
+                return;
+            }
+            RegionKey key = new RegionKey(dimensionName, regionX, regionZ);
+            synchronized (regionLock(key)) {
+                RegionIndex index = regionIndex(server, key);
+                if (index.remove(position.chunkX(), position.chunkZ())) {
+                    synchronized (this) {
+                        dirtyIndexes.add(key);
+                    }
+                }
+            }
+        } catch (NumberFormatException ignored) {
+        }
+    }
+
+    private IndexSlot readColumnHeader(Path path, int cx, int cz) {
+        if (!Files.isRegularFile(path)) return null;
+        try (InputStream fileIn = Files.newInputStream(path);
+             DataInputStream in = new DataInputStream(fileIn)) {
+            return readColumnHeader(in, cx, cz);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private IndexSlot readColumnHeader(DataInputStream in, int cx, int cz) throws IOException {
+        if (in.readInt() != FILE_MAGIC || in.readInt() != FILE_VERSION_CURRENT) {
+            return null;
+        }
+
+        int storedCx = in.readInt();
+        int storedCz = in.readInt();
+        long timestamp = in.readLong();
+        boolean completeColumn = in.readBoolean();
+        int method = in.readInt();
+        int rawSize = in.readInt();
+        int schemaVersion = in.readInt();
+        int sectionCount = in.readInt();
+        SectionManifest manifest = readSectionManifest(in, sectionCount);
+        int encodedCrc32c = in.readInt();
+        int length = in.readInt();
+        if (storedCx != cx || storedCz != cz || completeColumn != ColumnFilters.snapshot().isEmpty()) {
+            return null;
+        }
+        IndexSlot slot = new IndexSlot(
+                timestamp,
+                method,
+                rawSize,
+                schemaVersion,
+                length,
+                manifest.sectionYs(),
+                manifest.sectionLengths(),
+                encodedCrc32c);
+        return isPersistentSlot(slot) ? slot : null;
+    }
+
+    private static PositionKey parsePositionKey(String fileName) {
+        if (!fileName.endsWith(COLUMN_EXTENSION)) {
+            return null;
+        }
+        String stem = fileName.substring(0, fileName.length() - COLUMN_EXTENSION.length());
+        int separator = stem.lastIndexOf('_');
+        if (separator <= 0) {
+            return null;
+        }
+        try {
+            int cx = Integer.parseInt(stem.substring(0, separator));
+            int cz = Integer.parseInt(stem.substring(separator + 1));
+            return PositionKey.of(cx, cz);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private Path columnPath(MinecraftServer server, ResourceKey<Level> dimension, int cx, int cz) {
+        RegionKey key = RegionKey.of(dimension.identifier(), cx, cz);
+        return regionDir(server, key).resolve(cx + "_" + cz + COLUMN_EXTENSION);
+    }
+
+    private Path regionDir(MinecraftServer server, RegionKey key) {
+        return root(server)
+                .resolve(key.dimension())
+                .resolve(key.regionX() + "_" + key.regionZ());
+    }
+
+    private Path regionIndexPath(MinecraftServer server, RegionKey key) {
+        return regionDir(server, key).resolve(INDEX_FILE_NAME);
+    }
+
+    private Path root(MinecraftServer server) {
+        Path data = server.getWorldPath(LevelResource.ROOT).resolve("data");
+        String key = ColumnFilters.snapshot().cacheKey();
+        return key.isEmpty() ? data.resolve(CACHE_DIR)
+                : data.resolve(CACHE_DIR + "-filtered").resolve(key);
+    }
+
+    private static String safeDimension(Identifier location) {
+        return location.getNamespace() + "_" + location.getPath().replace('/', '_').replace('\\', '_').replace(':', '_');
+    }
+
+    private static long lastAccessMillis(Path path) throws IOException {
+        return Files.getLastModifiedTime(path).toMillis();
+    }
+
+    private static long sizeIfRegular(Path path) {
+        try {
+            return Files.isRegularFile(path) ? Files.size(path) : 0L;
+        } catch (IOException e) {
+            return -1L;
+        }
+    }
+
+    private static boolean deleteQuietly(Path path) {
+        if (!Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return false;
+        try {
+            return Files.deleteIfExists(path);
+        } catch (IOException ignored) {
+            return false;
+        }
+    }
+
+    private static void moveIntoPlace(Path tmp, Path path) throws IOException {
+        try {
+            Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private static boolean isIndexOlderThanRegionDirectory(Path indexPath, Path regionDir) {
+        try {
+            return Files.isDirectory(regionDir)
+                    && Files.getLastModifiedTime(regionDir).compareTo(Files.getLastModifiedTime(indexPath)) > 0;
+        } catch (IOException e) {
+            return true;
+        }
+    }
+
+    private static void markIndexFresh(Path indexPath, Path regionDir) throws IOException {
+        long timestamp = System.currentTimeMillis();
+        if (Files.isDirectory(regionDir)) {
+            timestamp = Math.max(timestamp, Files.getLastModifiedTime(regionDir).toMillis());
+        }
+        Files.setLastModifiedTime(indexPath, FileTime.fromMillis(timestamp));
+    }
+
+    private static void markRegionModified(Path regionDir) throws IOException {
+        long previous = Files.getLastModifiedTime(regionDir).toMillis();
+        Files.setLastModifiedTime(
+                regionDir,
+                FileTime.fromMillis(Math.max(System.currentTimeMillis(), previous + 1L)));
+    }
+
+    private record FileEntry(Path path, long sizeBytes, long lastAccessMillis) {
+    }
+
+    private record RegionKey(String dimension, int regionX, int regionZ) {
+        static RegionKey of(Identifier dimension, int cx, int cz) {
+            return new RegionKey(safeDimension(dimension), Math.floorDiv(cx, REGION_SIZE), Math.floorDiv(cz, REGION_SIZE));
+        }
+    }
+
+    private record PositionKey(int chunkX, int chunkZ) {
+        static PositionKey of(int cx, int cz) {
+            return new PositionKey(cx, cz);
+        }
+    }
+
+    private static SectionManifest readSectionManifest(DataInputStream in, int sectionCount) throws IOException {
+        if (sectionCount < 0 || sectionCount > 64) {
+            throw new IOException("Invalid persistent LOD section manifest size: " + sectionCount);
+        }
+        int[] sectionYs = new int[sectionCount];
+        int[] sectionLengths = new int[sectionCount];
+        for (int i = 0; i < sectionCount; i++) {
+            sectionYs[i] = in.readByte();
+            sectionLengths[i] = in.readInt();
+            if (i > 0 && sectionYs[i] <= sectionYs[i - 1]) {
+                throw new IOException("Persistent LOD section manifest is not strictly ordered");
+            }
+            if (sectionLengths[i] <= 0 || sectionLengths[i] > MAX_COLUMN_BYTES) {
+                throw new IOException("Invalid persistent LOD section length: " + sectionLengths[i]);
+            }
+        }
+        return new SectionManifest(sectionYs, sectionLengths);
+    }
+
+    private record SectionManifest(int[] sectionYs, int[] sectionLengths) {
+    }
+
+    private record IndexSlot(
+            long timestamp,
+            int method,
+            int rawSize,
+            int schemaVersion,
+            int length,
+            int[] sectionYs,
+            int[] sectionLengths,
+            int encodedCrc32c) {
+        private IndexSlot {
+            sectionYs = sectionYs != null ? sectionYs.clone() : new int[0];
+            sectionLengths = sectionLengths != null ? sectionLengths.clone() : new int[0];
+        }
+
+        @Override
+        public int[] sectionYs() {
+            return sectionYs.clone();
+        }
+
+        @Override
+        public int[] sectionLengths() {
+            return sectionLengths.clone();
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof IndexSlot slot
+                    && timestamp == slot.timestamp
+                    && method == slot.method
+                    && rawSize == slot.rawSize
+                    && schemaVersion == slot.schemaVersion
+                    && length == slot.length
+                    && encodedCrc32c == slot.encodedCrc32c
+                    && Arrays.equals(sectionYs, slot.sectionYs)
+                    && Arrays.equals(sectionLengths, slot.sectionLengths);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Long.hashCode(timestamp);
+            result = 31 * result + method;
+            result = 31 * result + rawSize;
+            result = 31 * result + schemaVersion;
+            result = 31 * result + length;
+            result = 31 * result + Arrays.hashCode(sectionYs);
+            result = 31 * result + Arrays.hashCode(sectionLengths);
+            return 31 * result + encodedCrc32c;
+        }
+
+        static IndexSlot from(EncodedColumnData columnData) {
+            return new IndexSlot(
+                    columnData.columnStamp(),
+                    columnData.compression(),
+                    columnData.rawSize(),
+                    columnData.schemaVersion(),
+                    columnData.encodedBytes().length,
+                    columnData.sectionYs(),
+                    columnData.sectionLengths(),
+                    columnData.encodedCrc32c());
+        }
+    }
+
+    public record ExistingColumn(int chunkX, int chunkZ, long timestamp, int distance, long distanceSquared) {
+    }
+
+    private static final class RegionIndex {
+        private final long[] presentBitmap = new long[REGION_BITMAP_LONGS];
+        private final IndexSlot[] slots = new IndexSlot[REGION_SLOT_COUNT];
+
+        synchronized IndexSlot slot(int cx, int cz) {
+            int localIndex = localIndex(cx, cz);
+            return hasBit(presentBitmap, localIndex) ? slots[localIndex] : null;
+        }
+
+        synchronized boolean put(int cx, int cz, IndexSlot slot) {
+            return putLocal(localIndex(cx, cz), slot);
+        }
+
+        synchronized boolean putLocal(int localIndex, IndexSlot slot) {
+            IndexSlot previous = hasBit(presentBitmap, localIndex) ? slots[localIndex] : null;
+            if (slot.equals(previous)) {
+                return false;
+            }
+            slots[localIndex] = slot;
+            setBit(presentBitmap, localIndex);
+            return true;
+        }
+
+        synchronized boolean remove(int cx, int cz) {
+            int localIndex = localIndex(cx, cz);
+            if (!hasBit(presentBitmap, localIndex)) {
+                return false;
+            }
+            slots[localIndex] = null;
+            clearBit(presentBitmap, localIndex);
+            return true;
+        }
+
+        synchronized void writeTo(DataOutputStream out) throws IOException {
+            for (long bits : presentBitmap) {
+                out.writeLong(bits);
+            }
+            for (int i = 0; i < REGION_SLOT_COUNT; i++) {
+                if (!hasBit(presentBitmap, i)) {
+                    continue;
+                }
+                IndexSlot slot = slots[i];
+                out.writeLong(slot.timestamp());
+                out.writeInt(slot.method());
+                out.writeInt(slot.rawSize());
+                out.writeInt(slot.schemaVersion());
+                out.writeByte(slot.sectionYs().length);
+                int[] sectionYs = slot.sectionYs();
+                int[] sectionLengths = slot.sectionLengths();
+                for (int sectionIndex = 0; sectionIndex < sectionYs.length; sectionIndex++) {
+                    out.writeByte(sectionYs[sectionIndex]);
+                    out.writeInt(sectionLengths[sectionIndex]);
+                }
+                out.writeInt(slot.encodedCrc32c());
+                out.writeInt(slot.length());
+            }
+        }
+
+        synchronized void collectReadable(
+                ArrayList<ExistingColumn> output,
+                int regionX,
+                int regionZ,
+                int centerCx,
+                int centerCz,
+                int minDistance,
+                int maxDistance) {
+            int baseX = regionX * REGION_SIZE;
+            int baseZ = regionZ * REGION_SIZE;
+            for (int localIndex = 0; localIndex < REGION_SLOT_COUNT; localIndex++) {
+                if (!hasBit(presentBitmap, localIndex)) {
+                    continue;
+                }
+                IndexSlot slot = slots[localIndex];
+                if (!isReadableSlot(slot, 0L)) {
+                    continue;
+                }
+                int cx = baseX + (localIndex & (REGION_SIZE - 1));
+                int cz = baseZ + (localIndex >>> 5);
+                int dx = cx - centerCx;
+                int dz = cz - centerCz;
+                int distance = Math.max(Math.abs(dx), Math.abs(dz));
+                if (distance < minDistance || distance > maxDistance) {
+                    continue;
+                }
+                long distanceSquared = (long) dx * dx + (long) dz * dz;
+                output.add(new ExistingColumn(cx, cz, slot.timestamp(), distance, distanceSquared));
+            }
+        }
+
+        private static int localIndex(int cx, int cz) {
+            return (cx & (REGION_SIZE - 1)) | ((cz & (REGION_SIZE - 1)) << 5);
+        }
+
+        private static boolean hasBit(long[] bitmap, int index) {
+            return (bitmap[index >>> 6] & (1L << (index & 63))) != 0L;
+        }
+
+        private static void setBit(long[] bitmap, int index) {
+            bitmap[index >>> 6] |= 1L << (index & 63);
+        }
+
+        private static void clearBit(long[] bitmap, int index) {
+            bitmap[index >>> 6] &= ~(1L << (index & 63));
+        }
+    }
+
+    public record Entry(EncodedColumnData columnData) {
+        public long timestamp() {
+            return columnData.columnStamp();
+        }
+    }
+}

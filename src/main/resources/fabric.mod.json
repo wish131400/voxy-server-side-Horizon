@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "vss",
+  "version": "${version}",
+  "name": "Voxy Server Side Horizon",
+  "description": "Synchronizes server chunk columns to Voxy and predicts distant terrain on Fabric.",
+  "authors": ["Xantha", "VoX", "wish"],
+  "contact": {"sources": "https://github.com/wish131400/voxy-server-side-Horizon", "issues": "https://github.com/wish131400/voxy-server-side-Horizon/issues"},
+  "license": "MIT",
+  "icon": "icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["dev.xantha.vss.VSSMod"],
+    "client": ["dev.xantha.vss.client.VSSClientBootstrap"],
+    "modmenu": ["dev.xantha.vss.client.VSSModMenuIntegration"]
+  },
+  "mixins": ["vss.compat.mixins.json", "vss.strict.mixins.json", "vss.lostcities.mixins.json"],
+  "accessWidener": "vss.accesswidener",
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "minecraft": "${minecraft_version}",
+    "java": ">=${java_version}",
+    "fabric-api": ">=${fabric_version}"
+  },
+  "suggests": {"voxy": "*", "modmenu": "*"}
+}

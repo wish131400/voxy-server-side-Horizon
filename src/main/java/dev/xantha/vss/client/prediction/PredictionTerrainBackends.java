@@ -1,0 +1,57 @@
+package dev.xantha.vss.client.prediction;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
+import net.minecraft.core.RegistryAccess;
+import dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionProfile;
+
+/** Registry used by VSS-compatible terrain mods to provide predictive samplers. */
+public final class PredictionTerrainBackends {
+    private static final List<PredictionTerrainBackend> BACKENDS = new CopyOnWriteArrayList<>();
+
+    private PredictionTerrainBackends() {
+    }
+
+    public static void register(PredictionTerrainBackend backend) {
+        if (backend == null) throw new IllegalArgumentException("backend is null");
+        BACKENDS.removeIf(existing -> existing.id().equals(backend.id()));
+        BACKENDS.add(backend);
+        BACKENDS.sort(Comparator.comparingInt(PredictionTerrainBackend::priority).reversed());
+    }
+    public static void unregister(String id) { BACKENDS.removeIf(backend -> backend.id().equals(id)); }
+
+    public static Optional<ClientTerrainSampler> open(DimensionProfile profile, long seed,
+                                                      RegistryAccess registries) {
+        return open(profile, seed, registries, null);
+    }
+
+    public static Optional<ClientTerrainSampler> open(DimensionProfile profile, long seed,
+                                                      RegistryAccess registries,
+                                                      ClientWorldgenRegistries worldgen) {
+        return open(profile, seed, registries, worldgen, null);
+    }
+    static Optional<ClientTerrainSampler> open(DimensionProfile profile, long seed,
+            RegistryAccess registries, ClientWorldgenRegistries worldgen, RustWorldgenDocument.SharedInputs inputs) {
+        for (PredictionTerrainBackend backend : BACKENDS) {
+            try {
+                Optional<ClientTerrainSampler> result = backend.open(profile, seed, registries, worldgen, inputs);
+                if (result.isPresent()) {
+                    result.get().terrainBackendOverride(backend.id());
+                    return result;
+                }
+            } catch (java.util.concurrent.CancellationException cancelled) {
+                throw cancelled;
+            } catch (RuntimeException | LinkageError failure) {
+                dev.xantha.vss.common.VSSLogger.warn("VSS optional terrain backend " + backend.id() + " unavailable", failure);
+            }
+        }
+        return Optional.empty();
+    }
+
+    public static List<PredictionTerrainBackend> snapshot() {
+        return List.copyOf(new ArrayList<>(BACKENDS));
+    }
+}

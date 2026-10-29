@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "vss_smoke",
+  "version": "1.0.0",
+  "name": "VSS Client Initialization Smoke Test",
+  "description": "Development-only client startup and title-screen verification.",
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["dev.xantha.vss.smoke.VSSClientSmoke"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "fabric-api": "*",
+    "minecraft": "*",
+    "java": ">=21"
+  }
+}

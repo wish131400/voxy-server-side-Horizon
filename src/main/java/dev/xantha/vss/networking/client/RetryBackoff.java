@@ -1,0 +1,80 @@
+package dev.xantha.vss.networking.client;
+
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import java.util.function.LongSupplier;
+
+final class RetryBackoff {
+    private final Long2LongOpenHashMap retryAfterNanos = new Long2LongOpenHashMap();
+    private final Long2IntOpenHashMap retryAttempts = new Long2IntOpenHashMap();
+    private final Long2IntOpenHashMap backpressureAttempts = new Long2IntOpenHashMap();
+    private final Long2IntOpenHashMap timeoutAttempts = new Long2IntOpenHashMap();
+    private final LongSupplier nanoClock;
+    private final RetryBackoffPolicy policy;
+
+    RetryBackoff(
+            LongSupplier nanoClock,
+            RetryBackoffPolicy policy) {
+        this.nanoClock = nanoClock;
+        this.policy = policy;
+        retryAfterNanos.defaultReturnValue(0L);
+        retryAttempts.defaultReturnValue(0);
+    }
+
+    boolean isCoolingDown(long packed, long now) {
+        long retryAfter = retryAfterNanos.get(packed);
+        if (retryAfter <= 0L) {
+            return false;
+        }
+        if (retryAfter > now) {
+            return true;
+        }
+        retryAfterNanos.remove(packed);
+        return false;
+    }
+
+    void markBackoff(long packed, boolean dirtyRefresh, boolean generationCandidate) {
+        int previousAttempts = retryAttempts.get(packed);
+        int attempts = previousAttempts == Integer.MAX_VALUE ? Integer.MAX_VALUE : previousAttempts + 1;
+        retryAttempts.put(packed, attempts);
+        long delay = policy.retryDelay(dirtyRefresh, generationCandidate, attempts);
+        retryAfterNanos.put(packed, nanoClock.getAsLong() + delay);
+    }
+
+    void markRateLimited(long packed) {
+        markTransientDelay(packed, policy.retryDelay(false, false, 1));
+    }
+
+    void markBackpressure(long packed) {
+        int attempt = Math.min(4, backpressureAttempts.get(packed) + 1);
+        backpressureAttempts.put(packed, attempt);
+        long base = policy.backpressureDelayNanos();
+        long multiplier = 1L << (attempt - 1);
+        markTransientDelay(packed, base > Long.MAX_VALUE / multiplier ? Long.MAX_VALUE : base * multiplier);
+    }
+
+    void markTimeout(long packed) {
+        int attempts = Math.min(5, timeoutAttempts.get(packed) + 1);
+        timeoutAttempts.put(packed, attempts);
+        markTransientDelay(packed, policy.retryDelay(false, false, attempts));
+    }
+
+    void clear(long packed) {
+        retryAfterNanos.remove(packed);
+        retryAttempts.remove(packed);
+        backpressureAttempts.remove(packed);
+        timeoutAttempts.remove(packed);
+    }
+
+    void clearAll() {
+        retryAfterNanos.clear();
+        retryAttempts.clear();
+        backpressureAttempts.clear();
+        timeoutAttempts.clear();
+    }
+
+    private void markTransientDelay(long packed, long delayNanos) {
+        retryAttempts.remove(packed);
+        retryAfterNanos.put(packed, nanoClock.getAsLong() + Math.max(0L, delayNanos));
+    }
+}

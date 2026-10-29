@@ -1,0 +1,377 @@
+package dev.xantha.vss.client.prediction;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.nio.file.*;
+import java.util.*;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.SlabBlock;
+import net.minecraft.world.level.block.state.properties.SlabType;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+class PredictionDiskCacheTest {
+    @Test void oldCityGroundPollutionIsRepairedWithoutPurgingOtherRecords() throws Exception {
+        int none = ClientColumnSample.NO_SPAN;
+        var temporary = new ClientColumnSample(90, none, 0, PredictionMaterialPalette.grassBlockIndex(),
+                0, 0, 0, 0, 0, ClientColumnSample.FLAG_SURFACE_ONLY | ClientColumnSample.FLAG_APPROXIMATE,
+                0, PredictionMaterialPalette.stoneIndex(), PredictionMaterialPalette.stoneIndex(),
+                none, none, none, none);
+        var key = PredictionDiskCache.Key.terrain(0, 0, 0);
+        var neighbor = PredictionDiskCache.Key.terrain(32, 0, 0);
+        ClientColumnSample[] grid = new ClientColumnSample[66 * 66]; Arrays.fill(grid, temporary);
+        try (var cache = new PredictionDiskCache(directory, 77); var lease = cache.lease(key)) {
+            assertTrue(cache.writeTerrain(lease, grid));
+            assertNotNull(cache.readTerrainData(lease, 0));
+            try (var other = cache.lease(neighbor)) { assertTrue(cache.writeTerrain(other, samples())); }
+            byte[] raw;
+            try (var in = new java.util.zip.InflaterInputStream(new java.io.ByteArrayInputStream(
+                    PredictionCacheTestFiles.read(cache, key)))) { raw = in.readAllBytes(); }
+            var bytes = new java.io.ByteArrayInputStream(raw);
+            var input = new java.io.DataInputStream(bytes);
+            input.skipNBytes(32); int size = input.readInt(), palette = input.readInt();
+            for (int i = 0; i < palette; i++) input.readUTF();
+            int start = raw.length - bytes.available();
+            for (int i = 0; i < size; i++) java.nio.ByteBuffer.wrap(raw)
+                    .putInt(start + i * 68 + 9 * 4, ClientColumnSample.FLAG_SURFACE_ONLY);
+            var encoded = new java.io.ByteArrayOutputStream();
+            try (var output = new java.util.zip.DeflaterOutputStream(encoded)) { output.write(raw); }
+            PredictionCacheTestFiles.legacy(cache, key, encoded.toByteArray());
+            assertNull(cache.readTerrainData(lease, 0));
+            assertTrue(cache.diagnostics().contains("terrainRepairs=1"));
+            try (var other = cache.lease(neighbor)) { assertArrayEquals(samples(), cache.readTerrain(other, 0)); }
+            ClientColumnSample[] repair = new ClientColumnSample[18 * 18]; Arrays.fill(repair, samples()[0]);
+            assertTrue(cache.writeTerrainLater(lease, new PredictionDiskCache.TerrainData(repair,
+                    Long.MIN_VALUE, null, null, null)).get(10, java.util.concurrent.TimeUnit.SECONDS));
+            assertArrayEquals(repair, cache.readTerrain(lease, 0), "a corrupt fine grid must not reject a smaller repair");
+        }
+    }
+
+    @TempDir Path directory;
+    @BeforeAll static void bootstrap() { ClientTerrainSamplerTest.bootstrapMinecraft(); }
+    @org.junit.jupiter.api.AfterEach void awaitBackgroundClose() {
+        var barrier = new PredictionDiskCache(directory,77);
+        barrier.close(); barrier.flush();
+    }
+
+    @Test void successfulLegacyReadMigratesAndDirtyQueuedMigrationCannotResurrect() throws Exception {
+        var key=PredictionDiskCache.Key.terrain(0,0,0);
+        try(var cache=new PredictionDiskCache(directory,77)) {
+            try(var lease=cache.lease(key)) { assertTrue(cache.writeTerrain(lease,samples())); }
+            byte[] bytes=PredictionCacheTestFiles.read(cache,key);
+            PredictionCacheTestFiles.legacy(cache,key,bytes);
+            try(var lease=cache.lease(key)) { assertArrayEquals(samples(),cache.readTerrain(lease,samples().length)); }
+            cache.flush();
+            assertFalse(Files.exists(cache.file(key)));
+            assertTrue(Files.exists(PredictionCacheTestFiles.storage(cache).path(key)));
+
+            PredictionCacheTestFiles.legacy(cache,key,bytes);
+            var field=PredictionDiskCache.class.getDeclaredField("COMMITS"); field.setAccessible(true);
+            var executor=(java.util.concurrent.ExecutorService)field.get(null);
+            var entered=new java.util.concurrent.CountDownLatch(1);
+            var release=new java.util.concurrent.CountDownLatch(1);
+            var gate=executor.submit(()-> { entered.countDown(); release.await(); return true; });
+            try {
+                assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS));
+                try(var lease=cache.lease(key)) { assertNotNull(cache.readTerrain(lease,samples().length)); }
+                cache.invalidate(List.of(key));
+            } finally { release.countDown(); gate.get(); }
+            cache.flush();
+            try(var lease=cache.lease(key)) { assertNull(cache.readTerrain(lease,samples().length)); }
+        }
+        try(var cache=new PredictionDiskCache(directory,77); var lease=cache.lease(key)) {
+            assertNull(cache.readTerrain(lease,samples().length));
+        }
+    }
+
+    @Test void batchedHeadersSurviveReopenAndRespectInvalidationAndCorruption() throws Exception {
+        var key = PredictionDiskCache.Key.terrain(-1, 2, 0);
+        ClientColumnSample[] grid = new ClientColumnSample[66 * 66];
+        Arrays.fill(grid, samples()[0]);
+        try (var cache = new PredictionDiskCache(directory, 77); var lease = cache.lease(key)) {
+            assertTrue(cache.writeTerrain(lease, grid));
+        }
+        try (var cache = new PredictionDiskCache(directory, 77)) {
+            cache.probeTerrain(List.of(key, PredictionDiskCache.Key.terrain(99,99,0)));
+            cache.flush();
+            assertEquals(64, cache.cachedTerrainAxis(key));
+            // A valid header is merely a hint, never proof that the payload is valid.
+            byte[] bytes = PredictionCacheTestFiles.read(cache,key);
+            PredictionCacheTestFiles.write(cache,key,Arrays.copyOf(bytes, bytes.length - 8));
+            try (var lease = cache.lease(key)) { assertNull(cache.readTerrainData(lease, 0)); }
+            cache.forgetTerrain(key);
+            assertEquals(0, cache.cachedTerrainAxis(key));
+            cache.invalidate(List.of(key));
+            cache.probeTerrain(List.of(key));
+            cache.flush();
+            assertEquals(0, cache.cachedTerrainAxis(key));
+        }
+    }
+
+    @Test void canonicalSurfaceMarkerDoesNotInvalidateOldResultsOrNetherEdits() {
+        var key = PredictionDiskCache.Key.surface(0,0,99);
+        var blocks = Map.of(new BlockPos(0,64,0), Blocks.FIRE.defaultBlockState());
+        try (var cache = new PredictionDiskCache(directory,77)) {
+            try (var lease = cache.lease(key)) {
+                assertTrue(cache.writeSurface(lease, blocks));
+                assertFalse(cache.readSurfaceData(lease).canonical());
+                assertTrue(cache.writeSurface(lease, blocks, true));
+                assertTrue(cache.readSurfaceData(lease).canonical());
+                assertEquals(blocks,cache.readSurface(lease));
+            }
+            cache.invalidateChunk(0,0);
+            try (var lease = cache.lease(key)) { assertNull(cache.readSurface(lease)); }
+        }
+    }
+
+    @Test void newHeaderProbeDoesNotDiscardOlderUnfinishedDemand() throws Exception {
+        var first=PredictionDiskCache.Key.terrain(0,0,0);
+        var last=PredictionDiskCache.Key.terrain(256,0,0);
+        var grid=new ClientColumnSample[66*66];Arrays.fill(grid,samples()[0]);
+        try(var cache=new PredictionDiskCache(directory,77);var lease=cache.lease(last)) {assertTrue(cache.writeTerrain(lease,grid));}
+        try(var cache=new PredictionDiskCache(directory,77)) {
+            var field=PredictionDiskCache.class.getDeclaredField("COMMITS");field.setAccessible(true);
+            var executor=(java.util.concurrent.ExecutorService)field.get(null);
+            var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+            var gate=executor.submit(()->{entered.countDown();release.await();return true;});
+            try {
+                assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS));
+                var older=new ArrayList<PredictionDiskCache.Key>();
+                for(int x=0;x<=256;x++)older.add(PredictionDiskCache.Key.terrain(x,0,0));
+                cache.probeTerrain(older);
+                cache.probeTerrain(List.of(PredictionDiskCache.Key.terrain(999,0,0)));
+                assertTrue(cache.terrainProbePending(first));assertTrue(cache.terrainProbePending(last));
+            } finally {release.countDown();gate.get();}
+            long deadline=System.nanoTime()+java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+            while(cache.terrainProbePending(last) && System.nanoTime()<deadline)Thread.sleep(2);
+            assertEquals(64,cache.cachedTerrainAxis(last),"A new plan or Voxy request cannot erase a queued outer-cache probe");
+        }
+    }
+
+    @Test void headerBatchesContinueWithoutAnotherPlannerTick() throws Exception {
+        var keys = new ArrayList<PredictionDiskCache.Key>();
+        for (int x=0;x<257;x++) keys.add(PredictionDiskCache.Key.terrain(x,0,0));
+        var last = keys.get(keys.size()-1);
+        var grid = new ClientColumnSample[66*66]; Arrays.fill(grid,samples()[0]);
+        try (var disk=new PredictionDiskCache(directory,77); var lease=disk.lease(last)) {
+            assertTrue(disk.writeTerrain(lease,grid));
+        }
+        try (var disk=new PredictionDiskCache(directory,77)) {
+            disk.probeTerrain(keys);
+            long deadline=System.nanoTime()+java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+            while (disk.cachedTerrainAxis(last)==0 && System.nanoTime()<deadline) Thread.sleep(5);
+            assertEquals(64,disk.cachedTerrainAxis(last));
+        }
+    }
+
+    @Test void oldSurfaceSchemaIsRejectedWhileTerrainAndNewEditsRemainReusable() throws Exception {
+        var terrain=PredictionDiskCache.Key.terrain(0,0,0);
+        var surface=PredictionDiskCache.Key.surface(0,0,3);
+        var edits=Map.of(new BlockPos(0,63,0),Blocks.FARMLAND.defaultBlockState(),
+                new BlockPos(1,63,0),Blocks.AIR.defaultBlockState(),new BlockPos(2,63,0),Blocks.WATER.defaultBlockState());
+        try(var cache=new PredictionDiskCache(directory,77)) {
+            try(var lease=cache.lease(terrain)) { assertTrue(cache.writeTerrain(lease,samples())); }
+            try(var lease=cache.lease(surface)) { assertTrue(cache.writeSurface(lease,edits)); }
+            try(var lease=cache.lease(surface)) { assertEquals(edits,cache.readSurface(lease)); }
+            byte[] raw;
+            try(var in=new java.util.zip.InflaterInputStream(new java.io.ByteArrayInputStream(PredictionCacheTestFiles.read(cache,surface)))) { raw=in.readAllBytes(); }
+            java.nio.ByteBuffer.wrap(raw).putInt(4,1);
+            var encoded = new java.io.ByteArrayOutputStream();
+            try(var out=new java.util.zip.DeflaterOutputStream(encoded)) { out.write(raw); }
+            PredictionCacheTestFiles.legacy(cache,surface,encoded.toByteArray());
+        }
+        try(var reopened=new PredictionDiskCache(directory,77)) {
+            try(var lease=reopened.lease(terrain)) { assertArrayEquals(samples(),reopened.readTerrain(lease,samples().length)); }
+            try(var lease=reopened.lease(surface)) { assertNull(reopened.readSurface(lease)); }
+            try(var lease=reopened.lease(surface)) { assertTrue(reopened.writeSurface(lease,edits)); }
+            try(var lease=reopened.lease(surface)) { assertEquals(edits,reopened.readSurface(lease)); }
+        }
+    }
+
+    @Test void compressedTerrainAndStatePaletteSurviveReopen() throws Exception {
+        var terrainKey = PredictionDiskCache.Key.terrain(-3, 7, 2);
+        var surfaceKey = PredictionDiskCache.Key.surface(-17, 23, 3);
+        var samples = samples();
+        var states = Map.of(new BlockPos(-270, 71, 375), Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.TOP),
+                new BlockPos(-270, 72, 375), Blocks.OAK_LEAVES.defaultBlockState(),
+                new BlockPos(-269, 71, 375), Blocks.DYED_TERRACOTTA.orange().defaultBlockState());
+        try (var cache = new PredictionDiskCache(directory, 77)) {
+            try (var lease = cache.lease(terrainKey)) { assertTrue(cache.writeTerrain(lease, samples)); }
+            try (var lease = cache.lease(surfaceKey)) { assertTrue(cache.writeSurface(lease, states)); }
+            long bytes = PredictionCacheTestFiles.read(cache,terrainKey).length;
+            assertTrue(bytes < samples.length * 68 / 4, "smooth columns should compress without storing meshes");
+            System.out.println("Prediction terrain fixture: columns=" + samples.length + ", rawBytes=" + samples.length * 68 + ", diskBytes=" + bytes);
+        }
+        try (var reopened = new PredictionDiskCache(directory, 77)) {
+            assertEquals(0, reopened.hits(), "opening must not preload disk contents into memory");
+            try (var lease = reopened.lease(terrainKey)) { assertArrayEquals(samples, reopened.readTerrain(lease, samples.length)); }
+            try (var lease = reopened.lease(surfaceKey)) { assertEquals(states, reopened.readSurface(lease)); }
+            assertEquals(2, reopened.hits());
+        }
+    }
+
+    @Test void legacyTerrainWithoutColorsRemainsReadable() throws Exception {
+        var key=PredictionDiskCache.Key.terrain(0,0,2);
+        try(var cache=new PredictionDiskCache(directory,77)) {
+            try(var lease=cache.lease(key)){assertTrue(cache.writeTerrain(lease,samples()));}
+            byte[] raw;
+            try(var in=new java.util.zip.InflaterInputStream(new java.io.ByteArrayInputStream(PredictionCacheTestFiles.read(cache,key)))){raw=in.readAllBytes();}
+            // Schema 1 ends after samples; schema 2 appends fingerprint + colors-present.
+            raw=java.util.Arrays.copyOf(raw,raw.length-9);
+            java.nio.ByteBuffer.wrap(raw).putInt(4,1);
+            var encoded = new java.io.ByteArrayOutputStream();
+            try(var out=new java.util.zip.DeflaterOutputStream(encoded)){out.write(raw);}
+            PredictionCacheTestFiles.legacy(cache,key,encoded.toByteArray());
+            try(var lease=cache.lease(key)) {
+                var restored=cache.readTerrainData(lease,0);
+                assertNotNull(restored);assertArrayEquals(samples(),restored.samples());
+                assertFalse(restored.colorsMatch(123));
+            }
+        }
+    }
+
+    @Test void coarsePreviewMarginIsIncludedInDirtyInvalidation() {
+        // LOD 7 spans 8192 blocks; its eight-cell preview reads x=-1024.
+        assertTrue(PredictionDiskCache.affected(-64,0).contains(PredictionDiskCache.Key.terrain(0,0,7)));
+        assertFalse(PredictionDiskCache.affected(-65,0).contains(PredictionDiskCache.Key.terrain(0,0,7)));
+    }
+
+    @Test void dirtyChunkInvalidatesUnloadedParentsBordersAndNeighborDecorationOnly() {
+        var affected = PredictionDiskCache.affected(-1, -1);
+        var terrain = PredictionDiskCache.Key.terrain(-1, -1, 0);
+        var border = PredictionDiskCache.Key.terrain(0, 0, 0);
+        var parent = PredictionDiskCache.Key.terrain(0, 0, 10);
+        var vegetation = PredictionDiskCache.Key.surface(1, -1, 3);
+        var outside = PredictionDiskCache.Key.surface(2, -1, 3);
+        assertTrue(affected.containsAll(List.of(terrain, border, parent, vegetation)));
+        assertFalse(affected.contains(outside));
+        try (var cache = new PredictionDiskCache(directory, 77)) {
+            for (var key : List.of(terrain, border, parent)) try (var lease = cache.lease(key)) { assertTrue(cache.writeTerrain(lease, samples())); }
+            for (var key : List.of(vegetation, outside)) try (var lease = cache.lease(key)) { assertTrue(cache.writeSurface(lease, Map.of())); }
+        }
+        try (var reopened = new PredictionDiskCache(directory, 77)) {
+            reopened.invalidateChunk(-1, -1); // no grid/chunk has been loaded in this session
+            try (var lease = reopened.lease(parent)) { assertNull(reopened.readTerrain(lease, samples().length)); }
+            reopened.flush();
+        }
+        try (var reopened = new PredictionDiskCache(directory, 77)) {
+            for (var key : List.of(terrain, border, parent)) try (var lease = reopened.lease(key)) { assertNull(reopened.readTerrain(lease, samples().length)); }
+            try (var lease = reopened.lease(vegetation)) { assertNull(reopened.readSurface(lease)); }
+            try (var lease = reopened.lease(outside)) { assertEquals(Map.of(), reopened.readSurface(lease), "empty result is a valid cached result"); }
+        }
+    }
+
+    @Test void arrivalBetweenGridPointsInvalidatesAreaMipsAndEditsStillInvalidateDecoration() {
+        for (int sign : new int[]{-1, 1}) {
+            int tile = sign < 0 ? -1 : 0;
+            int between = sign < 0 ? -3 : 1;
+            int sampled = sign < 0 ? -4 : 0;
+            var coarse = PredictionDiskCache.Key.terrain(tile, tile, 6);
+            var nearby = PredictionDiskCache.Key.terrain(tile, tile, 0);
+            var plants = PredictionDiskCache.Key.surface(between, between, 3);
+            try (var cache = new PredictionDiskCache(directory, 77)) {
+                for (var key : List.of(coarse, nearby)) try (var lease = cache.lease(key)) {
+                    assertTrue(cache.writeTerrain(lease, samples()));
+                }
+                try (var lease = cache.lease(plants)) { assertTrue(cache.writeSurface(lease, Map.of())); }
+            }
+            try (var cache = new PredictionDiskCache(directory, 77)) {
+                cache.invalidateCapture(between, between);
+                cache.flush();
+            }
+            try (var cache = new PredictionDiskCache(directory, 77)) {
+                // An area mip contains captured occupancy between point samples too.
+                try (var lease = cache.lease(coarse)) { assertNull(cache.readTerrain(lease, samples().length)); }
+                try (var lease = cache.lease(nearby)) { assertNull(cache.readTerrain(lease, samples().length)); }
+                try (var lease = cache.lease(plants)) { assertEquals(Map.of(), cache.readSurface(lease), "ordinary arrival must preserve deterministic decoration"); }
+                try (var lease = cache.lease(coarse)) { assertTrue(cache.writeTerrain(lease, samples())); }
+                cache.invalidateCapture(sampled, sampled);
+                try (var lease = cache.lease(coarse)) { assertNull(cache.readTerrain(lease, samples().length)); }
+                cache.flush();
+                try (var lease = cache.lease(coarse)) { assertTrue(cache.writeTerrain(lease, samples())); }
+                cache.invalidateChunk(between, between);
+                try (var lease = cache.lease(coarse)) { assertNull(cache.readTerrain(lease, samples().length)); }
+                try (var lease = cache.lease(plants)) { assertNull(cache.readSurface(lease), "world edits still invalidate decoration"); }
+                cache.flush();
+            }
+        }
+    }
+
+    @Test void adjacentSurfaceCacheFilesShareParsedBlockStates() {
+        var states = Map.of(new BlockPos(1, 65, 2), Blocks.OAK_LOG.defaultBlockState(),
+                new BlockPos(1, 66, 2), Blocks.OAK_LEAVES.defaultBlockState());
+        try (var cache = new PredictionDiskCache(directory, 77)) {
+            for (int x = 0; x < 12; x++) try (var lease = cache.lease(PredictionDiskCache.Key.surface(x, 0, 3))) {
+                assertTrue(cache.writeSurface(lease, states));
+            }
+        }
+        try (var cache = new PredictionDiskCache(directory, 77)) {
+            for (int x = 0; x < 12; x++) try (var lease = cache.lease(PredictionDiskCache.Key.surface(x, 0, 3))) {
+                assertEquals(states, cache.readSurface(lease));
+            }
+            assertEquals(12, cache.hits());
+            assertEquals(2, cache.stateDecodes(), "warm terrain cannot reparse the same palette in every chunk file");
+        }
+    }
+
+    @Test void dirtyNotificationAndNewSessionRejectLateWriters() {
+        var key = PredictionDiskCache.Key.terrain(2, 3, 1);
+        try (var older = new PredictionDiskCache(directory, 77); var stale = older.lease(key)) {
+            older.invalidate(List.of(key));
+            older.flush();
+            assertFalse(older.writeTerrain(stale, samples()), "work started before dirty cannot restore the stale file");
+            try (var beforeReconnect = older.lease(key); var newer = new PredictionDiskCache(directory, 77)) {
+                assertFalse(older.writeTerrain(beforeReconnect, samples()));
+                try (var current = newer.lease(key)) { assertTrue(newer.writeTerrain(current, samples())); }
+                older.close();
+                try (var read = newer.lease(key)) { assertNotNull(newer.readTerrain(read, samples().length)); }
+            }
+        }
+    }
+
+    @Test void interruptedLeaseCannotCommitAfterLeavingActiveSet() {
+        try (var cache = new PredictionDiskCache(directory, 77)) {
+            var key = PredictionDiskCache.Key.surface(1, 2, 3);
+            var cancelled = cache.lease(key);
+            cancelled.close();
+            cache.invalidate(List.of(key));
+            assertFalse(cache.writeSurface(cancelled, Map.of()));
+        }
+    }
+
+    @Test void corruptionWrongIdentityAndTruncationAreMisses() throws Exception {
+        var key = PredictionDiskCache.Key.terrain(2, 3, 1);
+        byte[] valid;
+        try (var cache = new PredictionDiskCache(directory, 77); var lease = cache.lease(key)) {
+            assertTrue(cache.writeTerrain(lease, samples()));
+            valid = PredictionCacheTestFiles.read(cache,key);
+        }
+        try (var changed = new PredictionDiskCache(directory, 88); var lease = changed.lease(key)) {
+            assertNull(changed.readTerrain(lease, samples().length));
+        }
+        try (var cache = new PredictionDiskCache(directory, 77)) {
+            PredictionCacheTestFiles.write(cache,key,Arrays.copyOf(valid, valid.length / 2));
+            try (var lease = cache.lease(key)) { assertNull(cache.readTerrain(lease, samples().length)); }
+            PredictionCacheTestFiles.write(cache,key,valid);
+            var copied = PredictionDiskCache.Key.terrain(3, 3, 1);
+            PredictionCacheTestFiles.write(cache,copied,valid);
+            try (var lease = cache.lease(copied)) { assertNull(cache.readTerrain(lease, samples().length)); }
+            try (var lease = cache.lease(key)) { assertArrayEquals(samples(), cache.readTerrain(lease, samples().length)); }
+        }
+    }
+
+    private static ClientColumnSample[] samples() {
+        var samples = new ClientColumnSample[66 * 66];
+        int grass = BuiltInRegistries.BLOCK.getId(Blocks.GRASS_BLOCK), dirt = BuiltInRegistries.BLOCK.getId(Blocks.DIRT), stone = BuiltInRegistries.BLOCK.getId(Blocks.STONE);
+        for (int i = 0; i < samples.length; i++) {
+            int y = 60 + i / 66 / 4;
+            samples[i] = new ClientColumnSample(y, Math.max(63, y), 0, grass, 0, 0, 0, 0, y < 63 ? 1 : 0,
+                    ClientColumnSample.FLAG_SURFACE_ONLY, 0, dirt, stone, ClientColumnSample.NO_SPAN, ClientColumnSample.NO_SPAN,
+                    ClientColumnSample.NO_SPAN, ClientColumnSample.NO_SPAN);
+        }
+        return samples;
+    }
+}

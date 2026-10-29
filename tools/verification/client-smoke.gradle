@@ -1,0 +1,98 @@
+import java.time.Duration
+
+// Development-only client verification. These sources and dependencies are not
+// part of main/test or any published VSS artifact.
+def smokeSources = sourceSets.create('clientSmoke') {
+    java.srcDir 'tools/verification/client-smoke/java'
+    resources.srcDir 'tools/verification/client-smoke/resources'
+    compileClasspath += sourceSets.main.compileClasspath + sourceSets.main.output
+    runtimeClasspath += sourceSets.main.runtimeClasspath
+}
+
+def needsRuntimeRemap = minecraft_version == '1.21.11'
+def smokeRuntimeConfiguration = smokeSources.runtimeOnlyConfigurationName
+if (needsRuntimeRemap) {
+    // Published 1.21.11 Fabric mods contain intermediary Minecraft references;
+    // a raw runtimeOnly file would fail against this named development runtime.
+    smokeRuntimeConfiguration = 'modClientSmokeRuntimeOnly'
+    loom.addRemapConfiguration(smokeRuntimeConfiguration) {
+        sourceSet = smokeSources
+        targetConfigurationName = smokeSources.runtimeOnlyConfigurationName
+        onCompileClasspath = false
+        onRuntimeClasspath = true
+        applyDependencyTransforms = true
+    }
+}
+// Minecraft 26.x and its matching Fabric mods already use unobfuscated names.
+// Keep their original JARs on the isolated smoke runtime classpath.
+def externalMods = [vssVoxyJar: 'voxy', vssSodiumJar: 'sodium', vssIrisJar: 'iris']
+externalMods.each { propertyName, modId ->
+    if (providers.gradleProperty(propertyName).isPresent()) {
+        dependencies.add(smokeRuntimeConfiguration,
+                files(providers.gradleProperty(propertyName).map { file(it) }))
+    }
+}
+
+def smokeReport = providers.gradleProperty('vssSmokeReport')
+        .map { file(it) }.orElse(layout.buildDirectory.file('client-smoke.json').map { it.asFile })
+def requiredMods = ['vss', 'voxy', 'sodium', 'fabric-api']
+if (providers.gradleProperty('vssIrisJar').isPresent()) requiredMods.add('iris')
+
+loom {
+    mods {
+        vss { sourceSet sourceSets.main }
+        vss_smoke { sourceSet smokeSources }
+    }
+    runs {
+        clientSmoke {
+            client()
+            source smokeSources
+            runDir providers.gradleProperty('vssSmokeRunDir')
+                    .getOrElse('run/client-smoke-' + minecraft_version)
+            vmArg '-Dvss.smoke.report=' + smokeReport.get().absolutePath
+            vmArg '-Dvss.smoke.requiredMods=' + requiredMods.join(',')
+            ideConfigGenerated false
+        }
+    }
+}
+
+tasks.named('runClientSmoke').configure {
+    group = 'verification'
+    description = 'Starts the real Fabric client with Voxy/Sodium and verifies the initialized title screen.'
+    dependsOn tasks.named(smokeSources.classesTaskName)
+    timeout = Duration.ofSeconds(180)
+    doFirst {
+        ['vssVoxyJar', 'vssSodiumJar'].each { propertyName ->
+            if (!providers.gradleProperty(propertyName).isPresent()) {
+                throw new GradleException('Client smoke requires -P' + propertyName + '=<matching release JAR>')
+            }
+        }
+        externalMods.each { propertyName, expectedId ->
+            if (!providers.gradleProperty(propertyName).isPresent()) return
+            def input = file(providers.gradleProperty(propertyName).get())
+            if (!input.isFile()) throw new GradleException('Missing client smoke JAR: ' + input)
+            new java.util.zip.ZipFile(input).withCloseable { archive ->
+                def metadataEntry = archive.getEntry('fabric.mod.json')
+                if (metadataEntry == null) throw new GradleException('Not a Fabric mod JAR: ' + input)
+                def metadata = archive.getInputStream(metadataEntry).withCloseable { stream ->
+                    new groovy.json.JsonSlurper().parse(stream)
+                }
+                if (metadata.id != expectedId) {
+                    throw new GradleException(propertyName + ' must contain mod ' + expectedId + ', found ' + metadata.id)
+                }
+            }
+        }
+        delete smokeReport.get()
+    }
+    doLast {
+        def reportFile = smokeReport.get()
+        if (!reportFile.isFile()) {
+            throw new GradleException('Client exited without a smoke report: ' + reportFile)
+        }
+        def report = new groovy.json.JsonSlurper().parse(reportFile)
+        if (report.status != 'passed') {
+            throw new GradleException('Client smoke failed: ' + report.reason + '; report: ' + reportFile)
+        }
+        logger.lifecycle('Client initialization smoke passed; report: ' + reportFile)
+    }
+}

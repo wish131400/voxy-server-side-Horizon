@@ -1,0 +1,4 @@
+accessWidener v2 official
+accessible field net/minecraft/world/level/levelgen/feature/foliageplacers/CherryFoliagePlacer cornerHoleChance F
+accessible class com/mojang/renderpearl/backend/opengl/GlDevice
+accessible field com/mojang/renderpearl/frontend/FrontendGpuDevice backend Lcom/mojang/renderpearl/backend/api/GpuDeviceBackend;

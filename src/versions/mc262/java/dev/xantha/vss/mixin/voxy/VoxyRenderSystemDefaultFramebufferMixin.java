@@ -1,0 +1,54 @@
+package dev.xantha.vss.mixin.voxy;
+
+import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.opengl.GlDevice;
+import java.util.List;
+import com.mojang.blaze3d.opengl.GlTextureView;
+import com.mojang.blaze3d.systems.RenderSystem;
+import dev.xantha.vss.common.VSSLogger;
+import net.minecraft.client.Minecraft;
+import org.lwjgl.opengl.GL11;
+import org.lwjgl.opengl.GL30;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Pseudo;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Pseudo
+@Mixin(targets = "me.cortex.voxy.client.core.VoxyRenderSystem", remap = false)
+public abstract class VoxyRenderSystemDefaultFramebufferMixin {
+    @Unique
+    private static boolean vss$loggedDefaultFramebufferSkip;
+    @Unique
+    private static boolean vss$loggedMainFramebufferRebind;
+
+    @Inject(method = "renderOpaque(Lme/cortex/voxy/client/core/rendering/Viewport;)V", at = @At("HEAD"), cancellable = true, remap = false, require = 0)
+    private void vss$bindMainFramebufferWhenDefaultBound(CallbackInfo ci) {
+        if (GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING) != 0) {
+            return;
+        }
+
+        RenderTarget mainTarget = Minecraft.getInstance().gameRenderer.mainRenderTarget();
+        if (mainTarget != null && RenderSystem.getDevice().backend instanceof GlDevice device
+                && mainTarget.getColorTextureView() instanceof GlTextureView color
+                && mainTarget.getDepthTextureView() instanceof GlTextureView depth) {
+            int framebuffer = device.frameBufferCache().getFbo(device.directStateAccess(), List.of(color), depth);
+            GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, framebuffer);
+            if (GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING) != 0) {
+                if (!vss$loggedMainFramebufferRebind) {
+                    vss$loggedMainFramebufferRebind = true;
+                    VSSLogger.warn("Rebound the Minecraft main framebuffer for Voxy LOD rendering");
+                }
+                return;
+            }
+        }
+
+        if (!vss$loggedDefaultFramebufferSkip) {
+            vss$loggedDefaultFramebufferSkip = true;
+            VSSLogger.warn("Skipped Voxy LOD rendering because the default framebuffer was bound");
+        }
+        ci.cancel();
+    }
+}

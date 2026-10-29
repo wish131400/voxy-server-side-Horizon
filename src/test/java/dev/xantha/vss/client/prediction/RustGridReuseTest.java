@@ -1,0 +1,337 @@
+package dev.xantha.vss.client.prediction;
+
+import static org.junit.jupiter.api.Assertions.*;
+import org.junit.jupiter.api.Test;
+
+class RustGridReuseTest {
+    @Test void taskOwnedGridWindowsPreserveEdgesAndCachedRecordsAcrossBatches() throws Exception {
+        ClientTerrainSamplerTest.bootstrapMinecraft();
+        assertTrue(RustTerrainSampler.available());
+        var profile = new dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionProfile(
+                net.minecraft.resources.Identifier.withDefaultNamespace("overworld"), -64, 384,
+                "noise", "minecraft:overworld", 1L);
+        var doc = LithostitchedNativeTest.document();
+        doc.add("possible_biomes", new com.google.gson.JsonArray());
+        try (var sampler = new RustTerrainSampler(RustWorldgenBackend.create(1, 0, doc.toString()), profile,
+                new ClientTerrainSampler(1, profile))) {
+            int gridSize = 10;
+            var grid = new ClientColumnSample[gridSize * gridSize];
+            var retained = sampler.sample(-24, -24);
+            grid[11] = retained;
+            for (int z = 0; z < gridSize; z += 8) for (int x = 0; x < gridSize; x += 8) {
+                int width = Math.min(8, gridSize - x), height = Math.min(8, gridSize - z);
+                var before = grid.clone();
+                assertSame(grid, sampler.sampleGridInPlace(-32 + x * 8, -32 + z * 8, 8,
+                        width, height, grid, z * gridSize + x, gridSize, false));
+                for (int index = 0; index < grid.length; index++) {
+                    boolean inside = index / gridSize >= z && index / gridSize < z + height
+                            && index % gridSize >= x && index % gridSize < x + width;
+                    if (!inside) assertSame(before[index], grid[index], "window changed another batch");
+                }
+            }
+            assertSame(retained, grid[11]);
+            assertEquals(99, sampler.gridComputedPoints.sum());
+            for (int z = 0; z < gridSize; z++) for (int x = 0; x < gridSize; x++)
+                assertEquals(sampler.sample(-32 + x * 8, -32 + z * 8), grid[z * gridSize + x],
+                        "a decoded scratch record must not alias another cache entry");
+            var before = grid.clone();
+            assertThrows(IllegalArgumentException.class,
+                    () -> sampler.sampleGridInPlace(0, 0, 1, 8, 8, grid, 50, 10, false));
+            assertThrows(IllegalArgumentException.class,
+                    () -> sampler.sampleGridInPlace(0, 0, 1, 8, 8, grid, 0, 7, false));
+            assertArrayEquals(before, grid);
+            sampler.close();
+            assertThrows(java.util.concurrent.CancellationException.class,
+                    () -> sampler.sampleGridInPlace(0, 0, 1, 8, 8, grid, 0, 10, false));
+        }
+    }
+
+    @Test void displayGridWindowDoesNotKeepApproximateRecordsWhenRefining() throws Exception {
+        ClientTerrainSamplerTest.bootstrapMinecraft();
+        assertTrue(RustTerrainSampler.available());
+        var profile = new dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionProfile(
+                net.minecraft.resources.Identifier.withDefaultNamespace("overworld"), -64, 384,
+                "noise", "minecraft:overworld", 1L);
+        var doc = LithostitchedNativeTest.document();
+        doc.add("possible_biomes", new com.google.gson.JsonArray());
+        try (var sampler = new RustTerrainSampler(RustWorldgenBackend.create(1, 0, doc.toString()), profile,
+                new ClientTerrainSampler(1, profile))) {
+            var grid = new ClientColumnSample[100];
+            assertSame(grid, sampler.sampleDisplayGridInPlace(-16, -16, 1, 8, 8, grid, 11, 10));
+            long approximate = java.util.Arrays.stream(grid).filter(java.util.Objects::nonNull)
+                    .filter(ClientColumnSample::approximate).count();
+            assertTrue(approximate > 0);
+            long computed = sampler.gridComputedPoints.sum();
+            sampler.sampleGridInPlace(-16, -16, 1, 8, 8, grid, 11, 10, false);
+            assertEquals(computed + approximate, sampler.gridComputedPoints.sum());
+            for (int z = 0; z < 8; z++) for (int x = 0; x < 8; x++)
+                assertEquals(sampler.sample(-16 + x, -16 + z), grid[11 + z * 10 + x]);
+            assertNull(grid[0]);
+            assertNull(grid[99]);
+        }
+    }
+
+    @Test void exteriorFootprintJniValidatesBeforeWritingAndHonorsCancellation() throws Exception {
+        ClientTerrainSamplerTest.bootstrapMinecraft();
+        assertTrue(RustTerrainSampler.available());
+        var doc=LithostitchedNativeTest.document();
+        long world=RustWorldgenBackend.create(917,0,doc.toString());
+        var output=java.nio.ByteBuffer.allocateDirect(384).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        try {
+            output.putInt(0,12345);
+            assertThrows(IllegalArgumentException.class,()->RustWorldgenBackend.exteriorFootprint(world,0,0,3,-64,80,output));
+            assertEquals(12345,output.getInt(0));
+            assertThrows(IllegalArgumentException.class,()->RustWorldgenBackend.exteriorFootprint(world,0,0,4,-65,80,output));
+            assertEquals(12345,output.getInt(0));
+            var input=java.nio.ByteBuffer.allocateDirect(8).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            var column=java.nio.ByteBuffer.allocateDirect(16+384*4).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            input.putInt(0,-3).putInt(4,-3);
+            assertEquals(1,RustWorldgenBackend.columns(world,input,column,1));
+            int top=column.getInt(0);
+            assertTrue(top>-64);
+            assertEquals(top+64,RustWorldgenBackend.exteriorFootprint(world,-3,-3,4,-64,top,output));
+            assertEquals(1,output.get(top+63));
+            RustWorldgenBackend.cancel(world);
+            output.putInt(0,12345);
+            assertThrows(IllegalArgumentException.class,()->RustWorldgenBackend.exteriorFootprint(world,0,0,4,-64,80,output));
+            assertEquals(12345,output.getInt(0));
+        } finally { RustWorldgenBackend.close(world); }
+    }
+
+    @Test void adjacentExteriorFootprintsMatchScalarJniResults() throws Exception {
+        ClientTerrainSamplerTest.bootstrapMinecraft();
+        assertTrue(RustTerrainSampler.available());
+        long world = RustWorldgenBackend.create(917, 0, LithostitchedNativeTest.document().toString());
+        try {
+            var input = java.nio.ByteBuffer.allocateDirect(40).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            var output = java.nio.ByteBuffer.allocateDirect(2 * (4 + 384)).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            var scalar = java.nio.ByteBuffer.allocateDirect(384).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            for (int index = 0; index < 2; index++) {
+                int offset = index * 20;
+                input.putInt(offset, -3 + index).putInt(offset + 4, -3)
+                        .putInt(offset + 8, 1).putInt(offset + 12, -64).putInt(offset + 16, 80);
+            }
+            assertEquals(2, RustWorldgenBackend.exteriorFootprints(world, input, output, 2));
+            for (int index = 0; index < 2; index++) {
+                int count = RustWorldgenBackend.exteriorFootprint(world, -3 + index, -3, 1, -64, 80, scalar);
+                int start = index * (4 + 384);
+                assertEquals(count, output.getInt(start));
+                for (int y = 0; y < count; y++) assertEquals(scalar.get(y), output.get(start + 4 + y));
+            }
+        } finally { RustWorldgenBackend.close(world); }
+    }
+
+    @Test void displayRecordsNeverBecomeExactDecorationInput() throws Exception {
+        ClientTerrainSamplerTest.bootstrapMinecraft();
+        assertTrue(RustTerrainSampler.available());
+        var profile = new dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionProfile(
+                net.minecraft.resources.Identifier.withDefaultNamespace("overworld"), -64, 384,
+                "noise", "minecraft:overworld", 1L);
+        var doc = LithostitchedNativeTest.document();
+        doc.add("possible_biomes", new com.google.gson.JsonArray());
+        try (var sampler = new RustTerrainSampler(RustWorldgenBackend.create(1,0,doc.toString()),profile,
+                new ClientTerrainSampler(1,profile))) {
+            var display=sampler.sampleDisplayGrid(-16,-16,1,8,8,new ClientColumnSample[64]);
+            long approximate=java.util.Arrays.stream(display).filter(ClientColumnSample::approximate).count();
+            assertTrue(approximate>0,"exercise the display path, not only exact fallbacks");
+            assertTrue(java.util.Arrays.stream(display).allMatch(ClientColumnSample::reusableForDisplay));
+            long computed=sampler.gridComputedPoints.sum();
+            assertArrayEquals(display,sampler.sampleDisplayGrid(-16,-16,1,8,8,display));
+            assertEquals(computed,sampler.gridComputedPoints.sum());
+            var exact=sampler.sampleGrid(-16,-16,1,8,8,display,false);
+            assertTrue(java.util.Arrays.stream(exact).noneMatch(ClientColumnSample::approximate));
+            assertEquals(computed+approximate,sampler.gridComputedPoints.sum(),"exact compatibility fallbacks stay reusable");
+            for(int i=0;i<64;i++) assertEquals(exact[i],sampler.sample(-16+i%8,-16+i/8));
+        }
+    }
+    @Test void diskRestoredApproximationIsResampledForFineTerrain(@org.junit.jupiter.api.io.TempDir java.nio.file.Path directory) throws Exception {
+        ClientTerrainSamplerTest.bootstrapMinecraft();
+        assertTrue(RustTerrainSampler.available());
+        var profile = new dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionProfile(
+                net.minecraft.resources.Identifier.withDefaultNamespace("overworld"), -64, 384,
+                "noise", "minecraft:overworld", 1L);
+        var doc = LithostitchedNativeTest.document();
+        doc.add("possible_biomes", new com.google.gson.JsonArray());
+        var key = PredictionDiskCache.Key.terrain(0,0,0);
+        try (var sampler = new RustTerrainSampler(RustWorldgenBackend.create(1,0,doc.toString()),profile,
+                new ClientTerrainSampler(1,profile))) {
+            var preview = sampler.sampleGrid(-16,-16,8,4,4,new ClientColumnSample[16],true);
+            assertTrue(java.util.Arrays.stream(preview).allMatch(ClientColumnSample::approximate));
+            var medium = sampler.sampleGrid(-16,-16,8,4,4,preview,true);
+            assertArrayEquals(preview,medium);
+            assertEquals(16,sampler.gridComputedPoints.sum(),"preview refinement may reuse approximations");
+            var direct = java.nio.ByteBuffer.allocateDirect(40).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            var input = java.nio.ByteBuffer.allocateDirect(8).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            direct.putInt(0,12345);
+            input.putInt(0,Integer.MIN_VALUE);
+            long invalidWorld = RustWorldgenBackend.create(1,0,doc.toString());
+            try {
+                assertThrows(IllegalArgumentException.class,()->RustWorldgenBackend.previewPoints(invalidWorld,input,direct,1));
+                assertEquals(12345,direct.getInt(0),"invalid input must not partly publish output");
+                assertThrows(IllegalArgumentException.class,()->RustWorldgenBackend.previewPoints(invalidWorld,input,direct,65));
+            } finally { RustWorldgenBackend.close(invalidWorld); }
+            try(var cache = new PredictionDiskCache(directory,77); var lease = cache.lease(key)) {
+                assertTrue(cache.writeTerrain(lease,preview));
+            }
+            ClientColumnSample[] restored;
+            try(var cache = new PredictionDiskCache(directory,77); var lease = cache.lease(key)) {
+                restored = cache.readTerrain(lease,16);
+            }
+            assertArrayEquals(preview,restored,"disk must preserve approximation metadata");
+            var exact = sampler.sampleGrid(-16,-16,8,4,4,restored,false);
+            assertEquals(32,sampler.gridComputedPoints.sum(),"all approximate columns must be replaced");
+            assertTrue(java.util.Arrays.stream(exact).noneMatch(ClientColumnSample::approximate));
+            var s = preview[0];
+            var captured = new ClientColumnSample(s.surfaceY(),s.fluidY(),s.biomeIndex(),s.topBlockIndex(),
+                    s.structureIndex(),s.treeKind(),s.treeDensity(),s.treeHeight(),s.fluid(),
+                    s.flags() | ClientColumnSample.FLAG_CAPTURED,s.groundFeatureKind(),s.underBlockIndex(),
+                    s.deepBlockIndex(),s.surfaceBottom(),s.lowerTop(),s.lowerBottom(),s.spanFloor());
+            assertSame(captured,sampler.sampleGrid(-16,-16,8,1,1,new ClientColumnSample[]{captured},false)[0]);
+            assertArrayEquals(exact,sampler.sampleGrid(-16,-16,8,4,4));
+            for(int z=0;z<4;z++) for(int x=0;x<4;x++)
+                assertEquals(sampler.sample(-16+x*8,-16+z*8),exact[z*4+x]);
+        }
+    }
+
+    @Test void retainedSamplesAvoidNativeWorkEvenAfterSamplerCachesAreGone() throws Exception {
+        ClientTerrainSamplerTest.bootstrapMinecraft();
+        var profile = new dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionProfile(
+                net.minecraft.resources.Identifier.withDefaultNamespace("overworld"), -64, 384,
+                "noise", "minecraft:overworld", 1L);
+        var doc = LithostitchedNativeTest.document();
+        doc.add("possible_biomes",new com.google.gson.JsonArray());
+        ClientColumnSample[] coarse;
+        try (var old = new RustTerrainSampler(RustWorldgenBackend.create(1,0,doc.toString()),profile,
+                new ClientTerrainSampler(1,profile))) {
+            coarse = old.sampleGrid(-16,-16,8,4,4);
+        }
+        try (var fresh = new RustTerrainSampler(RustWorldgenBackend.create(1,0,doc.toString()),profile,
+                new ClientTerrainSampler(1,profile))) {
+            var retained = new ClientColumnSample[64];
+            for(int z=0;z<4;z++) for(int x=0;x<4;x++) retained[z*16+x*2]=coarse[z*4+x];
+            var fine = fresh.sampleGrid(-16,-16,4,8,8,retained);
+            assertEquals(48,fresh.gridComputedPoints.sum(),"only missing points may cross JNI");
+            assertEquals(16,fresh.gridCacheHits.sum());
+            for(int z=0;z<8;z++) for(int x=0;x<8;x++)
+                assertEquals(fresh.sample(-16+x*4,-16+z*4),fine[z*8+x]);
+            assertNull(retained[1],"the caller's grid must remain immutable");
+        }
+    }
+
+    @Test void retainedTileMappingIncludesEdgesButNeverInterpolatesMissingSamples() {
+        var samples=new ClientColumnSample[33*33];
+        var sample=new ClientColumnSample(64,64,0,ClientColumnSample.NO_BLOCK,0,0,0,0,0,
+                ClientColumnSample.FLAG_SURFACE_ONLY,0,ClientColumnSample.NO_BLOCK,ClientColumnSample.NO_BLOCK,
+                ClientColumnSample.NO_SPAN,ClientColumnSample.NO_SPAN,ClientColumnSample.NO_SPAN,ClientColumnSample.NO_SPAN);
+        java.util.Arrays.fill(samples,sample);
+        var tile=new PredictionTileManager.PredictionTile(null,new int[0],new int[0],samples,null,
+                new PredictionDepthBound(64,64),0,1,32,16);
+        int reused=0;
+        for(int z=0;z<66;z++) for(int x=0;x<66;x++) {
+            var actual=PredictionTileManager.retainedSample(tile,x,z,8);
+            boolean aligned=x>=1 && z>=1 && x%2==1 && z%2==1;
+            if(aligned) { assertSame(sample,actual);reused++; } else assertNull(actual);
+        }
+        assertEquals(1089,reused);
+    }
+
+    @Test void compareColdBorderSamplingCostWithoutChangingOutput() throws Exception {
+        ClientTerrainSamplerTest.bootstrapMinecraft();
+        assertTrue(RustTerrainSampler.available());
+        var profile = new dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionProfile(
+                net.minecraft.resources.Identifier.withDefaultNamespace("overworld"), -64, 384,
+                "noise", "minecraft:overworld", 1L);
+        var doc=LithostitchedNativeTest.document();
+        doc.add("possible_biomes",new com.google.gson.JsonArray());
+        long[] before=new long[5],after=new long[5];
+        for(int round=0;round<6;round++) {
+            long oracle=RustWorldgenBackend.create(1,0,doc.toString());
+            long handle=RustWorldgenBackend.create(1,0,doc.toString());
+            try(var sampler=new RustTerrainSampler(handle,profile,new ClientTerrainSampler(1,profile))) {
+                assertEquals(16, sampler.initialTerrainCellAxis(0));
+                var outputs=new java.util.HashMap<Long,java.nio.ByteBuffer>();
+                long start=System.nanoTime();
+                for(int cx=-1;cx<=0;cx++) for(int cz=-1;cz<=0;cz++) {
+                    var buffer=java.nio.ByteBuffer.allocateDirect(256*40).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                    RustWorldgenBackend.surfaceColumns(oracle,cx,cz,buffer);
+                    outputs.put((long)cx<<32|cz&0xffffffffL,buffer);
+                }
+                long fullTime=System.nanoTime()-start;
+                start=System.nanoTime();
+                var grid=sampler.sampleGrid(-1,-1,1,8,8);
+                long mixedTime=System.nanoTime()-start;
+                for(int z=0;z<8;z++) for(int x=0;x<8;x++) {
+                    int xx=x-1,zz=z-1;
+                    var full=outputs.get((long)(xx>>4)<<32|(zz>>4)&0xffffffffL);
+                    int offset=((xx&15)*16+(zz&15))*40;
+                    assertEquals(full.getInt(offset),grid[z*8+x].surfaceY());
+                    assertEquals(full.getInt(offset+4),grid[z*8+x].fluidY());
+                }
+                if(round>0) {before[round-1]=fullTime;after[round-1]=mixedTime;}
+            } finally {RustWorldgenBackend.close(oracle);}
+        }
+        java.util.Arrays.sort(before);java.util.Arrays.sort(after);
+        System.out.println("Cold vanilla 8x8 border, five measured rounds: full median ms="
+                +before[2]/1_000_000.0+", mixed median ms="+after[2]/1_000_000.0);
+    }
+
+    @Test void nearBorderAvoidsFullNeighbourChunksAndMatchesTheirResults() throws Exception {
+        ClientTerrainSamplerTest.bootstrapMinecraft();
+        assertTrue(RustTerrainSampler.available());
+        var profile = new dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionProfile(
+                net.minecraft.resources.Identifier.withDefaultNamespace("overworld"), -64, 384,
+                "noise", "minecraft:overworld", 1L);
+        var doc = LithostitchedNativeTest.document();
+        doc.add("possible_biomes", new com.google.gson.JsonArray());
+        long handle = RustWorldgenBackend.create(1, 0, doc.toString());
+        try (var sampler = new RustTerrainSampler(handle, profile, new ClientTerrainSampler(1, profile))) {
+            var grid=sampler.sampleGrid(-1,-1,1,8,8);
+            assertEquals(64,sampler.gridComputedPoints.sum(),"submit only the requested border and interior columns");
+            assertArrayEquals(grid,sampler.sampleGrid(-1,-1,1,8,8));
+            assertEquals(64,sampler.gridComputedPoints.sum());
+            var full=java.nio.ByteBuffer.allocateDirect(256*40).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            for(int cz=-1;cz<=0;cz++) for(int cx=-1;cx<=0;cx++) {
+                assertEquals(256,RustWorldgenBackend.surfaceColumns(handle,cx,cz,full));
+                for(int z=0;z<8;z++) for(int x=0;x<8;x++) {
+                    int xx=x-1,zz=z-1;
+                    if((xx>>4)!=cx||(zz>>4)!=cz) continue;
+                    int offset=((xx&15)*16+(zz&15))*40;
+                    var sample=grid[z*8+x];
+                    assertEquals(full.getInt(offset),sample.surfaceY());
+                    assertEquals(full.getInt(offset+4),sample.fluidY());
+                    assertEquals(full.getInt(offset+8),sample.fluid());
+                    assertEquals(full.getInt(offset+12),sample.flags());
+                    int[] materials={sample.topBlockIndex(),sample.underBlockIndex(),sample.deepBlockIndex()};
+                    for(int i=0;i<3;i++) assertEquals(net.minecraft.core.registries.BuiltInRegistries.BLOCK.getId(
+                            sampler.states()[full.getInt(offset+16+i*4)].getBlock()),materials[i]);
+                }
+            }
+            sampler.close();
+            assertThrows(java.util.concurrent.CancellationException.class,()->sampler.sampleGrid(-1,-1,1,8,8));
+        }
+    }
+
+    @Test void alignedRefinementOnlyComputesMissingPoints() throws Exception {
+        ClientTerrainSamplerTest.bootstrapMinecraft();
+        assertTrue(RustTerrainSampler.available());
+        var profile = new dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionProfile(
+                net.minecraft.resources.Identifier.withDefaultNamespace("overworld"), -64, 384,
+                "noise", "minecraft:overworld", 1L);
+        var doc = LithostitchedNativeTest.document();
+        doc.add("possible_biomes", new com.google.gson.JsonArray());
+        long handle = RustWorldgenBackend.create(1, 0, doc.toString());
+        try (var sampler = new RustTerrainSampler(handle, profile, new ClientTerrainSampler(1, profile))) {
+            var coarse = sampler.sampleGrid(-16, -16, 8, 4, 4);
+            assertEquals(16, sampler.gridComputedPoints.sum());
+            assertArrayEquals(coarse, sampler.sampleGrid(-16, -16, 8, 4, 4));
+            assertEquals(16, sampler.gridComputedPoints.sum());
+            var fine = sampler.sampleGrid(-16, -16, 4, 8, 8);
+            assertEquals(64, sampler.gridComputedPoints.sum());
+            assertEquals(32, sampler.gridCacheHits.sum());
+            for (int z=0; z<4; z++) for (int x=0; x<4; x++)
+                assertEquals(coarse[z*4+x], fine[z*16+x*2]);
+            for (int z=0; z<8; z++) for (int x=0; x<8; x++)
+                assertEquals(sampler.sample(-16+x*4, -16+z*4), fine[z*8+x]);
+        }
+    }
+}

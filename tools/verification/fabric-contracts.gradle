@@ -1,0 +1,69 @@
+// Each actual Mixin application needs its own Sponge global state.
+tasks.register('fabricContractTest', Test) {
+    group = 'verification'
+    description = 'Applies Minecraft, Voxy and Iris hooks to real dependency bytecode.'
+    dependsOn tasks.named('testClasses')
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform()
+    ['FabricMinecraftMixinApplicationTest', 'FabricIrisMixinApplicationTest',
+     'VoxyPredictionCapabilitiesTest', 'VoxyNativeFaceContractTest',
+     'VoxyPredictionMixinApplicationTest', 'VoxyIngestMixinApplicationTest',
+     'VoxyIngestBytecodeTest', 'VoxyIngestContractTest',
+     'VoxyRenderPipelineMixinApplicationTest', 'VoxyNeighborVariantMixinTest',
+     'VoxyFluidBakeCompatibilityTest', 'PredictionNormalDepthBridgeTest'].each { include "**/${it}.class" }
+    maxHeapSize = '2G'
+    maxParallelForks = 1
+    forkEvery = 1
+    doFirst {
+        if (!providers.gradleProperty('vssVoxyJar').isPresent()) {
+            throw new GradleException('Supply -PvssVoxyJar with the actual Voxy release JAR')
+        }
+    }
+}
+
+tasks.register('fabricMigrationTest', Test) {
+    group = 'verification'
+    description = 'Checks migrated world generation, native ABI, palettes and payload limits.'
+    dependsOn tasks.named('testClasses')
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform()
+    ['TerrainGeneratorSnapshotTest', 'WorldgenDimensionTypeSnapshotTest',
+     'RegionPresenceTransferTest', 'VssNativePlatformTest',
+     'PredictionEndDecorationTest', 'PredictionEndColumnsTest',
+     'PredictionVegetationHandoffTest', 'PredictionVegetationPublicationTest',
+     'RustBiomeIdentityTest', 'RustDimensionBoundsTest',
+     'RustVegetationStageTest', 'RustVegetationDeltaUploadTest'].each { include "**/${it}.class" }
+    ['PredictionClimateSamplerTest', 'PredictionJavaExteriorTest', 'ClientWorldgenRegistriesTest',
+     'PredictionPlacementExecutorTest', 'PredictionVegetationTest',
+     'PredictionNetherDecorationTest', 'PredictionNativeNetherFeatureTest',
+     'RustVegetationDescriptorsTest'].each { include "**/${it}.class" }
+    if (minecraft_version == '26.3') {
+        ['FloatDensityCompilerTest', 'FloatMaterialPipelineTest'].each { include "**/${it}.class" }
+    }
+    maxHeapSize = '3G'
+    maxParallelForks = 1
+    forkEvery = 1
+}
+
+// Explicit GPU invocation keeps headless CI separate from real driver verification.
+tasks.register('fabricGpuContractTest', Test) {
+    group = 'verification'
+    description = 'Renders the real Voxy shader fixtures and validates final depth transfer on the GPU.'
+    dependsOn tasks.named('testClasses')
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform()
+    ['StrictVoxyShaderFixtureGpuTest', 'PredictionNormalDepthBridgeGpuTest'].each { include "**/${it}.class" }
+    systemProperty 'vss.gpuTests', 'true'
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
+    maxHeapSize = '2G'
+    maxParallelForks = 1
+    forkEvery = 1
+    doFirst {
+        if (!providers.gradleProperty('vssVoxyJar').isPresent()) {
+            throw new GradleException('Supply -PvssVoxyJar with the actual Voxy release JAR')
+        }
+    }
+}

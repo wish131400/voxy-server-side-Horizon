@@ -1,0 +1,83 @@
+name: Fabric version contracts
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - src/**
+      - gradle/**
+      - '*.gradle'
+      - gradle.properties
+      - tools/verification/**
+      - tools/prediction/compat-tests.gradle
+      - .github/workflows/fabric.yml
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fabric:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - minecraft: '1.21.11'
+            java: '21'
+            package_task: remapJar
+          - minecraft: '26.1'
+            java: '25'
+            package_task: jar
+          - minecraft: '26.1.1'
+            java: '25'
+            package_task: jar
+          - minecraft: '26.1.2'
+            java: '25'
+            package_task: jar
+          - minecraft: '26.2'
+            java: '25'
+            package_task: jar
+          - minecraft: '26.3'
+            java: '25'
+            package_task: jar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Download pinned bytecode contract inputs
+        id: mods
+        run: python tools/verification/fetch_compat_mods.py --minecraft '${{ matrix.minecraft }}' --github-output
+      - name: Compile, run regressions and package the production mod
+        env:
+          VOXY_JAR: ${{ steps.mods.outputs.voxy_jar }}
+          IRIS_JAR: ${{ steps.mods.outputs.iris_jar }}
+        run: >-
+          bash gradlew verifyModules fabricMigrationTest fabricContractTest
+          ${{ matrix.package_task }} --continue --console=plain
+          '-PmcTarget=${{ matrix.minecraft }}' '-PvssBuildId=ci-${{ github.sha }}'
+          "-PvssVoxyJar=$VOXY_JAR" "-PvssIrisJar=$IRIS_JAR"
+      - name: Start server, generate a real column and save its cache
+        run: python tools/verification/server_smoke.py --minecraft '${{ matrix.minecraft }}'
+      - name: Verify packaged metadata and source snapshot
+        run: >-
+          python tools/verification/verify_release.py
+          'lib/vss-0.3.6-fabric-${{ matrix.minecraft }}.jar'
+          --platform fabric --source . --minecraft '${{ matrix.minecraft }}'
+          --build-id 'ci-${{ github.sha }}'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fabric-${{ matrix.minecraft }}
+          path: |
+            lib/*.jar
+            build/**/test-results/**/TEST-*.xml
+            build/**/server-smoke.json
+            build/**/server-smoke.log

@@ -1,0 +1,101 @@
+package dev.xantha.vss.client.prediction;
+
+import java.nio.ByteBuffer;
+import java.nio.file.Path;
+
+/**
+ * Independent ABI 6 for the source-built Rust backend. All numerical work runs
+ * in Rust; Java supplies effective registries, colormaps and immutable inputs.
+ *
+ * <p>A surface region is before carvers/structures/decoration and
+ * must not be published as a completed generated chunk. Query support before
+ * sending a feature; unsupported Java/mod codecs are never silently skipped.
+ *
+ * <p>Buffers are direct, little endian, indexed from the buffer base. Pass a
+ * slice when using a nonzero position. Counts are records, never byte counts.
+ * World/result handles must be closed; a result retains its parent world.
+ */
+public final class RustWorldgenBackend {
+    public static final int ABI = 6;
+    private static boolean loaded;
+    private RustWorldgenBackend() { }
+    public static synchronized void load(Path library) {
+        // Two copies have separate handle tables; JNI can bind methods from
+        // either copy. All world/result methods must share one native instance.
+        if (loaded) return;
+        System.load(library.toAbsolutePath().toString());
+        if (abi() != ABI) throw new IllegalStateException("VSS worldgen ABI mismatch");
+        loaded = true;
+    }
+    public static native long openPalette(String compactDocument);
+    public static native void closePalette(long palette);
+    public static native String describeCompact(long world);
+    public static native int abi();
+    /** In-place 36-byte compact FTF cells; validates before committing ordered tile filters. */
+    public static native void freeTerraForgedFilters(ByteBuffer cells, String settings);
+    public static native long create(long seed, long biomeZoomSeed, String document);
+    public static native int close(long handle);
+    /** Stops outstanding surface work at column boundaries before closing a sampler. */
+    public static native void cancel(long world);
+    /** Replaces both resource-pack colormaps atomically; terrain algorithms stay unchanged. */
+    public static native void colormaps(long world,String document);
+    public static native String describe(long handle);
+    public static native String support(long world, String featureJson, int placedFeature);
+    /** XYZ int32 input; one float64 density per point, at most 65,536 points. */
+    public static native int density(long world, String routerNode, ByteBuffer xyz, ByteBuffer output, int count);
+    /** XZ int32 input; record = four int32 (surface, floor, fluid, height), then height int32 state IDs. */
+    public static native int columns(long world, ByteBuffer xz, ByteBuffer output, int count);
+    /** Exact non-air union of a 1/2/4-block footprint over [bottom,top), one byte per Y.
+     * Returns zero for an unoccupied anchor roof, -2 to use state-ID columns. Additive ABI 6 entry point. */
+    public static native int exteriorFootprint(long world, int x, int z, int step,
+                                               int bottom, int top, ByteBuffer output);
+    /** Additive batch entry point: up to eight 20-byte requests, fixed output row stride. */
+    public static native int exteriorFootprints(long world, ByteBuffer requests, ByteBuffer output, int count);
+    /** Complete material columns, same record layout as columns. */
+    public static native int interiorColumns(long world, ByteBuffer xz, ByteBuffer output, int count);
+    /** 1..5 chunks per side; returns a native volume result, not a world handle. */
+    public static native long surfaceRegion(long world, int minChunkX, int minChunkZ, int sideChunks);
+    /** Copies a complete bounded neighbourhood snapshot; state IDs refer to describe(world). */
+    public static native long createVolume(long world, int x, int y, int z,
+                                          int width, int height, int depth, ByteBuffer blocks);
+    /** Dense int32 state IDs in X,Z,Y order; state table and bounds are in describe(result). */
+    public static native int readVolume(long result, ByteBuffer output);
+    /** Explicit configured feature with supplied WorldgenRandom seed, on the result's current block context. */
+    public static native String feature(long result, String featureJson, long randomSeed, int x, int y, int z);
+    /** Global per-step feature order computed by Rust from ordered possible_biomes. */
+    public static native String schedule(long world);
+    /** Rust derives decoration/feature seeds, checks biome membership and applies modifiers lazily. */
+    public static native String placedFeature(long result, String name, int chunkX, int chunkZ, int globalIndex, int step);
+    /** 256 X,Z records of ten int32: floor, fluid top/kind, flags, three material states, grass/leaf/water RGB. */
+    public static native int surfaceColumns(long world, int chunkX, int chunkZ, ByteBuffer output);
+    /** Sparse XZ int32 input, at most 64 records, same ten-int32 output as surfaceColumns. */
+    public static native int surfacePoints(long world, ByteBuffer xz, ByteBuffer output, int count);
+    public static native int previewPoints(long world, ByteBuffer xz, ByteBuffer output, int count);
+    /** Display-only approximation, including visual vegetation; never seed exact caches. */
+    public static native int displayPoints(long world, ByteBuffer xz, ByteBuffer output, int count);
+    /** Additive ABI 6 entry: complete 8x8 shape plus missing bits (row-major).
+     * Writes 64 ten-int records; callers consume only missing cells and keep known exact values.
+     * Older external ABI 6 libraries may lack this entry; callers must use displayPoints then. */
+    public static native int displayGrid(long world, int x, int z, int spacing, long missing, ByteBuffer output);
+    /** Existing prediction surface context, 5x5 chunks, assembled in Rust. */
+    public static native long surfaceProxy(long world, int centerChunkX, int centerChunkZ);
+    /** Separate display policy; exact surfaceProxy callers never see approximate records. */
+    public static native long decorationProxy(long world, int centerChunkX, int centerChunkZ, int display);
+    public static native int decorationPoints(long world, ByteBuffer xz, ByteBuffer output, int count);
+    public static native String decorationQueryStats(long world);
+    /** External Java Random entropy for vanilla Collections.shuffle; not the terrain seed. */
+    public static native void decorationEntropy(long result,long seed);
+    /** Sparse XYZ/state-ID edits; validated atomically before any writes. */
+    public static native int applyEdits(long result, ByteBuffer edits, int count);
+    /** Drains committed native edits on a successful copy; a rejected buffer preserves them. */
+    public static native int readEdits(long result, ByteBuffer output);
+    /** Grass, foliage and water tints at a block position, before optional biome blending. */
+    public static native String colors(long world, int x, int y, int z);
+    /** Three RGB int32 values at the exact block position, using BiomeManager zoom. */
+    public static native int tints(long world, int x, int y, int z, ByteBuffer output);
+    /** Additive ABI 6 sidecar: up to 256 raw noise-quart XYZ int32 positions, one int32
+     * biome index per position into describe(world).biome_names (also in describeCompact).
+     * No BiomeManager zoom or height clamp; existing ten-int surface records are unchanged.
+     * Older libraries may omit both the palette and this entry point. */
+    public static native int biomeIndices(long world, ByteBuffer quartXyz, ByteBuffer output, int count);
+}

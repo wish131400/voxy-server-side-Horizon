@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "commit": "0dabe4a6e329ae07627718092d50cc644231bea0",
+  "workflowUrl": "https://github.com/wish131400/voxy-server-side-Horizon/actions/runs/40830261663",
+  "sourceSha256": "4a07fa30e1e93eaafda6f47e11132d656f0baefc56f2a3d85e63e679eb054612",
+  "libraries": {
+    "windows-x86_64/vss_native_core.dll": "0e3795825f6df1af99f0e77af30bb897ac122f3e77337696959efcc444d6edbe",
+    "linux-x86_64/libvss_native_core.so": "dd0c3f34641eed5e10d3243fae0f4c5f17fd76153d838c1f53e27bf65b1d9b5e",
+    "linux-aarch64/libvss_native_core.so": "615c81979a0eed24f6b744438a47d44bafd51a9c7fa23944a1ba73562b31f689",
+    "macos-x86_64/libvss_native_core.dylib": "ca3433cc29c2adadf67ee9eb36efa8b5baaaa12c2dc8dbddfaac58ebf664dde2",
+    "macos-aarch64/libvss_native_core.dylib": "c8877786de2a50a3420df38bb41b3e7d47ff4b1ff42be5183e10694f0077c275"
+  }
+}

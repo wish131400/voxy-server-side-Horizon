@@ -1,0 +1,131 @@
+package dev.xantha.vss.networking.client;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import dev.xantha.vss.common.VSSConstants;
+import dev.xantha.vss.config.VSSServerConfig;
+import org.junit.jupiter.api.Test;
+
+class RequestWindowTest {
+
+    @Test
+    void zeroNearRateKeepsProtocolBatchUnlimited() {
+        assertEquals(VSSConstants.MAX_BATCH_CHUNK_REQUESTS, LodRequestManager.syncBucketLimit(0, true));
+        assertEquals(0, LodRequestManager.syncBucketLimit(0, false));
+    }
+
+    @Test
+    void explicitSyncRateIsClampedToConfigMaximum() {
+        assertEquals(
+                VSSServerConfig.MAX_SYNC_RATE_LIMIT_PER_TICK,
+                LodRequestManager.syncBucketLimit(VSSConstants.MAX_BATCH_CHUNK_REQUESTS, true));
+    }
+
+    @Test
+    void xaeroBackpressureDoesNotLimitVssBudget() {
+        assertEquals(256, LodRequestManager.limitForXaeroBackpressure(256, true));
+        assertEquals(3, LodRequestManager.limitForXaeroBackpressure(3, true));
+        assertEquals(256, LodRequestManager.limitForXaeroBackpressure(256, false));
+        assertEquals(0, LodRequestManager.limitForXaeroBackpressure(0, true));
+    }
+
+    @Test
+    void emptyWindowHasNoCapacity() {
+        RequestWindow window = new RequestWindow(0, 0, 0, 0, 0, 0);
+
+        assertFalse(window.hasCapacity());
+        assertFalse(window.hasAnySyncCapacity());
+        assertEquals(0, window.remaining());
+    }
+
+    @Test
+    void syncRingsConsumeTheirOwnBuckets() {
+        RequestWindow window = new RequestWindow(1, 1, 1, 1, 0, 0);
+
+        window.record(false, false, VSSConstants.SYNC_NEAR_DISTANCE_CHUNKS);
+        window.record(false, false, VSSConstants.SYNC_NEAR_DISTANCE_CHUNKS + 1);
+        window.record(false, false, VSSConstants.SYNC_MID_DISTANCE_CHUNKS + 1);
+        window.record(false, false, VSSConstants.SYNC_FAR_DISTANCE_CHUNKS + 1);
+
+        assertEquals(4, window.syncSent());
+        assertFalse(window.hasAnySyncCapacity());
+        assertEquals(0, window.remaining());
+    }
+
+    @Test
+    void dirtyAndGenerationUseIndependentBudgets() {
+        RequestWindow window = new RequestWindow(1, 0, 0, 0, 1, 1);
+
+        assertTrue(window.hasGenerationCapacity());
+        assertTrue(window.canSend(true, false, 0));
+        assertTrue(window.canSend(false, true, 0));
+        window.record(true, false, 0);
+        window.record(false, true, 0);
+
+        assertEquals(1, window.dirtySent());
+        assertEquals(1, window.generationSent());
+        assertFalse(window.hasGenerationCapacity());
+        assertEquals(1, window.remaining());
+        assertTrue(window.hasNearSyncCapacity());
+    }
+
+    @Test
+    void firstPassDiskProbeUsesSyncBudgetWithoutOccupyingGenerationBudget() {
+        RequestWindow window = new RequestWindow(1, 0, 0, 0, 0, 0);
+
+        assertTrue(window.hasAnySyncCapacity());
+        assertFalse(window.hasGenerationCapacity());
+        assertTrue(window.canSend(false, false, VSSConstants.SYNC_NEAR_DISTANCE_CHUNKS));
+
+        window.record(false, false, VSSConstants.SYNC_NEAR_DISTANCE_CHUNKS);
+
+        assertEquals(1, window.syncSent());
+        assertEquals(0, window.generationSent());
+        assertFalse(window.hasAnySyncCapacity());
+    }
+
+    @Test
+    void cacheProbeUsesIndependentBudget() {
+        RequestWindow window = new RequestWindow(0, 0, 0, 0, 0, 2, 0);
+
+        assertFalse(window.hasAnySyncCapacity());
+        assertFalse(window.hasGenerationCapacity());
+        assertTrue(window.hasCacheProbeCapacity());
+        assertTrue(window.canSend(false, false, true, 128));
+
+        window.record(false, false, true, 128);
+        window.record(false, false, true, 128);
+
+        assertEquals(0, window.cacheProbeRemaining());
+        assertEquals(0, window.generationSent());
+        assertFalse(window.hasAnyNormalCandidateCapacity());
+    }
+
+    @Test
+    void firstPassGenerationCanUseItsOwnSlotWhenSyncBudgetIsExhausted() {
+        RequestWindow window = new RequestWindow(0, 0, 0, 0, 1, 0);
+
+        assertTrue(window.hasAnyNormalCandidateCapacity());
+        assertTrue(window.hasNormalCandidateCapacity(VSSConstants.SYNC_NEAR_DISTANCE_CHUNKS));
+        assertTrue(window.canSend(false, true, VSSConstants.SYNC_NEAR_DISTANCE_CHUNKS));
+
+        window.record(false, true, VSSConstants.SYNC_NEAR_DISTANCE_CHUNKS);
+
+        assertFalse(window.hasAnyNormalCandidateCapacity());
+        assertEquals(1, window.generationSent());
+    }
+
+    @Test
+    void remainingNeverCountsNegativeBuckets() {
+        RequestWindow window = new RequestWindow(0, 0, 0, 0, 0, 1);
+
+        window.record(true, false, 0);
+        window.record(true, false, 0);
+
+        assertEquals(2, window.dirtySent());
+        assertEquals(0, window.remaining());
+        assertFalse(window.canSend(true, false, 0));
+    }
+}

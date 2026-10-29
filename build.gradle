@@ -1,0 +1,102 @@
+plugins {
+    id 'fabric-loom' version '1.16.3'
+    id 'maven-publish'
+}
+
+version = "${vss_version}-fabric-${minecraft_version}"
+group = mod_group_id
+base { archivesName = 'vss' }
+
+repositories {
+    mavenCentral()
+    exclusiveContent {
+        forRepository { maven { name = 'Modrinth'; url = 'https://api.modrinth.com/maven' } }
+        filter { includeGroup 'maven.modrinth' }
+    }
+}
+
+loom {
+    accessWidenerPath = file('src/main/resources/vss.accesswidener')
+    runs {
+        client { client(); runDir 'run/client' }
+        server { server(); runDir providers.gradleProperty('serverRunDir').getOrElse('run/server'); programArgs '--nogui' }
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${fabric_version}"
+    modCompileOnly 'maven.modrinth:modmenu:17.0.0'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testImplementation 'org.mockito:mockito-core:5.14.2'
+    testImplementation 'com.tngtech.archunit:archunit:1.3.0'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(java_version as int)
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = java_version as int
+    options.compilerArgs += ['-Xmaxerrs', '1500']
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    inputs.properties(version: project.version, minecraft_version: minecraft_version,
+            loader_version: loader_version, fabric_version: fabric_version, java_version: java_version)
+    filesMatching('fabric.mod.json') {
+        expand(version: project.version, minecraft_version: minecraft_version,
+                loader_version: loader_version, fabric_version: fabric_version, java_version: java_version)
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    from('LICENSE') { rename { 'LICENSE_vss' } }
+    def productionInputs = files(fileTree('src/main'), fileTree('src/versions'),
+            'build.gradle', 'fabric-next.gradle', 'settings.gradle', 'gradle.properties', 'gradle/minecraft-targets.gradle')
+    inputs.files(productionInputs)
+    doFirst {
+        def digest = java.security.MessageDigest.getInstance('SHA-256')
+        productionInputs.files.findAll { it.isFile() }.sort { a, b ->
+            relativePath(a).replace('\\', '/') <=> relativePath(b).replace('\\', '/')
+        }.each { input ->
+            digest.update(relativePath(input).replace('\\', '/').getBytes('UTF-8'))
+            digest.update((byte) 0)
+            digest.update(input.bytes)
+            digest.update((byte) 0)
+        }
+        manifest.attributes('VSS-Source-SHA256': java.util.HexFormat.of().formatHex(digest.digest()))
+    }
+    manifest {
+        attributes('Specification-Title': 'vss', 'Specification-Vendor': 'Xantha',
+                'Implementation-Title': project.name, 'Implementation-Version': project.version,
+                'VSS-Build-Id': providers.gradleProperty('vssBuildId').getOrElse('dev'),
+                'VSS-Source-Baseline': '9fc910393ad5b1fac35d69393adab26ffdf77e74',
+                'VSS-Platform': 'fabric', 'VSS-Minecraft': minecraft_version,
+                'VSS-Protocol': (file('src/main/java/dev/xantha/vss/common/VSSWireFormat.java').text =~ /PROTOCOL_VERSION = (\d+)/)[0][1],
+                'VSS-Column-Schema': (file('src/main/java/dev/xantha/vss/common/VSSWireFormat.java').text =~ /COLUMN_SCHEMA = (\d+)/)[0][1])
+    }
+}
+
+tasks.named('remapJar').configure {
+    destinationDirectory = layout.projectDirectory.dir('lib')
+}
+
+tasks.withType(Test).configureEach {
+    systemProperty 'vss.minecraftTarget', minecraft_version
+    useJUnitPlatform()
+    testLogging { events 'failed', 'skipped'; exceptionFormat 'full' }
+}
+
+tasks.named('runServer', JavaExec).configure { standardInput = System.in }
+
+apply from: 'tools/prediction/compat-tests.gradle'
+apply from: 'tools/verification/modules.gradle'
+apply from: 'tools/verification/fabric-contracts.gradle'
+apply from: 'tools/verification/client-smoke.gradle'

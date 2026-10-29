@@ -1,0 +1,11 @@
+pluginManagement {
+    repositories {
+        maven { url = 'https://maven.fabricmc.net/' }
+        gradlePluginPortal()
+    }
+}
+
+rootProject.name = 'voxy-server-side-horizon'
+if (providers.gradleProperty('mcTarget').getOrElse('1.21.11') != '1.21.11') {
+    rootProject.buildFileName = 'fabric-next.gradle'
+}

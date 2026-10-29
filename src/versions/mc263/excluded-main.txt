@@ -1,0 +1,8 @@
+# Minecraft 26.3 supplies DensityFunctionCompiler and worker-local SamplerContext.
+dev/xantha/vss/client/prediction/DensityMemo.java
+dev/xantha/vss/client/prediction/DensityGraphCompiler.java
+dev/xantha/vss/client/prediction/DensityCompilerSupport.java
+dev/xantha/vss/client/prediction/DensityCompilation.java
+dev/xantha/vss/client/prediction/PredictionRawDensity.java
+dev/xantha/vss/client/prediction/PredictionVanillaDensity.java
+dev/xantha/vss/client/prediction/PredictionDensityOrder.java

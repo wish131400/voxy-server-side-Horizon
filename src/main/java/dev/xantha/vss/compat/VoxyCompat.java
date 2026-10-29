@@ -1,0 +1,695 @@
+package dev.xantha.vss.compat;
+
+import dev.xantha.vss.api.VSSApi;
+import dev.xantha.vss.api.VoxelColumnData;
+import dev.xantha.vss.common.VSSLogger;
+import dev.xantha.vss.common.DiagnosticCounters;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.lang.reflect.Field;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.OptionalInt;
+import java.util.Set;
+import java.util.WeakHashMap;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongConsumer;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.chunk.DataLayer;
+import net.minecraft.world.level.chunk.LevelChunkSection;
+
+final class VoxyCompat {
+    private static final int VOXY_BASE_LOD_LEVEL = 0;
+    private static final long LOCAL_INDEX_RETRY_NANOS = 30_000_000_000L;
+    private static MethodHandle worldIdentifierOf;
+    private static MethodHandle rawIngest;
+    private static MethodHandle worldEngineNullable;
+    private static MethodHandle getStorage;
+    private static MethodHandle iterateStoredSectionPositions;
+    private static MethodHandle acquireWorldRef;
+    private static MethodHandle releaseWorldRef;
+    private static volatile boolean trackIngestCompletion;
+    private static volatile MethodHandle getVoxyConfig;
+    private static volatile MethodHandle getSectionRenderDist;
+    private static volatile MethodHandle getEnabled;
+    private static volatile MethodHandle getEnableRendering;
+    private static final DiagnosticCounters ingestDiagnostics = new DiagnosticCounters(
+            VSSLogger::isDebugEnabled, 5_000_000_000L);
+    private static volatile String lastAcceptedColumn = "none";
+    private static boolean voxyStateInitialized;
+    private static boolean lastRenderAvailable;
+    private static boolean lastIngestAvailable;
+    private static boolean localIndexWarningLogged;
+    private static final Map<Object, LocalSectionIndex> localIndexes =
+            Collections.synchronizedMap(new WeakHashMap<>());
+
+    private VoxyCompat() {
+    }
+
+    /** Completed real coverage survives later updates. Stored section bounds alone do not prove air. */
+    static boolean confirmedPredictionColumn(Object engine, int x, int z) {
+        LocalSectionIndex index = localIndexes.get(engine);
+        return index != null && index.hasSettled(x, z);
+    }
+
+    /** Resolve the world index once per composition, rather than once per voxel column. */
+    static VoxyPredictionBridge.RealColumn confirmedPredictionColumns(Object engine) {
+        LocalSectionIndex index = localIndexes.get(engine);
+        return index == null ? (x,z) -> false
+                : index::hasSettled;
+    }
+
+    /** Record completion even before a render context exists; later ingests do not revoke it. */
+    static void settlePredictionColumn(int x, int z) {
+        if (VoxyIngestTracker.pendingColumn(x, z)) return;
+        synchronized (localIndexes) {
+            for (LocalSectionIndex index : localIndexes.values())
+                if (!index.cancelled && index.hasConfirmed(x, z) && !index.hasSettled(x, z))
+                    index.markSettled(x, z);
+        }
+    }
+
+    static boolean init() {
+        try {
+            MethodHandles.Lookup lookup = MethodHandles.lookup();
+            Class<?> worldIdClass = Class.forName("me.cortex.voxy.commonImpl.WorldIdentifier");
+            worldIdentifierOf = lookup
+                    .findStatic(worldIdClass, "of", MethodType.methodType(worldIdClass, Level.class))
+                    .asType(MethodType.methodType(Object.class, Level.class));
+            initLocalIndexHandles(lookup, worldIdClass);
+
+            Class<?> ingestClass = Class.forName("me.cortex.voxy.common.world.service.VoxelIngestService");
+            rawIngest = lookup.findStatic(
+                    ingestClass,
+                    "rawIngest",
+                    MethodType.methodType(
+                            Boolean.TYPE,
+                            worldIdClass,
+                            LevelChunkSection.class,
+                            Integer.TYPE,
+                            Integer.TYPE,
+                            Integer.TYPE,
+                            DataLayer.class,
+                            DataLayer.class));
+            trackIngestCompletion = hasProcessJobCompletionHook(ingestClass);
+            if (!trackIngestCompletion) {
+                VSSLogger.warn("Voxy ingest completion hook unavailable; near-first LOD will use mesh and GPU coverage");
+            }
+
+            VSSApi.registerColumnProcessingConsumer((level, dimension, chunkX, chunkZ, columnData) -> {
+                ingestDiagnostics.record("columnsOffered");
+                if (!VSSApi.clientSession().isClientLodSessionActive()) {
+                    ingestDiagnostics.record("columnsRejected");
+                    return false;
+                }
+                try {
+                    if (!isIngestAvailable()) {
+                        ingestDiagnostics.record("columnsRejected");
+                        return false;
+                    }
+                    Object worldId = worldIdentifierOf.invoke(level);
+                    if (worldId == null) {
+                        ingestDiagnostics.record("columnsRejected");
+                        return false;
+                    }
+
+                    if (columnData.sections().length == 0) {
+                        if (columnData.replaceMissingSections()) {
+                            if (!clearMissingSections(worldId, level, chunkX, chunkZ, Set.of())) {
+                                ingestDiagnostics.record("columnsRejected");
+                                return false;
+                            }
+                        }
+                        if (columnData.authoritative()) markLocalColumnPresent(level, chunkX, chunkZ);
+                        ingestDiagnostics.record("columnsAccepted");
+                        ingestDiagnostics.record("emptyColumnsAccepted");
+                        if (VSSLogger.isDebugEnabled()) {
+                            lastAcceptedColumn = dimension.identifier() + "@" + chunkX + "," + chunkZ;
+                        }
+                        return true;
+                    }
+
+                    boolean accepted = true;
+                    for (VoxelColumnData.SectionData sectionData : columnData.sections()) {
+                        accepted &= ingestSection(worldId, sectionData, chunkX, chunkZ);
+                    }
+                    if (!accepted) {
+                        ingestDiagnostics.record("columnsRejected");
+                        return false;
+                    }
+                    if (columnData.replaceMissingSections()) {
+                        Set<Integer> presentSections = replacementSectionSet(columnData);
+                        if (!clearMissingSections(worldId, level, chunkX, chunkZ, presentSections)) {
+                            ingestDiagnostics.record("columnsRejected");
+                            return false;
+                        }
+                    }
+                    if (columnData.authoritative()) markLocalColumnPresent(level, chunkX, chunkZ);
+                    ingestDiagnostics.record("columnsAccepted");
+                    if (VSSLogger.isDebugEnabled()) {
+                        lastAcceptedColumn = dimension.identifier() + "@" + chunkX + "," + chunkZ;
+                    }
+                    return true;
+                } catch (Throwable e) {
+                    if (e instanceof Error && !(e instanceof LinkageError) && !(e instanceof AssertionError)) {
+                        throw (Error) e;
+                    }
+                    VSSLogger.error("Voxy raw ingest failed", e);
+                    ingestDiagnostics.record("columnsRejected");
+                    return false;
+                }
+            });
+            VSSLogger.info("Voxy detected, registered raw ingest bridge");
+            return true;
+        } catch (ClassNotFoundException e) {
+            VSSLogger.warn("Voxy compat: class not found - " + e.getMessage());
+            return false;
+        } catch (NoSuchMethodException e) {
+            VSSLogger.warn("Voxy compat: method not found - " + e.getMessage());
+            return false;
+        } catch (Throwable e) {
+            VSSLogger.error("Failed to initialize Voxy compat", e);
+            return false;
+        }
+    }
+
+    private static void initLocalIndexHandles(MethodHandles.Lookup lookup, Class<?> worldIdClass) {
+        try {
+            Class<?> worldEngineClass = Class.forName("me.cortex.voxy.common.world.WorldEngine");
+            VoxySectionPosition.bind(worldEngineClass);
+            Class<?> sectionStorageClass = Class.forName("me.cortex.voxy.common.config.section.SectionStorage");
+            worldEngineNullable = lookup
+                    .findStatic(worldIdClass, "ofEngineNullable", MethodType.methodType(worldEngineClass, Level.class))
+                    .asType(MethodType.methodType(Object.class, Level.class));
+            getStorage = lookup
+                    .findGetter(worldEngineClass, "storage", sectionStorageClass)
+                    .asType(MethodType.methodType(Object.class, Object.class));
+            acquireWorldRef = lookup.findVirtual(worldEngineClass, "acquireRef", MethodType.methodType(Void.TYPE))
+                    .asType(MethodType.methodType(Void.TYPE, Object.class));
+            releaseWorldRef = lookup.findVirtual(worldEngineClass, "releaseRef", MethodType.methodType(Void.TYPE))
+                    .asType(MethodType.methodType(Void.TYPE, Object.class));
+        } catch (Throwable e) {
+            VSSLogger.debug("Voxy local section index query unavailable: " + e.getMessage());
+            worldEngineNullable = null;
+            getStorage = null;
+            iterateStoredSectionPositions = null;
+            acquireWorldRef = null;
+            releaseWorldRef = null;
+            return;
+        }
+
+        try {
+            iterateStoredSectionPositions = findStoredSectionIterator(lookup);
+        } catch (Throwable e) {
+            VSSLogger.debug("Voxy local section iterator unavailable: " + e.getMessage());
+            iterateStoredSectionPositions = null;
+        }
+    }
+
+    private static MethodHandle findStoredSectionIterator(MethodHandles.Lookup lookup) throws Throwable {
+        Throwable currentApiFailure;
+        try {
+            Class<?> iteratorClass = Class.forName("me.cortex.voxy.common.config.IStoredSectionPositionIterator");
+            MethodHandle currentIterator = lookup
+                    .findVirtual(iteratorClass, "iteratePositions",
+                            MethodType.methodType(Void.TYPE, Integer.TYPE, LongConsumer.class))
+                    .asType(MethodType.methodType(Void.TYPE, Object.class, Integer.TYPE, LongConsumer.class));
+            return MethodHandles.insertArguments(currentIterator, 1, VOXY_BASE_LOD_LEVEL);
+        } catch (Throwable e) {
+            currentApiFailure = e;
+        }
+
+        try {
+            Class<?> mappingStorageClass = Class.forName("me.cortex.voxy.common.config.IMappingStorage");
+            return lookup
+                    .findVirtual(mappingStorageClass, "iterateStoredSectionPositions",
+                            MethodType.methodType(Void.TYPE, LongConsumer.class))
+                    .asType(MethodType.methodType(Void.TYPE, Object.class, LongConsumer.class));
+        } catch (Throwable legacyApiFailure) {
+            legacyApiFailure.addSuppressed(currentApiFailure);
+            throw legacyApiFailure;
+        }
+    }
+
+    static void clientTick() {
+        if (!VSSApi.clientSession().isClientLodSessionActive()) {
+            ingestDiagnostics.reset();
+            lastAcceptedColumn = "none";
+        } else {
+            String events = ingestDiagnostics.poll(System.nanoTime());
+            if (events != null) {
+                var minecraft = net.minecraft.client.Minecraft.getInstance();
+                var player = minecraft.player;
+                VSSLogger.debug("VSS voxy ingest diagnostic v2: " + events
+                        + ",lastAccepted=" + lastAcceptedColumn
+                        + ",playerChunk=" + (player == null ? "none"
+                                : (player.getBlockX() >> 4) + "," + (player.getBlockZ() >> 4))
+                        + ",clientView=" + minecraft.options.getEffectiveRenderDistance()
+                        + ",acceptedMeans=enqueued-not-rendered");
+            }
+        }
+        boolean renderAvailable = isRenderAvailable();
+        boolean ingestAvailable = isIngestAvailable();
+        if (!voxyStateInitialized) {
+            lastRenderAvailable = renderAvailable;
+            lastIngestAvailable = ingestAvailable;
+            voxyStateInitialized = true;
+            return;
+        }
+
+        if ((!lastRenderAvailable && renderAvailable) || (!lastIngestAvailable && ingestAvailable)) {
+            VSSApi.clientSession().forceLodResync("Voxy became available again");
+        }
+        lastRenderAvailable = renderAvailable;
+        lastIngestAvailable = ingestAvailable;
+    }
+
+    static void onDisconnect() {
+        synchronized (localIndexes) {
+            for (LocalSectionIndex index : localIndexes.values()) {
+                index.cancelled = true;
+            }
+            localIndexes.clear();
+        }
+        lastLocalIndex = null;
+    }
+
+    private static boolean trackedRawIngest(Object worldId, LevelChunkSection section,
+                                            int cx, int sy, int cz, DataLayer block, DataLayer sky) throws Throwable {
+        return VoxyIngestControl.runServerIngest(() -> trackIngestCompletion
+                ? VoxyIngestTracker.runRawIngest(section, cx, cz,
+                    () -> (boolean) rawIngest.invoke(worldId, section, cx, sy, cz, block, sky))
+                : (boolean) rawIngest.invoke(worldId, section, cx, sy, cz, block, sky));
+    }
+
+    static boolean hasProcessJobCompletionHook(Class<?> ingestClass) {
+        try {
+            var marker = ingestClass.getDeclaredMethod("vss$ingestTrackingReady");
+            return marker.getReturnType() == Boolean.TYPE
+                    && java.lang.reflect.Modifier.isStatic(marker.getModifiers())
+                    && Boolean.TRUE.equals(marker.invoke(null));
+        } catch (ReflectiveOperationException failure) {
+            return false;
+        }
+    }
+
+    private static boolean ingestSection(
+            Object worldId,
+            VoxelColumnData.SectionData sectionData,
+            int chunkX,
+            int chunkZ) throws Throwable {
+        boolean accepted = trackedRawIngest(
+                worldId,
+                sectionData.section(),
+                chunkX,
+                sectionData.sectionY(),
+                chunkZ,
+                sectionData.blockLight(),
+                sectionData.skyLight());
+        ingestDiagnostics.record(accepted ? "rawSectionsAccepted" : "rawSectionsRejected");
+        return accepted;
+    }
+
+    private static Set<Integer> replacementSectionSet(VoxelColumnData columnData) {
+        HashSet<Integer> presentSections = new HashSet<>();
+        for (int sectionY : columnData.replacementSectionYs()) {
+            presentSections.add(sectionY);
+        }
+        return presentSections;
+    }
+
+    private static boolean clearMissingSections(
+            Object worldId,
+            Level level,
+            int chunkX,
+            int chunkZ,
+            Set<Integer> presentSections)
+            throws Throwable {
+        boolean accepted = true;
+        int minSection = level.getMinSectionY();
+        int maxSection = minSection + level.getSectionsCount();
+        for (int sectionY = minSection; sectionY < maxSection; sectionY++) {
+            if (!presentSections.contains(sectionY)) {
+                boolean sectionAccepted = trackedRawIngest(
+                        worldId,
+                        new LevelChunkSection(level.palettedContainerFactory()),
+                        chunkX,
+                        sectionY,
+                        chunkZ,
+                        null,
+                        null);
+                ingestDiagnostics.record(sectionAccepted ? "rawSectionsAccepted" : "rawSectionsRejected");
+                accepted &= sectionAccepted;
+            }
+        }
+        return accepted;
+    }
+
+    static ModCompat.LocalColumnState getLocalColumnState(Level level, int chunkX, int chunkZ) {
+        if (level == null || worldEngineNullable == null) {
+            return ModCompat.LocalColumnState.UNKNOWN;
+        }
+        try {
+            Object engine = worldEngineNullable.invoke(level);
+            if (engine == null) {
+                return ModCompat.LocalColumnState.UNKNOWN;
+            }
+            LocalSectionIndex index = localIndex(engine);
+            lastLocalIndex = index;
+            if (index.hasConfirmed(chunkX, chunkZ)) {
+                return ModCompat.LocalColumnState.PRESENT;
+            }
+            if (getStorage == null || iterateStoredSectionPositions == null
+                    || acquireWorldRef == null || releaseWorldRef == null || index.unavailable) {
+                return ModCompat.LocalColumnState.UNKNOWN;
+            }
+            // This index covers all stored sections. A distant query is not
+            // player movement and must not trigger a whole-database rebuild.
+            long now = System.nanoTime();
+            var minecraft = net.minecraft.client.Minecraft.getInstance();
+            if (minecraft != null && minecraft.level == level && minecraft.player != null) {
+                index.refresh.observePlayer(minecraft.player.getBlockX() >> 4,
+                        minecraft.player.getBlockZ() >> 4, now);
+            }
+            if (index.refresh.shouldRefresh(index.ready, index.lastBuildCompletedNanos, now)) {
+                startLocalIndexBuild(engine, index);
+            }
+            if (!index.ready) {
+                return ModCompat.LocalColumnState.UNKNOWN;
+            }
+            return resolveLocalIndexState(false, true, index.hasStored(chunkX, chunkZ));
+        } catch (Throwable e) {
+            if (!localIndexWarningLogged) {
+                localIndexWarningLogged = true;
+                VSSLogger.debug("Voxy local section index query failed: " + e.getMessage());
+            }
+            return ModCompat.LocalColumnState.UNKNOWN;
+        }
+    }
+
+    static ModCompat.LocalColumnState resolveLocalIndexState(boolean confirmed, boolean ready, boolean stored) {
+        if (confirmed) {
+            return ModCompat.LocalColumnState.PRESENT;
+        }
+        if (!ready) {
+            return ModCompat.LocalColumnState.UNKNOWN;
+        }
+        return stored ? ModCompat.LocalColumnState.PRESENT : ModCompat.LocalColumnState.MISSING;
+    }
+
+    private static void markLocalColumnPresent(Level level, int chunkX, int chunkZ) {
+        if (level == null || worldEngineNullable == null) {
+            return;
+        }
+        try {
+            Object engine = worldEngineNullable.invoke(level);
+            if (engine == null) {
+                return;
+            }
+            LocalSectionIndex index = localIndex(engine);
+            index.markConfirmed(chunkX, chunkZ);
+            VoxyPredictionBridge.realColumnSettled(chunkX, chunkZ);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static LocalSectionIndex localIndex(Object engine) {
+        synchronized (localIndexes) {
+            return localIndexes.computeIfAbsent(engine, ignored -> new LocalSectionIndex());
+        }
+    }
+
+    private static void startLocalIndexBuild(Object engine, LocalSectionIndex index) {
+        long now = System.nanoTime();
+        if (index.cancelled || now - index.nextBuildAttemptNanos < 0L) {
+            return;
+        }
+        if (!index.buildStarted.compareAndSet(false, true)) {
+            return;
+        }
+        boolean acquired = false;
+        boolean handedOff = false;
+        try {
+            // Voxy's idle cleaner closes the RocksDB storage when no world refs
+            // remain. Pin the engine before handing its storage to a worker.
+            acquireWorldRef.invoke(engine);
+            acquired = true;
+            if (index.cancelled) return;
+            index.refresh.startedBuild();
+            index.builds.incrementAndGet();
+            Thread thread = new Thread(() -> runLocalIndexBuild(engine, index, now), "VSS Voxy local index");
+            thread.setDaemon(true);
+            thread.setPriority(Thread.NORM_PRIORITY - 1);
+            thread.start();
+            handedOff = true;
+        } catch (Throwable failure) {
+            index.nextBuildAttemptNanos = System.nanoTime() + LOCAL_INDEX_RETRY_NANOS;
+            VSSLogger.debug("Voxy local section index scan could not start: " + failure.getMessage());
+        } finally {
+            if (!handedOff) {
+                try {
+                    if (acquired) releaseWorldRef.invoke(engine);
+                } catch (Throwable failure) {
+                    VSSLogger.warn("Failed to release Voxy world after local index startup", failure);
+                } finally {
+                    index.buildStarted.set(false);
+                }
+            }
+        }
+    }
+
+    private static void runLocalIndexBuild(Object engine, LocalSectionIndex index, long startedNanos) {
+        try {
+            if (index.cancelled) return;
+            // Build into shadow maps and swap atomically: clearing the live maps
+            // would make every query read MISSING during a long scan.
+            ConcurrentHashMap<Long, long[]> shadowStored = new ConcurrentHashMap<>();
+            Object storage = getStorage.invoke(engine);
+            if (storage == null) {
+                index.nextBuildAttemptNanos = System.nanoTime() + LOCAL_INDEX_RETRY_NANOS;
+                return;
+            }
+            LongConsumer consumer = sectionKey -> {
+                if (index.cancelled) throw new CancellationException("Voxy local index cancelled");
+                int level = (int) ((sectionKey >>> 60) & 15L);
+                if (level == VOXY_BASE_LOD_LEVEL) {
+                    index.markStoredWorldSection(shadowStored, unpackSectionX(sectionKey), unpackSectionZ(sectionKey));
+                }
+            };
+            iterateStoredSectionPositions.invoke(storage, consumer);
+            if (index.cancelled) return;
+            index.swapStored(shadowStored);
+            index.ready = true;
+            index.lastBuildCompletedNanos = System.nanoTime();
+            index.buildNanos.addAndGet(index.lastBuildCompletedNanos - startedNanos);
+        } catch (Throwable e) {
+            index.ready = false;
+            if (index.cancelled) return;
+            if (isUnsupportedLocalIndexQuery(e)) {
+                index.unavailable = true;
+            } else {
+                index.nextBuildAttemptNanos = System.nanoTime() + LOCAL_INDEX_RETRY_NANOS;
+            }
+            if (!localIndexWarningLogged) {
+                localIndexWarningLogged = true;
+                VSSLogger.debug("Voxy local section index build failed: " + e.getMessage());
+            }
+        } finally {
+            try {
+                releaseWorldRef.invoke(engine);
+            } catch (Throwable failure) {
+                VSSLogger.warn("Failed to release Voxy world after local index scan", failure);
+            } finally {
+                index.buildStarted.set(false);
+            }
+        }
+    }
+
+    private static long regionKey(int regionX, int regionZ) {
+        return ((long) regionX << 32) ^ (regionZ & 0xFFFFFFFFL);
+    }
+
+    private static int unpackSectionX(long sectionKey) {
+        return VoxySectionPosition.x(sectionKey);
+    }
+
+    private static int unpackSectionZ(long sectionKey) {
+        return VoxySectionPosition.z(sectionKey);
+    }
+
+    static int chunkCoordinateForWorldSection(int worldSectionCoordinate, int localChunk) {
+        if (localChunk < 0 || localChunk > 1) {
+            throw new IllegalArgumentException("Voxy local chunk must be 0 or 1");
+        }
+        return (worldSectionCoordinate << 1) + localChunk;
+    }
+
+    private static boolean isUnsupportedLocalIndexQuery(Throwable failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof UnsupportedOperationException
+                    || "Not yet implemented".equalsIgnoreCase(current.getMessage())) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private static final class LocalSectionIndex {
+        private final ConcurrentHashMap<Long, long[]> confirmedRegions = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<Long, long[]> settledRegions = new ConcurrentHashMap<>();
+        private volatile ConcurrentHashMap<Long, long[]> storedRegions = new ConcurrentHashMap<>();
+        private final AtomicBoolean buildStarted = new AtomicBoolean();
+        private volatile boolean ready;
+        private volatile boolean unavailable;
+        private volatile boolean cancelled;
+        private volatile long nextBuildAttemptNanos;
+        private volatile long lastBuildCompletedNanos;
+        private final LocalIndexRefreshPolicy refresh = new LocalIndexRefreshPolicy();
+        private final java.util.concurrent.atomic.AtomicLong builds = new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicLong buildNanos = new java.util.concurrent.atomic.AtomicLong();
+
+        private void markConfirmed(int chunkX, int chunkZ) {
+            mark(confirmedRegions, chunkX, chunkZ);
+        }
+
+        private void markSettled(int chunkX, int chunkZ) {
+            mark(settledRegions, chunkX, chunkZ);
+        }
+
+        private boolean hasSettled(int chunkX, int chunkZ) {
+            return !cancelled && has(settledRegions, chunkX, chunkZ);
+        }
+
+        private void markStoredWorldSection(ConcurrentHashMap<Long, long[]> target,
+                                            int worldSectionX, int worldSectionZ) {
+            for (int localZ = 0; localZ < 2; localZ++) {
+                for (int localX = 0; localX < 2; localX++) {
+                    mark(
+                            target,
+                            chunkCoordinateForWorldSection(worldSectionX, localX),
+                            chunkCoordinateForWorldSection(worldSectionZ, localZ));
+                }
+            }
+        }
+
+        private void swapStored(ConcurrentHashMap<Long, long[]> shadow) {
+            storedRegions = shadow;
+        }
+
+        private int storedRegionCount() {
+            return storedRegions.size();
+        }
+
+        private static void mark(ConcurrentHashMap<Long, long[]> regions, int chunkX, int chunkZ) {
+            int regionX = Math.floorDiv(chunkX, 32);
+            int regionZ = Math.floorDiv(chunkZ, 32);
+            int slot = (chunkX & 31) | ((chunkZ & 31) << 5);
+            regions.compute(regionKey(regionX, regionZ), (key, bitmap) -> {
+                long[] target = bitmap != null ? bitmap : new long[16];
+                target[slot >>> 6] |= 1L << (slot & 63);
+                return target;
+            });
+        }
+
+        private boolean hasConfirmed(int chunkX, int chunkZ) {
+            return has(confirmedRegions, chunkX, chunkZ);
+        }
+
+        private boolean hasStored(int chunkX, int chunkZ) {
+            return has(storedRegions, chunkX, chunkZ);
+        }
+
+        private static boolean has(ConcurrentHashMap<Long, long[]> regions, int chunkX, int chunkZ) {
+            if (regions.isEmpty()) return false;
+            int regionX = Math.floorDiv(chunkX, 32);
+            int regionZ = Math.floorDiv(chunkZ, 32);
+            int slot = (chunkX & 31) | ((chunkZ & 31) << 5);
+            long[] bitmap = regions.get(regionKey(regionX, regionZ));
+            return bitmap != null && (bitmap[slot >>> 6] & (1L << (slot & 63))) != 0L;
+        }
+    }
+
+    /** Diagnostics for the exact-coverage sweep: index health and size. */
+    static String localIndexDiagnostics() {
+        LocalSectionIndex index = lastLocalIndex;
+        if (index == null) {
+            return "none";
+        }
+        return "ready=" + index.ready + ",unavailable=" + index.unavailable
+                + ",storedRegions=" + index.storedRegionCount()
+                + ",builds=" + index.builds.get() + ",buildMs=" + index.buildNanos.get() / 1_000_000L;
+    }
+
+    private static volatile LocalSectionIndex lastLocalIndex;
+
+    static OptionalInt getViewDistanceChunks() {
+        try {
+            initConfigHandles();
+            Object config = getVoxyConfig.invokeExact();
+            if (config == null || !readBoolean(getEnabled, config, true) || !readBoolean(getEnableRendering, config, true)) {
+                return OptionalInt.of(0);
+            }
+            float sectionDist = (float) getSectionRenderDist.invokeExact(config);
+            return OptionalInt.of(Math.max(Math.round(sectionDist * 32.0f), VoxyPredictionBridge.renderDistanceChunks()));
+        } catch (Throwable e) {
+            return OptionalInt.empty();
+        }
+    }
+
+    private static boolean isRenderAvailable() {
+        try {
+            initConfigHandles();
+            Object config = getVoxyConfig.invokeExact();
+            return config != null
+                    && readBoolean(getEnabled, config, true)
+                    && readBoolean(getEnableRendering, config, true);
+        } catch (Throwable e) {
+            return true;
+        }
+    }
+
+    private static boolean isIngestAvailable() {
+        try {
+            initConfigHandles();
+            Object config = getVoxyConfig.invokeExact();
+            return config != null && readBoolean(getEnabled, config, true);
+        } catch (Throwable e) {
+            return true;
+        }
+    }
+
+    private static boolean readBoolean(MethodHandle handle, Object config, boolean fallback) {
+        if (handle == null) {
+            return fallback;
+        }
+        try {
+            return (boolean) handle.invoke(config);
+        } catch (Throwable e) {
+            return fallback;
+        }
+    }
+
+    private static void initConfigHandles() throws Throwable {
+        if (getVoxyConfig != null) {
+            return;
+        }
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        Class<?> voxyConfigClass = Class.forName("me.cortex.voxy.client.config.VoxyConfig");
+        Field configField = voxyConfigClass.getField("CONFIG");
+        getSectionRenderDist = VoxyRenderAccess.distanceField(voxyConfigClass);
+        getEnabled = lookup
+                .findGetter(voxyConfigClass, "enabled", Boolean.TYPE)
+                .asType(MethodType.methodType(Boolean.TYPE, Object.class));
+        getEnableRendering = lookup
+                .findGetter(voxyConfigClass, "enableRendering", Boolean.TYPE)
+                .asType(MethodType.methodType(Boolean.TYPE, Object.class));
+        getVoxyConfig = lookup.unreflectGetter(configField).asType(MethodType.methodType(Object.class));
+    }
+}
