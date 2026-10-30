@@ -4,7 +4,10 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static dev.xantha.vss.testutil.DensityCodecFixtures.CODEC;
 
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.mojang.serialization.DataResult;
+import com.mojang.serialization.DynamicOps;
 import com.mojang.serialization.JsonOps;
 import dev.xantha.vss.common.worldgen.DensityFunctionSnapshot;
 import java.net.URLClassLoader;
@@ -16,6 +19,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.jar.JarFile;
 import net.minecraft.core.Holder;
+import net.minecraft.core.HolderLookup;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.resources.RegistryOps;
@@ -144,9 +148,11 @@ class TectonicPresetSnapshotTest {
                     router, base.surfaceRule(), base.spawnTarget(), base.seaLevel(), base.disableMobGeneration(),
                     base.aquifersEnabled(), base.oreVeinsEnabled(), base.useLegacyRandomSource());
             var captured = DensityFunctionSnapshot.applied(source);
-            var ops = RegistryOps.create(JsonOps.INSTANCE, lookup);
-            var json = NoiseGeneratorSettings.DIRECT_CODEC.encodeStart(ops, captured).result().orElseThrow();
-            var decoded = NoiseGeneratorSettings.DIRECT_CODEC.parse(ops, json).result().orElseThrow();
+            var ops = serializationContext(lookup);
+            var json = requireCodecSuccess("encode complete noise settings",
+                    NoiseGeneratorSettings.DIRECT_CODEC.encodeStart(ops, captured));
+            var decoded = requireCodecSuccess("decode complete noise settings",
+                    NoiseGeneratorSettings.DIRECT_CODEC.parse(ops, json));
             var restored = decoded.noiseRouter().finalDensity().mapAll(new DensityFunction.Visitor() {
                 public DensityFunction apply(DensityFunction value) { return value; }
                 public DensityFunction.NoiseHolder visitNoise(DensityFunction.NoiseHolder value) { return noise; }
@@ -159,6 +165,26 @@ class TectonicPresetSnapshotTest {
                 assertEquals(Double.doubleToRawLongBits(graph.compute(point)),
                         Double.doubleToRawLongBits(restored.compute(point)), "settings decode " + java.util.Arrays.toString(p));
             }
+        }
+    }
+
+    private static <T> T requireCodecSuccess(String stage, DataResult<T> result) {
+        return result.result().orElseThrow(() -> new AssertionError(stage + ": "
+                + result.error().map(error -> error.message()).orElse("codec returned no value or error")));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static RegistryOps<JsonElement> serializationContext(HolderLookup.Provider lookup) {
+        try {
+            // RegistrySetBuilder supplies its own holder owners for the vanilla bootstrap graph.
+            // Invoke through the public interface because the implementation class is package-private.
+            return (RegistryOps<JsonElement>) HolderLookup.Provider.class
+                    .getMethod("createSerializationContext", DynamicOps.class).invoke(lookup, JsonOps.INSTANCE);
+        } catch (NoSuchMethodException legacyMinecraft) {
+            // Minecraft 1.20.1 predates Provider.createSerializationContext.
+            return RegistryOps.create(JsonOps.INSTANCE, lookup);
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError("Cannot create the registry provider's serialization context", failure);
         }
     }
 
@@ -187,7 +213,7 @@ class TectonicPresetSnapshotTest {
             }
             var doc = LithostitchedNativeTest.document();
             var router = doc.getAsJsonObject("settings").getAsJsonObject("noise_router");
-            var ops = RegistryOps.create(JsonOps.INSTANCE, lookup);
+            var ops = serializationContext(lookup);
             for (var entry : source.entrySet()) router.add(entry.getKey(),
                     dev.xantha.vss.testutil.DensityCodecFixtures.CODEC.encodeStart(ops,
                             dev.xantha.vss.common.worldgen.DensityFunctionSnapshot.applied(entry.getValue())).result().orElseThrow());

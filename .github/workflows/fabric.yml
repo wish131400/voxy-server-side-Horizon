@@ -135,7 +135,9 @@ jobs:
           '-PmcTarget=${{ matrix.minecraft }}' '-PvssBuildId=ci-${{ github.sha }}'
           "-PvssVoxyJar=$VOXY_JAR" "-PvssIrisJar=$IRIS_JAR"
       - name: Verify optional dependency evidence runner
-        run: python -m unittest discover -s tools/verification -p test_optional_matrix.py
+        run: |
+          python -m unittest discover -s tools/verification -p test_optional_matrix.py
+          python -m unittest discover -s tools/verification -p test_remap_worldgen_test_jar.py
       - name: Apply optional adapters to pinned actual Fabric releases
         run: python tools/verification/optional_matrix.py --minecraft '${{ matrix.minecraft }}'
       - name: Start server, generate a real column and save its cache

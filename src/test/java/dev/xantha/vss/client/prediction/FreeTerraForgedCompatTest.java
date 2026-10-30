@@ -14,6 +14,7 @@ import net.minecraft.resources.*;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.junit.jupiter.api.io.TempDir;
 
 class FreeTerraForgedCompatTest {
     private static URLClassLoader releaseLoader;
@@ -58,8 +59,8 @@ class FreeTerraForgedCompatTest {
     @Test
     @EnabledIfSystemProperty(named = "vss.freeTerraForgedJar", matches = ".+")
     @SuppressWarnings("unchecked")
-    void releasedApiAndRuntimeOnlyPresetRoundTrip() throws Exception {
-        {
+    void releasedApiAndRuntimeOnlyPresetRoundTrip(@TempDir Path gameDirectory) throws Exception {
+        try (var directories = new FabricLoaderDirectories(gameDirectory)) {
             var loader = releaseLoader();
             var api = new FreeTerraForgedCompat.Api(loader);
             assertNotNull(api.context);
@@ -102,6 +103,39 @@ class FreeTerraForgedCompatTest {
             }
 
             assertNoiseSnapshotSamples(loader, preset, codec, key, registry);
+        }
+    }
+
+    /** Supply the real loader's launch directories, then restore the caller's state. */
+    private static final class FabricLoaderDirectories implements AutoCloseable {
+        private final Object loader = net.fabricmc.loader.api.FabricLoader.getInstance();
+        private final java.lang.reflect.Field game = directoryField("gameDir");
+        private final java.lang.reflect.Field config = directoryField("configDir");
+        private final Object previousGame;
+        private final Object previousConfig;
+
+        FabricLoaderDirectories(Path directory) throws Exception {
+            previousGame = game.get(loader);
+            previousConfig = config.get(loader);
+            Path absolute = directory.toAbsolutePath();
+            Path configDirectory = java.nio.file.Files.createDirectories(absolute.resolve("config"));
+            game.set(loader, absolute);
+            config.set(loader, configDirectory);
+        }
+
+        private java.lang.reflect.Field directoryField(String name) {
+            try {
+                var field = loader.getClass().getDeclaredField(name);
+                field.setAccessible(true);
+                return field;
+            } catch (ReflectiveOperationException failure) {
+                throw new IllegalStateException("Unsupported standalone Fabric directory field: " + name, failure);
+            }
+        }
+
+        @Override public void close() throws IllegalAccessException {
+            game.set(loader, previousGame);
+            config.set(loader, previousConfig);
         }
     }
 
