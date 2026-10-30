@@ -27,7 +27,7 @@ gradlew jar -PmcTarget=26.1.2
 
 ## 标准产物
 
-当前八目标候选包的构建标识为 `voxy-update-20261029`，均已通过生产构建和包内源码、版本与原生库校验。包内生产源码 SHA-256 为 `f9135b29a891076b0bcbd6bb4baba9bf957462eb50c3120440b79d21bd1bc2dc`；该摘要使用构建脚本约定的生产输入集合计算，不等同于 Git 提交号。`lib/SHA256SUMS.txt` 按目标列出各标准 JAR 和合包的校验值。
+当前八目标候选包的构建标识为 `fabric-optional-20261030`，包含可选模组适配与 Tectonic 非默认预设修复。包内生产源码 SHA-256 为 `3b724bccaab22db2f06e7ef09573b198e351cdad428b8d7a04b44dfe1ce412d9`；该摘要使用构建脚本约定的生产输入集合计算，不等同于 Git 提交号。发布时逐目标核对生产源码、实际字节码、版本和五平台原生库，`lib/SHA256SUMS.txt` 列出各标准 JAR 和合包的校验值。
 
 `lib/vss-0.3.6.zip` 按 Minecraft 版本分目录收纳构建，附带构建清单和源码摘要。该合包只包含本仓库的 Fabric 版本。
 

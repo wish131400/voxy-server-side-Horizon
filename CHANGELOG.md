@@ -1,5 +1,13 @@
 # 更新日志
 
+## 0.3.6 Fabric 可选模组与预设更新（2026-10-30）
+
+- **修复 Tectonic 非默认预设的远景预测。** 完整保存已经生效的噪声缩放、倍数、偏移与替代缩放参数，覆盖 `I Use Voxy Btw` / `OVERKILL` 路径及嵌套地形设置。Java 与 Rust 使用同一快照；26.3 单独保留对应发行版的浮点精度和单点、体积采样行为。
+- **补全 Trinkets / Accessories 远玩家饰品同步。** 同步槽位属性、尺寸、装饰饰品和显示开关；卸下饰品、缩减或移除槽位时清除旧状态，失败后可重试。
+- **补齐 FTB Chunks 强加载适配。** 按服务器共享预算提交请求、合并重复任务并处理取消与关服清理，保留 FTB 原有保存和加载票据。FTB Essentials 恢复真实地形查询，撤销伪造平原与零高度的旧替代。
+- **修正树木模板和预生成挂钩的版本差异。** 匹配 Oh The Trees You'll Grow 实际发布方法与模板管理器，以及 ByePregen 的准确参数；26.3 使用独立适配。
+- 用固定实际发行文件检查 Create、Xaero、C2ME、FreeTerraForged / ReTerraForged 与 The Lost Cities 的相应接口和行为。具体 Minecraft、模组版本及验证边界见[可选模组适配表](docs/compatibility/optional-mods.md)与[阶段记录](docs/history/validation.md)。
+
 ## 0.3.6 Fabric 候选移植版（2026-10-29）
 
 - **分开单人和独立服务器的真实生成额度。** 单人游戏（含开放局域网）每玩家自动生成默认并发为 2，独立服务器仍为 4；两项独立设置，保留已有服务器自定义值，显式预生成任务继续使用自身额度。
