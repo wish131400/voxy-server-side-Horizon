@@ -45,7 +45,7 @@ class DensityFunctionSnapshotTest {
 
     @Test
     void appliedNoiseSettingsPreserveSeededDensityAndRemainBounded() {
-        var lookup = VanillaRegistries.createWorldLookup();
+        var lookup = worldLookup();
         var original = lookup.lookupOrThrow(Registries.NOISE_SETTINGS)
                 .getOrThrow(NoiseGeneratorSettings.OVERWORLD).value();
         var ops = lookup.createSerializationContext(JsonOps.INSTANCE);
@@ -129,7 +129,7 @@ class DensityFunctionSnapshotTest {
             } catch (ClassNotFoundException legacyRelease) {
                 assertRoundTrip(DensityFunctions.add(constant, DensityFunctions.yClampedGradient(-64, 320, 2, -2)));
             }
-            var noise = VanillaRegistries.createWorldLookup().lookupOrThrow(Registries.NOISE)
+            var noise = worldLookup().lookupOrThrow(Registries.NOISE)
                     .getOrThrow(net.minecraft.world.level.levelgen.Noises.CONTINENTALNESS);
             Class<?> noiseType = loader.loadClass(prefix + "ConfigNoise");
             DensityFunction configured = (DensityFunction) noiseType
@@ -138,7 +138,7 @@ class DensityFunctionSnapshotTest {
                     .newInstance(noise, constant, DensityFunctions.zero(), 0.13f, 1.25f, -0.8f, false);
             assertRoundTrip(configured);
             var applied = DensityFunctionSnapshot.applied(configured);
-            var ops = VanillaRegistries.createWorldLookup().createSerializationContext(JsonOps.INSTANCE);
+            var ops = worldLookup().createSerializationContext(JsonOps.INSTANCE);
             var encoded = DensityFunctions.DIRECT_CODEC.encodeStart(ops, applied).getOrThrow();
             var restored = DensityFunctions.DIRECT_CODEC.parse(ops, encoded).getOrThrow();
             for (int i = -16; i <= 16; i++) {
@@ -150,7 +150,7 @@ class DensityFunctionSnapshotTest {
     }
 
     private static void assertRoundTrip(DensityFunction graph) {
-        var ops = VanillaRegistries.createWorldLookup().createSerializationContext(JsonOps.INSTANCE);
+        var ops = worldLookup().createSerializationContext(JsonOps.INSTANCE);
         var encoded = DensityFunctions.DIRECT_CODEC.encodeStart(ops,
                 DensityFunctionSnapshot.applied(graph)).getOrThrow();
         var decoded = DensityFunctions.DIRECT_CODEC.parse(ops, encoded).getOrThrow();
@@ -170,15 +170,14 @@ class DensityFunctionSnapshotTest {
         }
     }
 
-    private static net.minecraft.core.HolderGetter<net.minecraft.world.level.levelgen.synth.NormalNoise> noises;
-    private static synchronized net.minecraft.core.HolderGetter<net.minecraft.world.level.levelgen.synth.NormalNoise> noiseLookup() {
-        if (noises == null) noises = net.minecraft.data.registries.VanillaRegistries.createWorldLookup()
-                .lookupOrThrow(net.minecraft.core.registries.Registries.NOISE);
-        return noises;
+    private static net.minecraft.core.HolderLookup.Provider worldLookup;
+    private static synchronized net.minecraft.core.HolderLookup.Provider worldLookup() {
+        if (worldLookup == null) worldLookup = VanillaRegistries.createWorldLookup();
+        return worldLookup;
     }
 
     private static float sample(DensityFunction function, int x, int y, int z) {
-        var noises = noiseLookup();
+        var noises = worldLookup().lookupOrThrow(Registries.NOISE);
         var zero = DensityFunctions.zero();
         var router = new net.minecraft.world.level.levelgen.NoiseRouter(zero, zero, zero, zero, zero, zero, zero, function);
         return RandomState.create(noises, 78123L, false, net.minecraft.world.level.block.Blocks.STONE.defaultBlockState(),

@@ -18,6 +18,7 @@ import java.util.jar.JarFile;
 import net.minecraft.core.Holder;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.data.registries.VanillaRegistries;
+import net.minecraft.resources.RegistryOps;
 import net.minecraft.world.level.levelgen.DensityFunction;
 import net.minecraft.world.level.levelgen.DensityFunctions;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
@@ -143,7 +144,7 @@ class TectonicPresetSnapshotTest {
                     router, base.surfaceRule(), base.spawnTarget(), base.seaLevel(), base.disableMobGeneration(),
                     base.aquifersEnabled(), base.oreVeinsEnabled(), base.useLegacyRandomSource());
             var captured = DensityFunctionSnapshot.applied(source);
-            var ops = lookup.createSerializationContext(JsonOps.INSTANCE);
+            var ops = RegistryOps.create(JsonOps.INSTANCE, lookup);
             var json = NoiseGeneratorSettings.DIRECT_CODEC.encodeStart(ops, captured).result().orElseThrow();
             var decoded = NoiseGeneratorSettings.DIRECT_CODEC.parse(ops, json).result().orElseThrow();
             var restored = decoded.noiseRouter().finalDensity().mapAll(new DensityFunction.Visitor() {
@@ -186,7 +187,7 @@ class TectonicPresetSnapshotTest {
             }
             var doc = LithostitchedNativeTest.document();
             var router = doc.getAsJsonObject("settings").getAsJsonObject("noise_router");
-            var ops = lookup.createSerializationContext(JsonOps.INSTANCE);
+            var ops = RegistryOps.create(JsonOps.INSTANCE, lookup);
             for (var entry : source.entrySet()) router.add(entry.getKey(),
                     dev.xantha.vss.testutil.DensityCodecFixtures.CODEC.encodeStart(ops,
                             dev.xantha.vss.common.worldgen.DensityFunctionSnapshot.applied(entry.getValue())).result().orElseThrow());

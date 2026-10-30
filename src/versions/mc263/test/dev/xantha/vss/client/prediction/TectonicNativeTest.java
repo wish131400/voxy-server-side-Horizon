@@ -2,9 +2,7 @@ package dev.xantha.vss.client.prediction;
 
 import static org.junit.jupiter.api.Assertions.*;
 import com.google.gson.JsonObject;
-import com.mojang.serialization.Codec;
 import com.mojang.serialization.JsonOps;
-import com.mojang.serialization.MapCodec;
 import java.net.URLClassLoader;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -130,25 +128,35 @@ class TectonicNativeTest {
         }
     }
 
-    @Test @SuppressWarnings("unchecked")
-    void releasedInvertCodecRunsInRustWithMatchingIeeeResults() throws Exception {
-        var url = Path.of(System.getProperty("vss.tectonicJar")).toUri().toURL();
-        try (var loader = new URLClassLoader(new java.net.URL[]{url}, getClass().getClassLoader())) {
-            var type = loader.loadClass("dev.worldgen.tectonic.worldgen.densityfunction.Invert");
-            Codec<DensityFunction> codec = ((MapCodec<DensityFunction>) type.getField("DATA_CODEC").get(null)).codec();
+    @Test
+    void releasedReciprocalCodecRunsInRustWithMatchingIeeeResults() throws Exception {
+        try (var jar = new java.util.jar.JarFile(System.getProperty("vss.tectonicJar"))) {
+            // Tectonic 3.0.32 replaced its removed Invert class with vanilla's reciprocal codec.
+            var resource = jar.getJarEntry("resourcepacks/tectonic/data/tectonic/worldgen/density_function/"
+                    + "__constants/cave/depth_cutoff.json");
+            assertNotNull(resource, "Use the actual released Tectonic cave graph as codec evidence");
+            String releasedType;
+            try (var input = jar.getInputStream(resource)) {
+                var graph = com.google.gson.JsonParser.parseReader(new java.io.InputStreamReader(
+                        input, java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();
+                releasedType = graph.getAsJsonObject("input").getAsJsonObject("left").get("type").getAsString();
+                assertEquals("minecraft:reciprocal", releasedType);
+            }
             var doc = LithostitchedNativeTest.document();
             var router = doc.getAsJsonObject("settings").getAsJsonObject("noise_router");
             var expected = new java.util.LinkedHashMap<String, DensityFunction>();
+            var restored = new java.util.LinkedHashMap<String, DensityFunction>();
             var inputs = List.of(DensityFunctions.yClampedGradient(-128, 128, -2, 2),
                     DensityFunctions.constant(0.0f), DensityFunctions.constant(-0.0f),
                     DensityFunctions.constant(Float.MIN_VALUE), DensityFunctions.constant(-Float.MIN_VALUE),
                     DensityFunctions.constant(0.25f), DensityFunctions.constant(-7.0f));
             for (int i = 0; i < inputs.size(); i++) {
-                var function = (DensityFunction) type.getMethod("create", DensityFunction.class).invoke(null, inputs.get(i));
-                var json = codec.encodeStart(JsonOps.INSTANCE, function).getOrThrow().getAsJsonObject();
-                json.addProperty("type", "tectonic:invert");
-                router.add("invert_" + i, json);
-                expected.put("invert_" + i, function);
+                var function = DensityFunctions.reciprocal(inputs.get(i));
+                var json = DensityFunctions.DIRECT_CODEC.encodeStart(JsonOps.INSTANCE, function).getOrThrow().getAsJsonObject();
+                assertEquals(releasedType, json.get("type").getAsString());
+                router.add("reciprocal_" + i, json);
+                expected.put("reciprocal_" + i, function);
+                restored.put("reciprocal_" + i, DensityFunctions.DIRECT_CODEC.parse(JsonOps.INSTANCE, json).getOrThrow());
             }
             var generator = new JsonObject();
             generator.add("settings", doc.get("settings"));
@@ -164,6 +172,9 @@ class TectonicNativeTest {
                     assertEquals(385, RustWorldgenBackend.density(world, entry.getKey(), points, results, 385));
                     for (int y = -192; y <= 192; y++) {
                         double value = ModernDensityTestSamples.sample(entry.getValue(), -17, y, 256);
+                        assertEquals(Double.doubleToRawLongBits(value), Double.doubleToRawLongBits(
+                                ModernDensityTestSamples.sample(restored.get(entry.getKey()), -17, y, 256)),
+                                entry.getKey() + " codec round trip y=" + y);
                         assertEquals(Double.doubleToRawLongBits(value),
                                 Double.doubleToRawLongBits(results.getDouble((y + 192) * 8)), entry.getKey() + " y=" + y);
                     }

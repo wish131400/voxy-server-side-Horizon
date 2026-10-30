@@ -268,12 +268,17 @@ def verify_worldgen_interface_paths(read_class, minecraft):
 
     density = "common/worldgen/DensityFunctionSnapshot"
     calls(snapshot, None, prefix + density, "applied")
+    tectonic = "common/worldgen/TectonicConfigNoise"
+    read_class(tectonic, "tectonic_config_noise", "smoother_scaling", "multiplier", "offset")
+    calls("VSSMod", "onInitialize", prefix + tectonic, "register")
+    calls(density, None, prefix + tectonic, "<init>")
     if minecraft == "26.3":
         read_class(density, "dev.worldgen.lithostitched.impl.worldgen.densityfunction.marker.MergedFunction", "full")
         calls(density, "applied", "java/lang/Class", "getMethod")
         calls(density, "applied", "java/lang/reflect/Method", "invoke")
         calls(density, "applied", prefix + density, "applied")
     else:
+        calls(density, "applied", prefix + "common/worldgen/AppliedDensityRecords", "capture")
         calls(density, "applied", prefix + density, "UNWRAP")
         calls(density, None, prefix + density, "legacyTectonic")
         if not any(entry[1] == "<instanceof>" for entries in class_references(read_class(density)).values()
@@ -282,7 +287,7 @@ def verify_worldgen_interface_paths(read_class, minecraft):
 
     fixes = ["worldgen-registry-tag-snapshot-binding", "terrablender-end-routing-snapshot-replay",
              "lod-provider-capture-palette-r2", "required-biome-routing-fallback-guard",
-             "applied-density-graph-snapshot"]
+             "applied-density-graph-snapshot", "tectonic-applied-preset-snapshot"]
     if minecraft == "26.3":
         better_end = "client/prediction/BetterEndCompat$BetterEndSurface"
         read_class(better_end, "islandCellSize", "BetterEnd returned an invalid island interpolation grid")
