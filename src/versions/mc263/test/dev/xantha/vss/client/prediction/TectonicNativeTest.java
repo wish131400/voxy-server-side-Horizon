@@ -20,9 +20,67 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 class TectonicNativeTest {
     @BeforeAll static void bootstrap() {
         ClientTerrainSamplerTest.bootstrapMinecraft();
+        dev.xantha.vss.testutil.TectonicCodecFixtures.register();
         String library = System.getProperty("vss.testNativeLibrary");
         if (library != null) RustWorldgenBackend.load(Path.of(library));
         else assertTrue(RustTerrainSampler.available());
+    }
+
+    @Test void releasedConfiguredNoiseAndOverkillSnapshotsRunInRustWithExactFloatBits(
+            @org.junit.jupiter.api.io.TempDir Path directory) throws Exception {
+        try (var loader = TectonicPresetSnapshotTest.releasedLoader(directory)) {
+            var lookup = net.minecraft.data.registries.VanillaRegistries.createWorldLookup();
+            var noises = lookup.lookupOrThrow(net.minecraft.core.registries.Registries.NOISE);
+            var noise = noises.getOrThrow(net.minecraft.resources.ResourceKey.create(
+                    net.minecraft.core.registries.Registries.NOISE,
+                    net.minecraft.resources.Identifier.parse("minecraft:continentalness")));
+            var source = new java.util.LinkedHashMap<String, DensityFunction>();
+            for (boolean smoother : new boolean[]{false, true}) {
+                source.put("config_" + smoother,
+                        TectonicPresetSnapshotTest.releasedNoise(loader, noise, 0.13f, 1.25f, -0.8f, smoother));
+            }
+            for (String key : List.of("continents", "erosion"))
+                source.put("overkill_" + key, TectonicPresetSnapshotTest.presetNoise(loader, key, noise));
+            var doc = LithostitchedNativeTest.document();
+            var router = doc.getAsJsonObject("settings").getAsJsonObject("noise_router");
+            var ops = lookup.createSerializationContext(JsonOps.INSTANCE);
+            for (var entry : source.entrySet()) router.add(entry.getKey(), DensityFunctions.DIRECT_CODEC.encodeStart(
+                    ops, dev.xantha.vss.common.worldgen.DensityFunctionSnapshot.applied(entry.getValue())).getOrThrow());
+            var generator = new JsonObject();
+            generator.add("settings", doc.get("settings"));
+            generator.add("biome_source", doc.get("biome_source"));
+            assertNull(PredictionWorldgenCapabilities.nativeTerrainRejection(generator, doc),
+                    "an applied smoother-scaling preset must remain eligible for Rust");
+            int[][] positions = {{-17, -96, 31}, {0, 0, 0}, {8191, 128, -8193},
+                    {-29_999_999, 383, 29_999_999}, {1, -1, -1}, {29_999_999, 129, -29_999_999}};
+            var points = ByteBuffer.allocateDirect(positions.length * 12).order(ByteOrder.LITTLE_ENDIAN);
+            for (int[] point : positions) for (int coordinate : point) points.putInt(coordinate);
+            var output = ByteBuffer.allocateDirect(positions.length * 8).order(ByteOrder.LITTLE_ENDIAN);
+            for (long seed : new long[]{0, 78123L, Long.MIN_VALUE, Long.MAX_VALUE}) {
+                long world = RustWorldgenBackend.create(seed, 0, doc.toString());
+                try {
+                    for (var entry : source.entrySet()) {
+                        var zero = DensityFunctions.zero();
+                        var graph = new net.minecraft.world.level.levelgen.NoiseRouter(zero, zero, zero, zero,
+                                zero, zero, zero, entry.getValue());
+                        var random = net.minecraft.world.level.levelgen.RandomState.create(noises, seed, false,
+                                net.minecraft.world.level.block.Blocks.STONE.defaultBlockState(), 63, graph);
+                        var expected = random.getSampler(entry.getValue());
+                        assertEquals(positions.length, RustWorldgenBackend.density(world, entry.getKey(), points, output,
+                                positions.length));
+                        for (int i = 0; i < positions.length; i++) {
+                            int[] point = positions[i];
+                            float value = expected.sampleValue(
+                                    net.minecraft.world.level.levelgen.densityfunction.SamplerContext.EMPTY_UNCACHED,
+                                    point[0], point[1], point[2]);
+                            assertEquals(Double.doubleToRawLongBits((double) value),
+                                    Double.doubleToRawLongBits(output.getDouble(i * 8)),
+                                    entry.getKey() + " seed=" + seed + " pos=" + java.util.Arrays.toString(point));
+                        }
+                    }
+                } finally { RustWorldgenBackend.close(world); }
+            }
+        }
     }
 
     @Test void noiseSeedsMatchTheReleasedTectonicMixinAndKeepOriginalParameters() throws Exception {

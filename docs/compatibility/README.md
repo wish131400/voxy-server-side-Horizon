@@ -42,4 +42,6 @@ tkettela 此固定提交还存在上游配置初始化顺序缺陷：新配置�
 
 ## 世界生成与验证范围
 
+[Fabric 可选模组适配](optional-mods.md)记录饰品、FTB、Create、树木模板与实际发行包的适用范围。
+
 [世界生成模组适配](worldgen.md)记录快照、TerraBlender、BetterEnd 与 Lithostitched 的接口边界；[验证记录](../history/validation.md)列出生产构建、实际依赖、GPU、客户端与服务器验证范围。共享适配代码或标题画面启动不能代替整合包实机验收。

@@ -21,6 +21,28 @@ public final class DensityFunctionSnapshot {
                 throw new IllegalStateException("Cannot capture applied Lithostitched density function", failure);
             }
         }
+        String name = function.getClass().getName();
+        String tectonic = "dev.worldgen.tectonic.worldgen.densityfunction.";
+        try {
+            if (name.equals(tectonic + "ConfigConstant")) {
+                return DensityFunctions.constant((float) function.getClass().getMethod("value").invoke(function));
+            }
+            if (name.equals(tectonic + "ConfigNoise")) {
+                var type = function.getClass();
+                @SuppressWarnings("unchecked")
+                var noise = (net.minecraft.core.Holder<net.minecraft.world.level.levelgen.synth.NormalNoise>)
+                        type.getMethod("noise").invoke(function);
+                return new TectonicConfigNoise(noise,
+                        applied((DensityFunction) type.getMethod("shiftX").invoke(function)),
+                        applied((DensityFunction) type.getMethod("shiftZ").invoke(function)),
+                        (float) type.getMethod("scale").invoke(function),
+                        (float) type.getMethod("multiplier").invoke(function),
+                        (float) type.getMethod("offset").invoke(function),
+                        (boolean) type.getMethod("smootherScaling").invoke(function));
+            }
+        } catch (ReflectiveOperationException failure) {
+            throw new IllegalStateException("Cannot capture applied Tectonic density function " + name, failure);
+        }
         return function.rewriteChildren(DensityFunctionSnapshot::applied);
     }
     public static NoiseGeneratorSettings applied(NoiseGeneratorSettings s) {

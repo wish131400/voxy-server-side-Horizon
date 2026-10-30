@@ -22,6 +22,14 @@ allprojects {
         dependencies.add('testRuntimeOnly', nestedClasspath)
     }
     tasks.withType(Test).configureEach {
+        ['Trinkets', 'Accessories', 'FtbChunks', 'FtbChunksNamed', 'FtbEssentials', 'NbtTreeRuntime', 'Byepregen',
+         'Create', 'C2me', 'OptionalCompatManifest'].each { input ->
+            def property = providers.gradleProperty('vss' + input + (input == 'OptionalCompatManifest' ? '' : 'Jar'))
+            if (property.isPresent()) {
+                def suffix = input.substring(0, 1).toLowerCase() + input.substring(1)
+                systemProperty 'vss.' + suffix + (input == 'OptionalCompatManifest' ? '' : 'Jar'), property.get()
+            }
+        }
         if (providers.gradleProperty('vssSodiumJar').isPresent()) {
             systemProperty 'vss.sodiumJar', providers.gradleProperty('vssSodiumJar').get()
         }

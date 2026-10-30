@@ -16,9 +16,11 @@ import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 public final class VSSMod implements ModInitializer {
     @Override
     public void onInitialize() {
+        dev.xantha.vss.common.worldgen.TectonicConfigNoise.register();
         VSSLogger.configureDebug(() -> dev.xantha.vss.config.VSSClientConfig.CONFIG.debugLogging
                 || dev.xantha.vss.config.VSSServerConfig.CONFIG.debugLogging);
         VSSNetworking.register();
+        dev.xantha.vss.compat.ftbchunks.FTBChunksForceLoadCompat.register();
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
                 VSSServerCommands.register(dispatcher));
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) ->

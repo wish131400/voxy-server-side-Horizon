@@ -71,7 +71,7 @@ jobs:
 
   fabric:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -134,6 +134,10 @@ jobs:
           ${{ matrix.package_task }} --continue --console=plain
           '-PmcTarget=${{ matrix.minecraft }}' '-PvssBuildId=ci-${{ github.sha }}'
           "-PvssVoxyJar=$VOXY_JAR" "-PvssIrisJar=$IRIS_JAR"
+      - name: Verify optional dependency evidence runner
+        run: python -m unittest discover -s tools/verification -p test_optional_matrix.py
+      - name: Apply optional adapters to pinned actual Fabric releases
+        run: python tools/verification/optional_matrix.py --minecraft '${{ matrix.minecraft }}'
       - name: Start server, generate a real column and save its cache
         run: python tools/verification/server_smoke.py --minecraft '${{ matrix.minecraft }}'
       - name: Verify packaged metadata and source snapshot
@@ -151,3 +155,5 @@ jobs:
             build/**/test-results/**/TEST-*.xml
             build/**/server-smoke.json
             build/**/server-smoke.log
+            external/optional-compat/*/validation/
+            external/optional-compat/*/inputs.json

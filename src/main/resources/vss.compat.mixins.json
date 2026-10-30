@@ -6,7 +6,9 @@
   "refmap": "vss.refmap.json",
   "compatibilityLevel": "JAVA_21",
   "mixins": [
-    "ftbessentials.TeleportCommandsNoBlockingMixin",
+    "ftbchunks.FTBChunksExpectedImplMixin",
+    "ftbchunks.FTBChunksModernForceLoadMixin",
+    "minecraft.FTBChunksForceLoadNoBlockingMixin",
     "minecraft.ChunkMapEntityTrackingAccessor",
     "minecraft.ConnectionChannelAccessor",
     "minecraft.ServerCommonConnectionAccessor",

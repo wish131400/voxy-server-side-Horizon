@@ -20,9 +20,15 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 class TectonicNativeTest {
     @BeforeAll static void bootstrap() {
         ClientTerrainSamplerTest.bootstrapMinecraft();
+        dev.xantha.vss.testutil.TectonicCodecFixtures.register();
         String library = System.getProperty("vss.testNativeLibrary");
         if (library != null) RustWorldgenBackend.load(Path.of(library));
         else assertTrue(RustTerrainSampler.available());
+    }
+
+    @Test void releasedConfiguredNoiseAndOverkillSnapshotsRunInRustWithExactDoubleBits(
+            @org.junit.jupiter.api.io.TempDir Path directory) throws Exception {
+        TectonicPresetSnapshotTest.assertReleasedConfiguredNoiseAndOverkillSnapshotsRunInRustWithExactDoubleBits(directory);
     }
 
     @Test void noiseSeedsMatchTheReleasedTectonicMixinAndKeepOriginalParameters() throws Exception {

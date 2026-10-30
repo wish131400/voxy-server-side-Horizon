@@ -47,4 +47,14 @@ gradlew jar -PmcTarget=26.1.2
 
 每个目标分别执行生产编译、模块与迁移回归、实际依赖接口检查、专用服务器启动和缓存验证。客户端启动、GPU 小场景与实际游戏画面分别记录；缺少外部输入的可选测试显式记为跳过。工具入口见仓库的 `build.gradle`、`.github/workflows/` 和 `tools/verification/`，不要用扩大版本声明代替目标验证。
 
+可选模组验证使用固定发布文件，下载工具校验平台、版本、模组身份及文件摘要。设置对应 JDK 的 `JAVA_HOME` 后执行：
+
+```text
+python tools/verification/optional_matrix.py --minecraft 1.21.1
+```
+
+运行器先编译目标，再准备真实输入并执行 `optionalCompatTest`。旧版 Fabric 输入同时保留原始包与离线映射副本，Mixin 挂钩分别检查生产方法名和实际应用结果。1.21.1 的 FreeTerraForged 与旧 ReTerraForged 分两轮验证。没有对应发行文件或没有 DFC 模块的目标按不适用记录；提供了实际输入却未执行、关键行为检查缺席或出现未解释跳过时，验证失败。
+
+下载内容、日志、输入摘要和独立 XML 留在 `external/optional-compat/<目标版本>`，不提交第三方文件。八目标 CI 使用相同入口。依赖版本和范围见 [可选模组适配表](../compatibility/optional-mods.md)。
+
 Rust 由 [原生工具目录](../../tools/rust/README.md)维护；第三方输入遵守上游分发要求，不纳入源码仓库。构建身份和源码摘要放入 JAR 清单，标准文件名不追加临时后缀。固定构建的历史验证见 [阶段记录](../history/validation.md)。

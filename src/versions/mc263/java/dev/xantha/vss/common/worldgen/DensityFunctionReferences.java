@@ -98,6 +98,7 @@ public final class DensityFunctionReferences {
             case "minecraft:lerp" -> field.equals("alpha") || field.equals("first") || field.equals("second");
             case "minecraft:pow" -> field.equals("base") || field.equals("exponent");
             case "minecraft:ore_vein" -> field.equals("density") || field.equals("richness") || field.equals("filler_gap");
+            case "vss:tectonic_config_noise" -> field.equals("shift_x") || field.equals("shift_z");
             // Unknown mod codec fields keep their original inline representation.
             default -> false;
         };

@@ -11,7 +11,7 @@ import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.world.entity.LivingEntity;
 
-/** Optional Curios bridge that keeps far-player render capabilities in sync. */
+/** Optional equipment bridge for far-player Curios, Trinkets and Accessories render state. */
 public final class CuriosCompat {
     private static final String API_CLASS = "top.theillusivec4.curios.api.CuriosApi";
     private static final String STACKS_HANDLER_CLASS = "top.theillusivec4.curios.common.inventory.CurioStacksHandler";
@@ -30,31 +30,37 @@ public final class CuriosCompat {
     }
 
     public static CompoundTag capture(LivingEntity entity) {
-        if (GET_INVENTORY == null || entity == null) {
-            return null;
-        }
-        try {
-            Object handler = resolve(GET_INVENTORY.invoke(null, entity));
-            if (handler == null) {
-                return null;
+        if (entity == null) return null;
+        CompoundTag equipment = FabricEquipmentCompat.capture(entity);
+        if (GET_INVENTORY != null) {
+            try {
+                Object handler = resolve(GET_INVENTORY.invoke(null, entity));
+                if (handler != null) {
+                    CompoundTag snapshot = captureHandler(handler);
+                    if (snapshot != null) equipment.put("Curios", snapshot);
+                }
+            } catch (Throwable error) {
+                reportFailure(error);
             }
-            return captureHandler(handler);
-        } catch (Throwable error) {
-            reportFailure(error);
-            return null;
         }
+        if (equipment.isEmpty()) return null;
+        CompoundTag result = new CompoundTag();
+        result.put(FabricEquipmentCompat.ENVELOPE, equipment);
+        return result;
     }
 
     public static boolean apply(LivingEntity entity, CompoundTag tag) {
-        if (GET_INVENTORY == null || entity == null || tag == null) {
-            return false;
+        if (entity == null || tag == null) return false;
+        boolean success = true;
+        CompoundTag curios = tag;
+        if (tag.get(FabricEquipmentCompat.ENVELOPE) instanceof CompoundTag equipment) {
+            success = FabricEquipmentCompat.apply(entity, equipment);
+            curios = equipment.get("Curios") instanceof CompoundTag data ? data : null;
         }
+        if (GET_INVENTORY == null || curios == null) return success;
         try {
             Object handler = resolve(GET_INVENTORY.invoke(null, entity));
-            if (handler == null) {
-                return false;
-            }
-            return applyHandler(handler, tag);
+            return handler != null && applyHandler(handler, curios) && success;
         } catch (Throwable error) {
             reportFailure(error);
             return false;

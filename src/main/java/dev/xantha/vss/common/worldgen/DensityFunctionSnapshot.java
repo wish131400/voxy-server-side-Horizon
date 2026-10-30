@@ -23,17 +23,21 @@ public final class DensityFunctionSnapshot {
                 return DensityFunctions.constant((double) function.getClass().getMethod("value").invoke(function));
             }
             if (name.equals(prefix + "ConfigNoise")) {
-                // Newer ConfigNoise.mapAll already emits vanilla nodes, including
-                // smoother scaling. This branch handles the six-field legacy record.
                 var type = function.getClass();
-                type.getConstructor(DensityFunction.NoiseHolder.class, DensityFunction.class,
-                        DensityFunction.class, double.class, double.class, double.class);
                 var noise = (DensityFunction.NoiseHolder) type.getMethod("noise").invoke(function);
                 var shiftX = (DensityFunction) type.getMethod("shiftX").invoke(function);
                 var shiftZ = (DensityFunction) type.getMethod("shiftZ").invoke(function);
                 double scale = (double) type.getMethod("scale").invoke(function);
                 double multiplier = (double) type.getMethod("multiplier").invoke(function);
                 double offset = (double) type.getMethod("offset").invoke(function);
+                boolean smoother = false;
+                try { smoother = (boolean) type.getMethod("smootherScaling").invoke(function); }
+                catch (NoSuchMethodException legacyRecord) { /* The six-field record has no alternate scaling. */ }
+                if (smoother) {
+                    // (x + shift) * scale cannot be reassociated into vanilla's
+                    // x * scale + shift without changing both terrain and rounding.
+                    return new TectonicConfigNoise(noise, shiftX, shiftZ, scale, multiplier, offset, true);
+                }
                 var shifted = DensityFunctions.shiftedNoise2d(shiftX, shiftZ, scale, noise.noiseData())
                         .mapAll(new DensityFunction.Visitor() {
                             public DensityFunction apply(DensityFunction value) { return value; }
@@ -54,12 +58,25 @@ public final class DensityFunctionSnapshot {
         // mapAll visits the effective graph of Lithostitched's merged functions.
         // HolderHolder.mapAll creates direct holders, which must be unwrapped
         // before a nested DIRECT_CODEC attempts to call HolderHolder.codec().
-        return function.mapAll(UNWRAP);
+        var records = records();
+        var prepared = (DensityFunction) records.capture(function);
+        return (DensityFunction) records.capture(prepared.mapAll(UNWRAP));
+    }
+
+    private static AppliedDensityRecords records() {
+        return new AppliedDensityRecords(
+                value -> value instanceof DensityFunction function ? legacyTectonic(function) : value,
+                value -> value instanceof DensityFunction || value instanceof net.minecraft.world.level.levelgen.NoiseRouter
+                        || value.getClass().getName().startsWith("net.minecraft.util.CubicSpline$")
+                        || value.getClass().getName().startsWith("net.minecraft.world.level.levelgen.DensityFunctions$"));
     }
 
     public static NoiseGeneratorSettings applied(NoiseGeneratorSettings settings) {
+        var records = records();
+        var prepared = (net.minecraft.world.level.levelgen.NoiseRouter) records.capture(settings.noiseRouter());
         return new NoiseGeneratorSettings(settings.noiseSettings(), settings.defaultBlock(),
-                settings.defaultFluid(), settings.noiseRouter().mapAll(UNWRAP),
+                settings.defaultFluid(), (net.minecraft.world.level.levelgen.NoiseRouter)
+                        records.capture(prepared.mapAll(UNWRAP)),
                 settings.surfaceRule(), settings.spawnTarget(), settings.seaLevel(),
                 settings.disableMobGeneration(), settings.aquifersEnabled(),
                 settings.oreVeinsEnabled(), settings.useLegacyRandomSource());

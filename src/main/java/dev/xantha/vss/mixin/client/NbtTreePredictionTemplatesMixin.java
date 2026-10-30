@@ -17,14 +17,17 @@ import org.spongepowered.asm.mixin.injection.Redirect;
         "dev.corgitaco.ohthetreesyoullgrow.world.level.levelgen.feature.TreeFromStructureNBTFeatureV2"
 }, remap = false)
 public abstract class NbtTreePredictionTemplatesMixin {
-    @Redirect(method = "place", at = @At(value = "INVOKE",
+    // Fabric keeps the inherited Feature method's intermediary name in releases.
+    // The optional target is not on the compile classpath, so Loom cannot infer
+    // that mapping from this target's class hierarchy.
+    @Redirect(method = {"place", "method_13151"}, at = @At(value = "INVOKE",
             target = "Lnet/minecraft/world/level/WorldGenLevel;getLevel()Lnet/minecraft/server/level/ServerLevel;", remap = true), remap = false)
     private ServerLevel vss$avoidLiveWorld(WorldGenLevel level) {
         // Only the immediately redirected getStructureManager consumes this receiver.
         return PredictionTemplateAccess.virtual(level) ? null : level.getLevel();
     }
 
-    @Redirect(method = "place", at = @At(value = "INVOKE",
+    @Redirect(method = {"place", "method_13151"}, at = @At(value = "INVOKE",
             target = "Lnet/minecraft/server/level/ServerLevel;getStructureManager()Lnet/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplateManager;", remap = true),
             remap = false)
     private StructureTemplateManager vss$verifiedTreeTemplates(ServerLevel level, FeaturePlaceContext<?> context) {

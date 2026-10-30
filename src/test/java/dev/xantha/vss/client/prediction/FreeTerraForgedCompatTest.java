@@ -17,11 +17,10 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
 class FreeTerraForgedCompatTest {
     private static URLClassLoader releaseLoader;
-    // NeoForge's process-wide registry catalog permits one instance per registry.
-    // Keep the published mod's classes in one loader for this test JVM.
+    // Keep the published mod's classes and custom codec registries in one loader.
     static synchronized URLClassLoader releaseLoader() throws Exception {
-        if (releaseLoader == null) releaseLoader = new URLClassLoader(new java.net.URL[]{
-                Path.of(System.getProperty("vss.freeTerraForgedJar")).toUri().toURL()}, FreeTerraForgedCompatTest.class.getClassLoader());
+        if (releaseLoader == null) releaseLoader = new dev.xantha.vss.testutil.FabricRegistryTestLoader(
+                Path.of(System.getProperty("vss.freeTerraForgedJar")).toUri().toURL(), FreeTerraForgedCompatTest.class.getClassLoader());
         return releaseLoader;
     }
 
@@ -85,7 +84,7 @@ class FreeTerraForgedCompatTest {
             assertTrue(dependencies.encode().entrySet().isEmpty(), "preset is a runtime dependency, not a density holder");
             dependencies.require(key.identifier());
             var client = ClientWorldgenRegistries.decode(WorldgenRegistryDependenciesTest.root(dependencies.encode()), RegistryAccess.EMPTY, codecs);
-            Object decoded = client.access().lookupOrThrow(key).get(id);
+            Object decoded = registryValue(client.access().lookupOrThrow(key).get(id));
             assertNotSame(preset, decoded);
             assertEquals(codec.encodeStart(JsonOps.INSTANCE, preset).getOrThrow(),
                     codec.encodeStart(JsonOps.INSTANCE, decoded).getOrThrow());
@@ -114,20 +113,16 @@ class FreeTerraForgedCompatTest {
         for (String type : List.of("module.Noises", "domain.Domains", "function.CurveFunctions")) {
             loader.loadClass(prefix + "world.worldgen.noise." + type).getMethod("bootstrap").invoke(null);
         }
-        // Standalone tests have no mod event bus. Apply only the actual mod's
-        // queued custom codec registrations to its isolated registry objects.
-        var registersField = loader.loadClass(prefix + "platform.neoforge.RegistryUtilImpl").getDeclaredField("REGISTERS");
-        registersField.setAccessible(true);
-        var registers = (java.util.Map<?, ?>) registersField.get(null);
-        var entriesField = loader.loadClass("net.neoforged.neoforge.registries.DeferredRegister").getDeclaredField("entries");
-        entriesField.setAccessible(true);
-        for (var field : loader.loadClass(prefix + "registries." + variant.abbreviation + "BuiltInRegistries").getFields()) {
-            if (!(field.get(null) instanceof Registry target)) continue;
-            Object deferred = registers.get(target.key());
-            if (deferred == null) continue;
-            var entries = (java.util.Map<Object, java.util.function.Supplier<?>>)
-                    entriesField.get(deferred);
-            for (var entry : entries.entrySet()) Registry.register(target, (Identifier)entry.getKey().getClass().getMethod("getId").invoke(entry.getKey()), entry.getValue().get());
+        // Fabric registers immediately. The loader replaces only the global
+        // registry allocation; these entries came from the real mod bootstrap.
+        var builtins = loader.loadClass(prefix + "registries." + variant.abbreviation + "BuiltInRegistries");
+        for (String field : List.of("NOISE_TYPE", "DOMAIN_TYPE", "CURVE_FUNCTION_TYPE")) {
+            var target = (Registry<?>) builtins.getField(field).get(null);
+            assertTrue(target.size() > 0, "The real Fabric bootstrap must register " + field);
+            // The game freezes static registries after mod initialization. Our
+            // isolated allocation must perform that lifecycle step too: codecs
+            // resolve Holder references, which stay unbound before freeze().
+            target.freeze();
         }
         var noiseKey = ResourceKey.<Object>createRegistryKey(Identifier.parse(variant.namespace + ":worldgen/noise"));
         var noises = new MappedRegistry<Object>(noiseKey, Lifecycle.stable());
@@ -160,7 +155,7 @@ class FreeTerraForgedCompatTest {
         var compute = noiseType.getMethod("compute", float.class, float.class, int.class);
         int entriesChecked = 0;
         for (var entry : noises.entrySet()) {
-            Object copy = decoded.get(entry.getKey());
+            Object copy = registryValue(decoded.get(entry.getKey()));
             for (int i = 0; i < 8; i++) assertEquals(
                     compute.invoke(entry.getValue(), i * 317.0f - 731, -i * 127.0f, 918273),
                     compute.invoke(copy, i * 317.0f - 731, -i * 127.0f, 918273), entry.getKey().toString());
@@ -199,7 +194,11 @@ class FreeTerraForgedCompatTest {
                 var constructor = mixinType.getDeclaredConstructor();
                 constructor.setAccessible(true);
                 Object mixin = constructor.newInstance();
-                var samplerField = mixinType.getDeclaredField("sampler");
+                // @Shadow names in the standalone intermediary Mixin have no
+                // superclass for TinyRemapper to infer the mapped field name.
+                var samplerField = java.util.Arrays.stream(mixinType.getDeclaredFields())
+                        .filter(field -> field.getType() == net.minecraft.world.level.biome.Climate.Sampler.class)
+                        .findFirst().orElseThrow();
                 samplerField.setAccessible(true);
                 var zero = net.minecraft.world.level.levelgen.DensityFunctions.zero();
                 samplerField.set(mixin, new net.minecraft.world.level.biome.Climate.Sampler(zero, zero, zero, zero, zero, zero, List.of()));
@@ -302,6 +301,11 @@ class FreeTerraForgedCompatTest {
             Class<?> cacheClass = loader.loadClass(api.variant.packagePrefix + "concurrent.cache.Cache");
             ((java.util.concurrent.ExecutorService) cacheClass.getField("SCHEDULER").get(null)).shutdownNow();
         }
+    }
+
+    private static Object registryValue(Object result) {
+        if (result instanceof java.util.Optional<?> optional) result = optional.orElseThrow();
+        return result instanceof Holder<?> holder ? holder.value() : result;
     }
 
     private static void assertClimateContextCopy(ClassLoader loader, FreeTerraForgedVariant variant, Object context) throws Exception {

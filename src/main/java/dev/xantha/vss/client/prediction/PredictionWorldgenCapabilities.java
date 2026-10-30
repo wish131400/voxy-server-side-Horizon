@@ -21,6 +21,7 @@ final class PredictionWorldgenCapabilities {
             "terrablender:merged",
             "youkaishomecoming:noise",
             "tectonic:invert",
+            "vss:tectonic_config_noise",
             "lithostitched:axis", "lithostitched:ceil", "lithostitched:floor", "lithostitched:sin",
             "lithostitched:cos", "lithostitched:sqrt", "lithostitched:mix", "lithostitched:select",
             "lithostitched:shift", "lithostitched:fast_noise", "lithostitched:perlin",

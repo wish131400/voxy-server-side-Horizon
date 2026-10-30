@@ -32,9 +32,18 @@ class C2meDensityMemoCompatTest {
                     default -> throw new UnsupportedOperationException(method.getName());
                 };
             });
-            var entryType = loader.loadClass("com.ishland.c2me.opts.dfc.common.gen.jvm.CompiledEntry");
+            // 26.1 retained the older DFC layout; 0.4 moved it beneath gen.jvm.
+            String packageName;
+            try {
+                loader.loadClass("com.ishland.c2me.opts.dfc.common.gen.jvm.CompiledEntry");
+                packageName = "com.ishland.c2me.opts.dfc.common.gen.jvm.";
+            } catch (ClassNotFoundException oldLayout) {
+                packageName = "com.ishland.c2me.opts.dfc.common.gen.";
+            }
+            var entryType = loader.loadClass(packageName + "CompiledEntry");
             var evaluations = new java.util.concurrent.atomic.AtomicInteger();
-            var compiledType = loader.loadClass("com.ishland.c2me.opts.dfc.common.gen.jvm.CompiledDensityFunction");
+            var compiledType = loader.loadClass(packageName + "CompiledDensityFunction");
+            boolean listArguments = java.util.List.class.isAssignableFrom(entryType.getMethod("getArgs").getReturnType());
             boolean modern = java.util.Arrays.stream(entryType.getMethods())
                     .anyMatch(method -> method.getName().equals("getRootsUnsafe"));
             Object subRoots;
@@ -55,7 +64,7 @@ class C2meDensityMemoCompatTest {
             } else subRoots = null;
             Object entry = Proxy.newProxyInstance(loader, new Class<?>[]{entryType}, (proxy, method, args) -> {
                 return switch (method.getName()) {
-                    case "getArgs" -> new Object[]{cache};
+                    case "getArgs" -> listArguments ? java.util.List.of(cache) : new Object[]{cache};
                     case "getRootsUnsafe" -> subRoots;
                     case "newInstance" -> {
                         if (modern) {

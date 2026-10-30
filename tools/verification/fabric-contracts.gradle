@@ -1,4 +1,31 @@
 // Each actual Mixin application needs its own Sponge global state.
+// Optional mods are checked in isolation: none becomes a production dependency.
+tasks.register('optionalCompatTest', Test) {
+    group = 'verification'
+    description = 'Checks optional Fabric mod adapters and pinned release bytecode.'
+    dependsOn tasks.named('testClasses')
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform()
+    ['CuriosCompatTest', 'FabricEquipmentCompatTest', 'FabricEquipmentActualJarTest',
+     'XaeroActualJarContractTest', 'XaeroMapCompatStubContractTest',
+     'XaeroMapCompatRegionLoadingTest', 'XaeroMapCompatQueueTest',
+     'XaeroMapCompatBufferUpdateTest', 'XaeroTileExtractorTest',
+     'DensityMemoCompatTest', 'C2meDensityMemoCompatTest',
+     'BandwidthOptimizerCompatTest', 'OptionalWorldgenMixinApplicationTest',
+     'ByePregenMixinApplicationTest', 'CreateReleaseContractTest',
+     'FreeTerraForgedMixinApplicationTest', 'NbtTreePredictionTemplatesTest',
+     'FreeTerraForgedCompatTest', 'LostCityReleaseMatrixTest',
+     'TectonicPresetSnapshotTest', 'DensityFunctionSnapshotTest', 'AppliedDensityRecordsTest',
+     'ForceLoadQueueTest', 'FtbActualJarContractTest',
+     'FtbMinecraftMixinApplicationTest', 'FtbForceLoadIntegrationTest',
+     'FtbPlatformMixinApplicationTest'].each { include "**/${it}.class" }
+    maxHeapSize = '3G'
+    maxParallelForks = 1
+    forkEvery = 1
+    testLogging { events 'failed', 'skipped'; exceptionFormat 'full' }
+}
+
 tasks.register('fabricContractTest', Test) {
     group = 'verification'
     description = 'Applies Minecraft, Voxy and Iris hooks to real dependency bytecode.'

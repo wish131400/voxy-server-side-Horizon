@@ -32,7 +32,7 @@ class PredictionCacheDecodeTest {
                         dev.xantha.vss.testutil.NoiseCodecFixtures.CODEC.encodeStart(ops,holder.value()).result().orElseThrow()));
         source.lookupOrThrow(net.minecraft.core.registries.Registries.DENSITY_FUNCTION).listElements().forEach(holder ->
                 registries.getAsJsonObject("density_functions").add(holder.key().identifier().toString(),
-                        net.minecraft.world.level.levelgen.DensityFunction.DIRECT_CODEC.encodeStart(ops,holder.value()).result().orElseThrow()));
+                        dev.xantha.vss.testutil.DensityCodecFixtures.CODEC.encodeStart(ops,holder.value()).result().orElseThrow()));
         generator.add("settings",net.minecraft.world.level.levelgen.NoiseGeneratorSettings.DIRECT_CODEC
                 .encodeStart(ops,source.lookupOrThrow(net.minecraft.core.registries.Registries.NOISE_SETTINGS)
                         .getOrThrow(net.minecraft.world.level.levelgen.NoiseGeneratorSettings.OVERWORLD).value()).result().orElseThrow());

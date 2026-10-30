@@ -4,8 +4,10 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import dev.xantha.vss.mixin.client.NbtTreePredictionTemplatesMixin;
 import java.lang.reflect.Proxy;
+import java.nio.file.Path;
 import java.util.Optional;
 import java.util.jar.JarFile;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.server.level.ServerLevel;
@@ -15,6 +17,8 @@ import net.minecraft.world.level.levelgen.feature.FeaturePlaceContext;
 import net.minecraft.world.level.levelgen.feature.configurations.NoneFeatureConfiguration;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.mockito.Mockito;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.ClassNode;
@@ -24,7 +28,7 @@ class NbtTreePredictionTemplatesTest {
     private static final class MixinInstance extends NbtTreePredictionTemplatesMixin { }
     @BeforeAll static void bootstrap() { ClientTerrainSamplerTest.bootstrapMinecraft(); }
 
-    @Test void virtualTreeLookupUsesVerifiedManagerAndNormalWorldGetLevelIsForwarded() throws Exception {
+    @Test void virtualTreeLookupUsesVerifiedManagerAndNormalWorldGetLevelIsForwarded(@TempDir Path gameDir) throws Exception {
         var methods = NbtTreePredictionTemplatesMixin.class.getDeclaredMethods();
         var world = java.util.Arrays.stream(methods).filter(method -> method.getName().equals("vss$avoidLiveWorld")).findFirst().orElseThrow();
         var templates = java.util.Arrays.stream(methods).filter(method -> method.getName().equals("vss$verifiedTreeTemplates")).findFirst().orElseThrow();
@@ -37,7 +41,14 @@ class NbtTreePredictionTemplatesTest {
                 NoneFeatureConfiguration.INSTANCE);
         var mixin = new MixinInstance();
         assertNull(world.invoke(mixin, level), "No access to a live ServerLevel during prediction");
-        assertSame(level.templateManager(), templates.invoke(mixin, null, context));
+        var loader = Mockito.spy(FabricLoader.getInstance());
+        Mockito.doReturn(gameDir).when(loader).getGameDir();
+        try (var fabric = Mockito.mockStatic(FabricLoader.class, Mockito.CALLS_REAL_METHODS)) {
+            fabric.when(FabricLoader::getInstance).thenReturn(loader);
+            var manager = level.templateManager();
+            assertNotNull(manager, "Construct the real verified template manager in a disposable game directory");
+            assertSame(manager, templates.invoke(mixin, null, context));
+        }
         var forwarded = new java.util.concurrent.atomic.AtomicInteger();
         var normal = (WorldGenLevel) Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[] {WorldGenLevel.class},
                 (proxy, method, args) -> {
@@ -49,7 +60,7 @@ class NbtTreePredictionTemplatesTest {
         assertEquals(1, forwarded.get());
     }
 
-    @Test void bothReleasedTreeVersionsHaveExactlyTheRedirectedManagerChain() throws Exception {
+    @Test void everyReleasedTreeFeatureHasExactlyTheRedirectedManagerChain() throws Exception {
         String path = System.getProperty("vss.nbtTreeJar");
         assumeTrue(path != null, "Supply the released OTTYG JAR with -PvssNbtTreeJar");
         var mixin = new ClassNode();
@@ -57,10 +68,9 @@ class NbtTreePredictionTemplatesTest {
             new ClassReader(input).accept(mixin, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
         }
         try (var jar = new JarFile(path)) {
-            for (String name : new String[] {"TreeFromStructureNBTFeature", "TreeFromStructureNBTFeatureV2"}) {
+            for (String name : dev.xantha.vss.testutil.ReleasedNbtTreeFeatures.classNames(jar)) {
                 var node = new ClassNode();
-                try (var stream = jar.getInputStream(jar.getJarEntry(
-                        "dev/corgitaco/ohthetreesyoullgrow/world/level/levelgen/feature/" + name + ".class"))) {
+                try (var stream = jar.getInputStream(jar.getJarEntry(name.replace('.', '/') + ".class"))) {
                     new ClassReader(stream).accept(node, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
                 }
                 int levels = 0, managers = 0;

@@ -14,7 +14,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 @Mixin(targets = {"com.moepus.byepregen.worldgen.feature.FastBlockPredicateOptimizer",
         "com.moepus.byepregen.Feature.FastBlockPredicateOptimizer"}, remap = false)
 public abstract class ByePregenPredictionPredicateMixin {
-    @Inject(method = "getState",
+    @Inject(method = "getState(Lnet/minecraft/world/level/WorldGenLevel;Lnet/minecraft/core/BlockPos;III)Lnet/minecraft/world/level/block/state/BlockState;",
             at = @At("HEAD"), cancellable = true, require = 0, remap = false)
     private static void vss$virtualTerrainPredicate(WorldGenLevel level, BlockPos pos,
                                                   int offsetX, int offsetY, int offsetZ,

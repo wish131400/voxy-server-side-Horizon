@@ -71,6 +71,7 @@ public final class DensityFunctionReferences {
         return switch (type) {
             case "minecraft:range_choice" -> field.equals("input") || field.equals("when_in_range") || field.equals("when_out_of_range");
             case "minecraft:shifted_noise" -> field.equals("shift_x") || field.equals("shift_y") || field.equals("shift_z");
+            case "vss:tectonic_config_noise" -> field.equals("shift_x") || field.equals("shift_z");
             case "minecraft:weird_scaled_sampler" -> field.equals("input");
             // Clamp.input is DIRECT_CODEC; custom codecs may also require inline values.
             default -> false;

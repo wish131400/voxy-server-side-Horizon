@@ -20,6 +20,7 @@ class DensityFunctionSnapshotTest {
     @BeforeAll
     static void bootstrap() {
         dev.xantha.vss.testutil.TerrainPredictionFixtures.bootstrap();
+        dev.xantha.vss.testutil.TectonicCodecFixtures.register();
     }
 
     @Test
@@ -117,13 +118,7 @@ class DensityFunctionSnapshotTest {
         try (var loader = new java.net.URLClassLoader(new java.net.URL[]{url}, getClass().getClassLoader())) {
             String prefix = "dev.worldgen.tectonic.worldgen.densityfunction.";
             Class<?> constantType = loader.loadClass(prefix + "ConfigConstant");
-            DensityFunction constant;
-            try {
-                constant = (DensityFunction) constantType.getConstructor(double.class).newInstance(0.375);
-            } catch (NoSuchMethodException legacyRelease) {
-                constant = (DensityFunction) constantType.getConstructor(double.class, double.class, double.class)
-                        .newInstance(0.375, 0.375, 0.375);
-            }
+            DensityFunction constant = (DensityFunction) constantType.getConstructor(float.class).newInstance(0.375f);
             assertRoundTrip(constant);
             try {
                 var clamp = (DensityFunction) loader.loadClass(prefix + "ConfigClamp")
@@ -134,24 +129,18 @@ class DensityFunctionSnapshotTest {
             } catch (ClassNotFoundException legacyRelease) {
                 assertRoundTrip(DensityFunctions.add(constant, DensityFunctions.yClampedGradient(-64, 320, 2, -2)));
             }
-            var noise = Holder.direct(net.minecraft.world.level.levelgen.synth.NormalNoise.createParity(-3, 1.0));
+            var noise = VanillaRegistries.createWorldLookup().lookupOrThrow(Registries.NOISE)
+                    .getOrThrow(net.minecraft.world.level.levelgen.Noises.CONTINENTALNESS);
             Class<?> noiseType = loader.loadClass(prefix + "ConfigNoise");
-            DensityFunction configured;
-            try {
-                configured = (DensityFunction) noiseType
-                        .getConstructor(Holder.class, DensityFunction.class,
-                                DensityFunction.class, double.class, double.class, double.class, boolean.class)
-                        .newInstance(noise, constant, DensityFunctions.zero(), 0.13, 1.25, -0.8, false);
-            } catch (NoSuchMethodException legacyRelease) {
-                configured = (DensityFunction) noiseType
-                        .getConstructor(Holder.class, DensityFunction.class,
-                                DensityFunction.class, double.class, double.class, double.class)
-                        .newInstance(noise, constant, DensityFunctions.zero(), 0.13, 1.25, -0.8);
-            }
+            DensityFunction configured = (DensityFunction) noiseType
+                    .getConstructor(Holder.class, DensityFunction.class,
+                            DensityFunction.class, float.class, float.class, float.class, boolean.class)
+                    .newInstance(noise, constant, DensityFunctions.zero(), 0.13f, 1.25f, -0.8f, false);
             assertRoundTrip(configured);
             var applied = DensityFunctionSnapshot.applied(configured);
-            var encoded = DensityFunctions.DIRECT_CODEC.encodeStart(JsonOps.INSTANCE, applied).getOrThrow();
-            var restored = DensityFunctions.DIRECT_CODEC.parse(JsonOps.INSTANCE, encoded).getOrThrow();
+            var ops = VanillaRegistries.createWorldLookup().createSerializationContext(JsonOps.INSTANCE);
+            var encoded = DensityFunctions.DIRECT_CODEC.encodeStart(ops, applied).getOrThrow();
+            var restored = DensityFunctions.DIRECT_CODEC.parse(ops, encoded).getOrThrow();
             for (int i = -16; i <= 16; i++) {
                 int x = i * 137, y = i * 11, z = -i * 79;
                 assertEquals(sample(configured, x, y, z), sample(applied, x, y, z), "retain seeded compile context");
@@ -161,9 +150,10 @@ class DensityFunctionSnapshotTest {
     }
 
     private static void assertRoundTrip(DensityFunction graph) {
-        var encoded = DensityFunctions.DIRECT_CODEC.encodeStart(JsonOps.INSTANCE,
+        var ops = VanillaRegistries.createWorldLookup().createSerializationContext(JsonOps.INSTANCE);
+        var encoded = DensityFunctions.DIRECT_CODEC.encodeStart(ops,
                 DensityFunctionSnapshot.applied(graph)).getOrThrow();
-        var decoded = DensityFunctions.DIRECT_CODEC.parse(JsonOps.INSTANCE, encoded).getOrThrow();
+        var decoded = DensityFunctions.DIRECT_CODEC.parse(ops, encoded).getOrThrow();
         for (int y = -64; y <= 320; y += 7) {
             assertEquals(sample(graph, -131, y, 257), sample(decoded, -131, y, 257));
         }
