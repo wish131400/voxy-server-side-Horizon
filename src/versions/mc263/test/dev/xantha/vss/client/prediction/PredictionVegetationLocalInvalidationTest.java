@@ -264,8 +264,8 @@ class PredictionVegetationLocalInvalidationTest {
         var fixture = new Fixture();
         var level = new PredictionDecorationLevel(fixture.terrain, fixture.terrain, RegistryAccess.EMPTY, 5, 6);
         var position = new BlockPos(80, 100, 96);
-        assertThrows(PredictionDecorationLevel.LocalPlacementFailure.class,
-                () -> level.setBlock(position.offset(-17, 0, 0), Blocks.OAK_LOG.defaultBlockState(), 2, 0));
+        assertFalse(level.setBlock(position.offset(-17, 0, 0), Blocks.OAK_LOG.defaultBlockState(), 2, 0),
+                "Modern WorldGenRegion rejects an outside write without aborting the transaction");
         level.beginFeature();
         try {
             for (int i = 0; i < 65_536; i++)

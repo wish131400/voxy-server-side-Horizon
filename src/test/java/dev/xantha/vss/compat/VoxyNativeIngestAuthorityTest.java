@@ -65,6 +65,7 @@ class VoxyNativeIngestAuthorityTest {
         assertTrue(results.isEmpty());
         Object worker = VoxyIngestTracker.enterWorker();
         VoxyIngestTracker.workerTask(task);
+        VoxyIngestTracker.committed(engine,new VoxyRealSectionHandoffTest.Voxels(1,0,2));
         VoxyIngestTracker.finishWorker(worker);
         VoxyIngestTracker.finishWorker(worker);
         assertEquals(List.of(true), results);
@@ -83,8 +84,17 @@ class VoxyNativeIngestAuthorityTest {
         worker = VoxyIngestTracker.enterWorker();
         VoxyIngestTracker.workerTask(failed);
         VoxyIngestTracker.workerFailed(worker, new IllegalStateException("native failed"));
+        Object empty = new Object();
+        VoxyIngestTracker.runRawIngest(engine, section, 1, 2, results::add, () -> {
+            VoxyIngestTracker.submittedSnapshot(empty); return true;
+        });
+        worker = VoxyIngestTracker.enterWorker();
+        VoxyIngestTracker.workerTask(empty);
+        VoxyIngestTracker.finishWorker(worker);
+        assertEquals(List.of(true, false, false, false), results,
+                "A worker returning without committing voxels cannot confirm native ownership");
         VoxyIngestTracker.runRawIngest(engine, section, 1, 2, results::add, () -> true);
-        assertEquals(List.of(true, false, false, false), results);
+        assertEquals(List.of(true, false, false, false, false), results);
         assertFalse(VoxyIngestTracker.pendingColumn(engine, 1, 2));
         assertFalse(VoxyIngestTracker.pendingColumn(1, 2));
         assertFalse(VoxyIngestTracker.workerScopeActive());
@@ -104,7 +114,9 @@ class VoxyNativeIngestAuthorityTest {
         assertTrue(VoxyIngestTracker.pendingColumn(engine, 1, 2));
         assertTrue(newResults.isEmpty()); assertEquals(List.of(false), oldResults);
         Object worker = VoxyIngestTracker.enterWorker();
-        VoxyIngestTracker.workerTask(newTask); VoxyIngestTracker.finishWorker(worker);
+        VoxyIngestTracker.workerTask(newTask);
+        VoxyIngestTracker.committed(engine,new VoxyRealSectionHandoffTest.Voxels(1,0,2));
+        VoxyIngestTracker.finishWorker(worker);
         assertEquals(List.of(true), newResults);
     }
 
