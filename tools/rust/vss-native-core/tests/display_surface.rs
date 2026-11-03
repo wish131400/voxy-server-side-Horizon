@@ -31,13 +31,31 @@ fn partial_java_reuse_keeps_grid_admission_and_sparse_fallback() {
     let exact = world.surface_points(&[(-16, -16)]).unwrap()[0].values;
     let mask = u64::MAX ^ 1;
     let grid = world.display_grid(-16, -16, 1, mask).unwrap();
-    assert_eq!(world.display_query_stats()[2], 1);
-    assert_eq!(world.display_query_stats()[5], 32);
+    assert_eq!(world.display_query_stats()[2], 0, "an exact-only cache entry cannot supply a display probe");
+    assert_eq!(world.display_query_stats()[5], 63, "compute only missing cells");
+    assert_eq!(grid[0].values, [0; 10], "retained cells belong to the caller");
     assert_eq!(world.surface_points(&[(-16, -16)]).unwrap()[0].values, exact);
     let oracle = World::new(1, 0, d.clone()).unwrap();
     let points: Vec<_> = (0..64).map(|i| (-16 + i % 8, -16 + i / 8)).collect();
     let full = oracle.display_points(&points).unwrap();
     for i in 1..64 { assert_eq!(grid[i].values, full[i].values); }
+    let warm = World::new(1, 0, d.clone()).unwrap();
+    warm.display_points(&[points[0]]).unwrap();
+    let interpolated = warm.display_grid(-16, -16, 1, mask).unwrap();
+    assert_eq!(warm.display_query_stats()[2], 1, "native display probes still permit flat-grid interpolation");
+    assert_eq!(warm.display_query_stats()[5], 32);
+    for i in 1..64 { assert_eq!(interpolated[i].values, full[i].values); }
+    for step in [1, 4] {
+        let partial = World::new(1, 0, d.clone()).unwrap();
+        let mask = !0x0055005500550055u64;
+        let rows = partial.display_grid(-16, -16, step, mask).unwrap();
+        assert_eq!(partial.display_query_stats()[2], 0);
+        assert_eq!(partial.display_query_stats()[5], 48);
+        for i in 0..64 {
+            if mask & (1u64 << i) == 0 { assert_eq!(rows[i].values, [0; 10]); }
+            else { assert_eq!(rows[i].values, full[i].values); }
+        }
+    }
     // With almost every point retained, do not speculate on all 32 probes.
     let sparse = World::new(1, 0, d).unwrap();
     let one = sparse.display_grid(-16, -16, 1, 1u64 << 63).unwrap();

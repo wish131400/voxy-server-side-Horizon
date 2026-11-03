@@ -13,17 +13,23 @@ JAR 内包含 Windows x64、Linux x64 / ARM64、macOS Intel / Apple Silicon 的 
 
 服务端配置位于 `config/vss-server-config.json`，客户端配置位于 `config/vss-client-config.json`。直接编辑前关闭相应进程；已有配置保留保存值。
 
-真实区块自动生成的每玩家并发分开设置：单人游戏（含开放局域网）使用 `singleplayerGenerationConcurrencyLimit`，默认 `2`；独立服务器使用 `generationConcurrencyLimitPerPlayer`，默认 `4`。已有服务器自定义值保留；旧配置缺少单人字段时使用新默认值。显式 `/vss chunky` 任务沿用自身额度。
+`enableChunkGeneration` 在单人和开放局域网默认关闭，在专用服务器默认开启。已有配置保留保存值；缺少该字段时使用对应运行环境的默认值。关闭后仍同步已有真实区块并刷新脏区块，不影响预测 LOD。
+
+真实区块自动生成的每玩家并发分开设置：单人游戏（含开放局域网）使用 `singleplayerGenerationConcurrencyLimit`，默认 `2`；独立服务器使用 `generationConcurrencyLimitPerPlayer`，默认 `4`。已有服务器自定义值保留；旧配置缺少单人字段时使用新默认值。显式 `/vss chunky` 任务沿用自身额度，但也需要开启 `enableChunkGeneration`。
 
 | 设置 | 默认值 | 作用 |
 | --- | --- | --- |
+| `enableChunkGeneration`（服务端） | 单人/局域网 `false`；专用服务器 `true` | 允许生成真实区块 LOD；关闭后仍同步已有真实区块及其变更，预测 LOD 独立 |
 | `enablePrediction` | `true` | 预测总开关，功能标记为 Beta |
 | `enablePredictionLoading` | `true` | 是否继续加载新预测；关闭后已有数据仍可显示 |
 | `predictionDistanceBlocks` | `4096` | 预测距离，单位方块 |
 | `predictionSpyglassLoading` | `true` | 望远镜额外加载 |
+| `predictionVulkanAcceleration` | `false` | 仅 26.3：使用 Vulkan GPU 分担预览和正式细化的密度计算，需要支持 Vulkan 和双精度坐标运算的显卡与驱动 |
 | `rememberTerrain` | `true` | 保存并恢复本地预测结果 |
 
 预测使用同步的世界生成信息，由 Rust / Java 计算；真实数据优先，画面交给 Voxy 构网与绘制。Voxy 适配不可用时不能用旧独立渲染器补位。缺少必需生成快照或路由时，该维度的预测不能冒充已兼容。
+
+26.3 可在 VSS 预测设置的“预测计算”中切换“Vulkan GPU 加速”。它可提升远景预览和细化加载速度，但会占用渲染算力，可能降低一定帧数，效果取决于显卡和场景。首次启用会在后台准备计算程序，准备期间继续使用 Rust；后续可复用本地着色器和驱动管线缓存。小批次、GPU 请求队列已满、CPU 更快或算法不支持时继续由 Rust 计算，不降低预测精度。关闭后新批次立即使用 Rust。
 
 ## 命令与排错
 

@@ -15,6 +15,10 @@ pub struct Cellular {
 }
 
 impl Cellular {
+    pub(crate) fn vulkan_data(&self, seed:i64) -> [u32;7] {
+        let seed=seed.wrapping_add(self.salt as i64) as u64;
+        [self.horizontal as u32,self.vertical as u32,self.jitter_xz as u32,self.jitter_y as u32,self.result as u32,seed as u32,(seed>>32) as u32]
+    }
     pub fn parse(value: &Value) -> Result<Self> {
         let grid = &value["grid_dimensions"];
         let (horizontal, vertical) = if let Some(size) = grid.as_i64() {

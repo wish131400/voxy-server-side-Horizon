@@ -52,10 +52,11 @@ public final class VoxyMixinHarness extends MixinServiceAbstract implements ICla
                     .getDeclaredConstructor();
             constructor.setAccessible(true);
             transformer = (IMixinTransformer) constructor.newInstance();
-            // MixinExtras needs the installed transformer before registering its extensions.
-            com.llamalad7.mixinextras.MixinExtrasBootstrap.init();
         }
         byte[] bytes = classes.get(name.replace('.', '/') + ".class");
+        if (bytes == null) try (InputStream input = getResourceAsStream(name.replace('.', '/') + ".class")) {
+            if (input != null) bytes = input.readAllBytes();
+        }
         if (bytes == null) throw new ClassNotFoundException(name);
         return transformer.transformClass(MixinEnvironment.getCurrentEnvironment(), name, bytes);
     }
@@ -74,8 +75,6 @@ public final class VoxyMixinHarness extends MixinServiceAbstract implements ICla
     @Override public ITransformerProvider getTransformerProvider() { return null; }
     @Override public IClassTracker getClassTracker() { return null; }
     @Override public IMixinAuditTrail getAuditTrail() { return null; }
-    @Override public IFeatureValidator getFeatureValidator() { return IFeatureValidator.ALLOW_ALL; }
-    @Override public IAdviceProvider getAdviceProvider() { return IAdviceProvider.GENERIC; }
     @Override public Collection<String> getPlatformAgents() { return List.of(); }
     @Override public IContainerHandle getPrimaryContainer() { return new ContainerHandleVirtual("VSS ingest tests"); }
     @Override public InputStream getResourceAsStream(String name) {

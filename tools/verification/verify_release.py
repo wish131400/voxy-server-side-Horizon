@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 import zipfile
 from install_native_artifacts import native_source_digest, LIBRARIES
+from mixin_annotation_baseline import scalar_redirect_at
 
 
 def manifest_attributes(data):
@@ -144,6 +145,35 @@ def verify_version_paths(read_class, names, minecraft):
     # unused constant-pool entry left over from an earlier implementation.
     state = "ClientPredictionState"
     calls(state, "tick", prefix + state, "currentResourceAtlasToken")
+    calls("PredictionTreeModels", "place", prefix + "PredictionPlacementExecutor", "visit")
+    calls("ClientWorldgenProfileDecoder", "publish", prefix + "ClientTerrainSampler", "bindDimensionType",
+          "(Lcom/google/gson/JsonObject;Lcom/mojang/serialization/DynamicOps;)V")
+    calls("PredictionTileManager", "publishTileLocked", prefix + "PredictionCaptureRefresh", "completed")
+    calls("PredictionVegetation", "generate", prefix + "PredictionBiomePruning", "job")
+    calls("PredictionVegetation", "generate", prefix + "PredictionBiomePruning$Job", "excludes")
+    calls("PredictionBiomePruning$Job", "excludes", prefix + "RustTerrainSampler", "possibleBiomes")
+    calls("RustTerrainSampler", "possibleBiomes", prefix + "RustWorldgenBackend", "possibleBiomes")
+    calls("RustVegetationStage", "place", prefix + "RustWorldgenBackend", "applyPlacedFeature")
+    calls("RustWorldgenBackend", "applyPlacedFeature", prefix + "RustWorldgenBackend", "placedFeatureStatus")
+    calls("RustWorldgenBackend", "applyPlacedFeature", prefix + "RustWorldgenBackend", "placedFeature")
+    if minecraft == "26.3":
+        calls("RustTerrainSampler", "sampleGrid", prefix + "VulkanPredictionCompute", "preview")
+        calls("VulkanPredictionCompute", "preview", prefix + "RustWorldgenBackend", "previewPointsGpu")
+        calls("VulkanPredictionCompute", "prepare", "java/util/concurrent/ThreadPoolExecutor", "execute")
+        calls("VulkanPredictionCompute", "drain", prefix + "VulkanDensityDevice", "dispatch")
+        calls("VulkanDensityDevice", "dispatch", "org/lwjgl/vulkan/VK10", "vkCmdDispatch")
+        calls("RustTerrainSampler", "sampleDisplayRegion", prefix + "VulkanPredictionCompute", "displayRegionHeights")
+        calls("RustTerrainSampler", "sampleDisplayRegion", prefix + "VulkanPredictionCompute", "beginDisplayRegion")
+        calls("RustTerrainSampler", "sampleDisplayRegion", prefix + "VulkanPredictionCompute", "finishDisplayRegion")
+        calls("RustTerrainSampler", "sampleDisplayRegion", prefix + "VulkanPredictionCompute", "displayReady")
+        calls("RustTerrainSampler", "sampleGrid", prefix + "RustWorldgenBackend", "displayPointsGpu")
+        calls("RustTerrainSampler", "sampleGrid", prefix + "RustWorldgenBackend", "displayGridGpu")
+        calls("VulkanPredictionCompute", "displayRegionHeights", prefix + "VulkanPredictionCompute", "displayHeightsDetailed")
+        calls("VulkanPredictionCompute", "displayHeightsDetailed", prefix + "RustWorldgenBackend", "displayGpuMask")
+        calls("VulkanPredictionCompute", "displayHeightsDetailed", prefix + "VulkanPredictionCompute", "await")
+        calls("VulkanPredictionCompute", "beginDisplayRegion", prefix + "VulkanDisplayPolicy", "begin")
+        calls("VulkanPredictionCompute", "finishDisplayRegion", prefix + "VulkanDisplayPolicy", "finish")
+        calls("RustTerrainSampler", "sampleGrid", prefix + "RustTerrainSampler", "restoreDisplayWindow")
     if minecraft in ("1.20.1", "1.21.1"):
         calls(state, "currentResourceAtlasToken", "net/minecraft/class_310", "method_1549",
               "(Lnet/minecraft/class_2960;)Ljava/util/function/Function;")
@@ -288,6 +318,27 @@ def verify_worldgen_interface_paths(read_class, minecraft):
     fixes = ["worldgen-registry-tag-snapshot-binding", "terrablender-end-routing-snapshot-replay",
              "lod-provider-capture-palette-r2", "required-biome-routing-fallback-guard",
              "applied-density-graph-snapshot", "tectonic-applied-preset-snapshot"]
+    if minecraft == "1.21.1":
+        runtime = "common/worldgen/FreeTerraForgedRuntime"
+        cells = "client/prediction/FreeTerraForgedCells"
+        read_class(runtime, "TerraForgedChunkGenerator", "biomeReplacementConfig", "contributionRevision", "initializeEpoch")
+        read_class(cells, "getFilteredChunk", "getPaddedCell", "provideAtChunk", "releaseTileCache")
+        compat = "client/prediction/FreeTerraForgedCompat"
+        read_class(compat, "climateQuerySemantics", "setWorldgenPlan", "setClimateQuerySemantics",
+                   "copySpawnSearch", "getSpawnSearch", "setSpawnSearch", "WORLD_ORIGIN", "getConstructor", "newInstance")
+        calls(compat, "copyClimateContext", prefix + compat, "copySpawnSearch")
+        calls(compat, "copySpawnSearch", "java/lang/reflect/Constructor", "newInstance")
+        calls(compat, "copySpawnSearch", "java/lang/reflect/Field", "get")
+        read_class("client/prediction/FreeTerraForgedDensity", "readFinite")
+        read_class("client/prediction/FreeTerraForgedTerrainSampler", "runtimeOwner")
+        read_class(snapshot, "vss_freeterraforged_release", "freeterraforged:worldgen/biome_modifier", "freeterraforged:worldgen/structure_rule")
+        calls(snapshot, "encodeNoiseGenerator", prefix + runtime, "snapshot")
+        calls(snapshot, "encodeNoiseGenerator", prefix + runtime, "acquisitionSource")
+        calls(decoder, "decodeJavaSampler", prefix + runtime, "epoch")
+        calls(decoder, "decodeJavaSampler", prefix + runtime, "initialize")
+        calls("client/prediction/FreeTerraForgedCells", "cellAt", "java/lang/invoke/MethodHandle", "invokeExact")
+        fixes.append("freeterraforged-1.21.1-epoch-runtime-and-filtered-chunks")
+        fixes.append("freeterraforged-1.21.1-missing-spawn-search-default")
     if minecraft == "26.3":
         better_end = "client/prediction/BetterEndCompat$BetterEndSurface"
         read_class(better_end, "islandCellSize", "BetterEnd returned an invalid island interpolation grid")
@@ -343,6 +394,17 @@ def verify(jar, platform, build_id, source, minecraft=None):
         require(not metadata.get("jars"), "External nested dependency declared in Fabric metadata")
         require(metadata["id"] == "vss" and metadata["version"] == version, "Wrong Fabric metadata")
         require(metadata["depends"]["minecraft"] == minecraft, "Wrong Minecraft target")
+        targets_text = (source / "gradle/minecraft-targets.gradle").read_text()
+        target_row = re.search(r"'" + re.escape(minecraft) + r"':\s*\[([^\n]+)\]", targets_text)
+        require(target_row is not None, "Missing Fabric dependency baseline target")
+        target_values = dict(re.findall(r"(\w+):\s*'([^']+)'", target_row.group(1)))
+        runtime_minimum = {
+            "fabricloader": ">=" + target_values.get("loaderMin", properties["loader_min_version"].strip()),
+            "fabric-api": ">=" + target_values["apiMin"],
+        }
+        for dependency, minimum in runtime_minimum.items():
+            require(metadata["depends"][dependency] == minimum,
+                    "Wrong Fabric runtime minimum: " + dependency)
         require(manifest.get("VSS-Minecraft") == minecraft, "Wrong Minecraft build identity")
         target_index = ["1.21.11", "26.1", "26.1.1", "26.1.2", "26.2", "26.3", "1.21.1", "1.20.1"].index(minecraft)
         require(manifest.get("VSS-Protocol") == str(54 + target_index), "Wrong target protocol")
@@ -357,6 +419,9 @@ def verify(jar, platform, build_id, source, minecraft=None):
             if name.endswith(".class"):
                 require(int.from_bytes(archive.read(name)[6:8], "big") == major,
                         "Wrong packaged Java version: " + name)
+                if name.startswith("dev/xantha/vss/mixin/"):
+                    _, newer_redirects = scalar_redirect_at(archive.read(name))
+                    require(newer_redirects == 0, "Redirect.at requires a newer Mixin runtime: " + name)
 
         def check_class(name, *symbols):
             data = archive.read("dev/xantha/vss/" + name + ".class")
@@ -368,7 +433,27 @@ def verify(jar, platform, build_id, source, minecraft=None):
         check_class("config/VSSServerConfig", "singleplayerGenerationConcurrencyLimit", "effectiveGenerationConcurrencyLimitPerPlayer")
         check_class("networking/server/generation/ChunkGenerationService", "effectiveGenerationConcurrencyLimitPerPlayer")
         check_class("networking/server/session/PlayerSessionManager", "effectiveGenerationConcurrencyLimitPerPlayer")
+        check_class("config/VSSClientConfig", "predictionVulkanAcceleration")
+        check_class("client/VSSVoxyOptionsIntegration", "prediction_vulkan")
+        check_class("client/VSSVoxyOptionsIntegration", "me.jellysquid.mods.sodium.client.gui",
+                    "net.caffeinemc.mods.sodium.client.gui", "hasLegacyOptions", "currentPage")
+        check_class("mixin/client/SodiumLegacyOptionsMixin", "addPage")
+        require("client.SodiumLegacyOptionsMixin" in json.loads(archive.read("vss.compat.mixins.json"))["client"],
+                "Legacy Sodium options hook absent from runtime configuration")
+        if minecraft == "26.3":
+            check_class("client/prediction/VulkanPredictionCompute", "REQUEST_SLOTS", "largestBatch", "cpu-faster", "previewPointsGpu")
+            check_class("client/prediction/VulkanDisplayPolicy", "minimumColdColumns", "cpuSentinels", "onlineFallbacks")
+            check_class("client/prediction/RustTerrainSampler", "finishDisplayRegion", "sampleDisplayRegion")
+            check_class("client/prediction/VulkanDensityDevice", "shaderFloat64", "shaderBinary", "vkCmdDispatch")
+            for language in ("zh_cn", "en_us"):
+                messages = json.loads(archive.read(f"assets/vss/lang/{language}.json"))
+                require(bool(messages.get("vss.voxy_options.prediction_vulkan.tooltip")), "Missing Vulkan GPU warning")
         check_class("compat/ModCompat", "replayRealXaeroColumn")
+        if minecraft.startswith("26."):
+            check_class("client/prediction/PredictionTreeModels", "SETTINGS_VERSION", "environmentExactFallbacks", "SUPPORTS_VEGETATION")
+            vegetation = check_class("client/prediction/PredictionVegetation", "runtimeSettings")
+            require(b"\x03\x00\x02\x00\x00" in vegetation,
+                    "Modern tree repair is missing its decoration cache identity bit")
         check_class("compat/XaeroMapCompat", "replayRealColumn", "tryOfferReplay")
         check_class("networking/client/IntegratedPregenImporter", "replayRealXaeroColumn")
         check_class("networking/server/generation/ChunkyGenerationService", "retryImport")
@@ -383,6 +468,11 @@ def verify(jar, platform, build_id, source, minecraft=None):
         verify_version_paths(lambda name: check_class("client/prediction/" + name), names, minecraft)
         worldgen_interface_fixes = verify_worldgen_interface_paths(check_class, minecraft)
         check_class("client/prediction/PredictionClimateSampler", "FabricBiomeCompat", "copyClimateContext")
+        check_class("client/prediction/PredictionClimateSampler", "PredictionHorizontalClimate", "bindHorizontal")
+        check_class("client/prediction/PredictionClimateCache", "horizontalDescriptor", "horizontalBytes", "LIVE_BYTES")
+        check_class("client/prediction/PredictionClimateCache$NativeInputs", "horizontalLookup")
+        check_class("client/prediction/PredictionClimateIdentity", "doubleToRawLongBits")
+        check_class("client/prediction/RustTerrainSampler", "bindHorizontalClimate", "detachHorizontalClimate")
         check_class("client/prediction/FabricBiomeCompat", "net.fabricmc.fabric.impl.biome.MultiNoiseSamplerHooks", "fabric_getSeed", "fabric_setSeed")
         check_class("client/prediction/PredictionBiomeCache", "LookupFailure", "sample")
         check_class("client/prediction/PredictionBiomeCache$Points", "xs", "ys", "zs", "values")
@@ -459,6 +549,19 @@ def verify(jar, platform, build_id, source, minecraft=None):
         check_class("networking/client/VSSClientNetworking", "onClientLevelUnload")
         check_class("compat/VoxyCompat$LocalSectionIndex", "settledRegions")
         check_class("compat/VoxyIngestTracker", "realColumnSettled")
+        check_class("compat/VoxyIngestTracker", "authorityGeneration", "committed", "PUBLICATIONS", "VoxyRealIngestAccess")
+        check_class("compat/VoxyPredictionBridge$RealColumn", "coverageMask", "containsSectionAtLod")
+        check_class("compat/VoxyRealCoverage", "completeColumns", "verticalRange", "coverageMask")
+        check_class("compat/VoxyRealIngestAccess", "VoxyRealCoveragePersistence", "ACCESS", "save")
+        check_class("compat/VoxyRealIngestAccess$1", "saveSection", "markDirty")
+        check_class("compat/VoxyRealCoveragePersistence", "SHA-256", "getWorldId", "loadedSuccessfully")
+        check_class("compat/transform/VoxyStorageTransformer", "vss$coverageSaveBody", "vss$coverageLoadBody", "capture")
+        require("dev/xantha/vss/mixin/voxy/PredictionVoxyStoragePlugin.class" not in archive.namelist(),
+                "Storage helper remains in a reserved Mixin package")
+        check_class("mixin/voxy/PredictionVoxyStorageIdentityMixin")
+        strict_config = json.loads(archive.read("vss.strict.mixins.json"))
+        require("voxy.PredictionVoxyStorageMixin" in strict_config["client"]
+                and "voxy.PredictionVoxyStorageIdentityMixin" in strict_config["client"], "Real storage hooks absent")
         check_class("compat/VoxyPredictionBridge$Context", "hasSkyLight")
         check_class("compat/VoxyCapacityPlan", "initialCapacity", "capacity")
         check_class("compat/VoxyTraversalCapacity", "getCurrentMaxNodeId", "beforeAdd", "beforeTraversal", "ensureRoots", "ensureQueues")
@@ -472,6 +575,7 @@ def verify(jar, platform, build_id, source, minecraft=None):
                 "Capacity mixins absent from runtime configuration")
         check_class("client/prediction/PredictionVoxySource", "lightingBuilds")
         check_class("client/prediction/PredictionTileManager", "invalidatedSurfaces")
+        check_class("client/prediction/PredictionTileManager", "runningVoxyDetails")
         check_class("client/prediction/PredictionCaptureHandoff", "await", "committed", "blocked", "reindex", "retired")
         check_class("client/prediction/PredictionTileManager", "awaitExactColumns", "requiresExactCapture", "retryCapture", "captureHandoff", "retireExactColumns")
         check_class("networking/client/VSSClientNetworking", "dirtyColumnTimestamp", "expectsAuthoritativeColumns")
@@ -539,6 +643,19 @@ def verify(jar, platform, build_id, source, minecraft=None):
         check_class("client/prediction/PredictionCapturedTerrain$Summary", "columns")
         check_class("client/prediction/PredictionDecorationLevel", "LocalPlacementFailure")
         check_class("client/prediction/PredictionVegetation", "localFailures", "LocalPlacementFailure")
+        check_class("client/prediction/ClientTerrainSampler", "cacheBiomeHolder", "cachedBiomeHolders")
+        check_class("client/prediction/RustTerrainSampler", "noiseBiome", "cacheBiomeHolder", "featureRequiresJava",
+                    "unsupported block survival hook ", "javaFeatureSnapshot")
+        check_class("client/prediction/RustTerrainSampler", "exactSurfacePage", "proxyHeight")
+        check_class("client/prediction/PredictionDecorationLevel", "exactSurfacePage", "proxyHeight", "columnQueryVersions")
+        check_class("client/prediction/PredictionJavaFeatureMetrics", "record", "snapshot", "withoutWrites")
+        check_class("client/prediction/RustVegetationStage", "featureRequiresJava")
+        check_class("client/prediction/PredictionTreeModels", "performanceSnapshot", "placementFiltered",
+                    "selectedExactFallbacks", "replayRejected")
+        check_class("client/prediction/PredictionVegetation", "DECORATION_WRITE_SETTINGS_VERSION", "javaPlacement")
+        require(b"decoration write outside its bounded region" not in
+                check_class("client/prediction/PredictionDecorationLevel"),
+                "Ordinary rejected decoration writes still abort the complete feature")
         check_class("client/prediction/PredictionTileManager", "detailPipelineSnapshot", "oldestIncomplete", "visibleRemaining")
         require("dev/xantha/vss/client/prediction/PredictionVoxyFeatures$Node.class" not in names, "Object feature tree packaged")
         check_class("client/prediction/PredictionVoxyDetailQueue", "maintainResidency", "dormant")
@@ -671,21 +788,28 @@ def verify(jar, platform, build_id, source, minecraft=None):
                 require(archive.read(name) == (source / "src/main/resources" / name).read_bytes(),
                         "Native library differs from source: " + name)
                 require(b"find_top_surface" in archive.read(name), "Stale native library without the new height router: " + name)
+                require(b"RustWorldgenBackend_horizontalLookup" in archive.read(name), "Native climate input lookup absent: " + name)
+                require(b"vss_dry_air" in archive.read(name) and b"vss_aquifer_nearby" in archive.read(name), "Native exact height reuse absent: " + name)
                 natives[name] = hashlib.sha256(archive.read(name)).hexdigest()
         require(len(natives) == 5, "Expected all five native libraries")
         native_build = json.loads(archive.read("META-INF/vss-native-build.json"))
         require(native_build["sourceSha256"] == native_source_digest(source),
-                "Rust source differs from the tested native libraries")
+                "Rust source differs from the recorded native build")
         expected_native_paths = {"META-INF/vss-natives/" + platform + "/" + filename
                                  for platform, filename in LIBRARIES.items()}
         require(set(natives) == expected_native_paths, "Unexpected native platform paths")
         require({name.removeprefix("META-INF/vss-natives/"): value for name, value in natives.items()}
-                == native_build["libraries"], "Native CI checksums differ from packaged libraries")
+                == native_build["libraries"], "Recorded native checksums differ from packaged libraries")
     return {"jar": jar.name, "platform": platform, "buildId": build_id,
+            "runtimeMinimum": runtime_minimum,
             "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
             "bytes": jar.stat().st_size, "nativeSha256": natives,
             "worldgenInterfaceCheck": {"kind": "artifact-presence-reference", "gameplayValidated": False},
-            "integratedFixes": ["view-priority-background-notifications", "asynchronous-budgeted-retirement", "off-lock-snapshot-disposal", "native-empty-fast-withdrawal", "steady-state-lock-bypass", "configured-shared-cpu-admission", "two-stage-warm-cache-startup", "in-place-native-backend-promotion", "streamed-voxel-content-digest", "stale-prepared-backend-retirement", "native-border-consumer-evidence", "byte-bounded-section-admission", "independent-partial-surface-cache-restore", "early-identical-input-notification", "answer-budget-biome-cache", "terrain-interval-publication", "shared-quart-neighborhoods", "persistent-fair-generation-turn", "community-explicit-far-plane", "community-delegated-ingest-completion", "engine-scoped-real-column-settlement", "community-native-inset-preservation", "legacy-fluid-inset-normalization",
+            "integratedFixes": ["biome-specialized-material-rules", "demand-driven-surface-noise",
+                                *(["modern-tree-environment-admission", "modern-decoration-cache-identity"] if minecraft.startswith("26.") else []),
+                                *(["complete-region-gpu-cost-policy", "online-cpu-sentinels"] if minecraft == "26.3" else []),
+                                "conservative-column-biome-certificates", "candidate-envelope-decoration-pruning",
+                                "committed-real-section-authority", "verified-native-image-coverage-persistence", "exact-dry-air-certificates", "reused-aquifer-neighbourhoods", "bounded-horizontal-climate-reuse", "validated-native-climate-sharing", "view-priority-background-notifications", "asynchronous-budgeted-retirement", "off-lock-snapshot-disposal", "native-empty-fast-withdrawal", "steady-state-lock-bypass", "configured-shared-cpu-admission", "two-stage-warm-cache-startup", "in-place-native-backend-promotion", "streamed-voxel-content-digest", "stale-prepared-backend-retirement", "native-border-consumer-evidence", "byte-bounded-section-admission", "independent-partial-surface-cache-restore", "early-identical-input-notification", "answer-budget-biome-cache", "terrain-interval-publication", "shared-quart-neighborhoods", "persistent-fair-generation-turn", "community-explicit-far-plane", "community-delegated-ingest-completion", "engine-scoped-real-column-settlement", "community-native-inset-preservation", "legacy-fluid-inset-normalization",
                                 *worldgen_interface_fixes,
                                 *(["native-server-stream-ownership", "native-column-success-receipts", "native-column-timestamp-order"] if minecraft == "1.20.1" else []),
                                 "static-worldgen-codec-context", "inline-stronghold-biome-preference", "registry-context-surface-cache", "versioned-resource-atlas-token", "horizon-planned-root-capacity", "resident-node-traversal-capacity", "non-spinning-gpu-queue-bounds", "two-phase-dirty-capture-handoff", "bounded-capture-retry", "dirty-retention-buffer-fetch", "retired-refresh-barrier", "seeded-fabric-end-biomes", "failed-biome-surface-rejection", "end-decoration-cache-repair", "compact-column-pages", "contributing-feature-query", "native-owner-publication",
@@ -704,9 +828,24 @@ def verify(jar, platform, build_id, source, minecraft=None):
                                 "shared-tile-state-pages", "reused-scheduling-facts", "packed-vegetation-display",
                                 "reusable-material-workspace", "bounded-section-boundaries", "reused-notification-faces",
                                 "partial-vegetation-lod-union", "complete-surface-eviction-fallback",
+                                "interval-select-finite-branch-bounds", "retained-display-probe-cache-admission",
                                 "active-projected-sample-demand", "zoom-sensitive-view-refresh", "prediction-horizon-mask",
                                 "indexed-horizon-invalidation",
                                 "off-lock-publication-evidence", "shared-horizontal-change-evidence", "spatial-cache-invalidation",
+                                "capture-refresh-until-publication", "running-detail-retention",
+                                "snapshot-registry-dimension-binding", "fast-tree-placement",
+                                "native-decoration-biome-holders", "stable-missing-survival-routing",
+                                "vanilla-rejected-decoration-writes", "tree-placement-outcome-counters",
+                                "exception-free-local-cache-presence",
+                                *(["vulkan-cell-display-density", "vulkan-display-rust-concurrency", "vulkan-grid-calibration",
+                                   "vulkan-driver-pipeline-cache", "native-display-window-reuse", "modern-aquifer-admission",
+                                   "modern-volume-pointwise-horizontal-cache", "modern-lattice-column-edges",
+                                   "modern-end-distance-finite-bounds", "independent-surface-proof-footprint",
+                                   "specialized-scalar-volume-noise-kernels",
+                                   "modern-column-interval-bounds", "modern-full-cell-proof-isolation",
+                                   "modern-passthrough-graph-compilation", "modern-constant-direct-evaluation",
+                                   "modern-chunk-material-workspace", "modern-lazy-display-steepness",
+                                   "modern-final-density-search-grid", "cpu-display-region-allocation-bypass"] if minecraft == "26.3" else []),
                                 "asynchronous-native-demand-handoff", "bulk-exact-section-signatures", "bounded-middle-cover", "first-terrain-priority", "bounded-cache-probe-wait", "offscreen-retirement-without-generation"]}
 
 

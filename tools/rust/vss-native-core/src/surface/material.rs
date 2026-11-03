@@ -51,6 +51,15 @@ pub(super) struct OreRule {
     raw_chance: f32,
     random: Positional,
 }
+impl Clone for OreRule {
+    fn clone(&self) -> Self {
+        Self {
+            density: self.density, richness: self.richness, gap: self.gap,
+            ore: self.ore, raw: self.raw, filler: self.filler, raw_chance: self.raw_chance,
+            random: copy_positional(&self.random),
+        }
+    }
+}
 impl OreRule {
     pub fn parse(value: &Value, graph: &mut Graph, doc: &Value, palette: &mut Palette) -> Result<Self> {
         let raw_chance = number(value, "raw_ore_chance")? as f32;
@@ -174,7 +183,7 @@ mod tests {
         assert_ne!(expected, graph.noise(noise, pos[0] as f64, 0.0, pos[2] as f64));
         let mut value = json!({"type":"minecraft:noise_threshold", "noise":"minecraft:surface",
             "min_threshold":expected, "max_threshold":expected, "is_3d":true});
-        let context = Context { p: pos, biome: "minecraft:plains", cold: false, steep: false,
+        let context = Context { p: pos, biome: "minecraft:plains", cold: false, steep: Steepness::Known(false),
             depth: 3, secondary: 0.0, above: 1, below: 1, water: i32::MIN, min_surface: 0 };
         assert!(parse_condition(&value, &mut graph, &doc, -64, 384, 0).unwrap().matches(&graph, &context));
         value["is_3d"] = json!(false);

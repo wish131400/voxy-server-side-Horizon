@@ -62,6 +62,13 @@ public final class VoxyPredictionPlugin implements IMixinConfigPlugin {
         return node.methods.stream().anyMatch(m -> m.name.equals(name) && m.desc.equals(desc));
     }
     @Override public boolean shouldApplyMixin(String target, String mixin) {
+        if (mixin.endsWith(".SodiumLegacyOptionsMixin")) {
+            try {
+                // Inspect bytecode only: optional UI classes must not load during Mixin preparation.
+                ClassNode screen = MixinService.getService().getBytecodeProvider().getClassNode(target);
+                return screen.fields.stream().anyMatch(f -> f.name.equals("pages") && f.desc.equals("Ljava/util/List;"));
+            } catch (Exception unavailable) { return false; }
+        }
         if (mixin.endsWith(".VoxyTraversalCapacityMixin") || mixin.endsWith(".VoxyTraversalQueueShaderMixin")) {
             if (capacity == null) {
                 try { capacity = supportsCapacity(name -> MixinService.getService().getBytecodeProvider().getClassNode(name.replace('/', '.'))); }

@@ -498,10 +498,13 @@ class PredictionVegetationTest {
             };
             var sampler=sampler(17,Blocks.GRASS_BLOCK,List.of(placed(feature,1)));
             var prediction=new PredictionVegetation(sampler,null,false);
-            assertTrue(prediction.chunk(0,0).isEmpty(),"failed transaction rolls back its partial trunk");
+            if (failureMode == 0)
+                assertTrue(prediction.chunk(0,0).values().stream().anyMatch(s->s.is(Blocks.OAK_LOG)),
+                        "ordinary rejected writes preserve valid placements");
+            else assertTrue(prediction.chunk(0,0).isEmpty(),"failed transaction rolls back its partial trunk");
             assertTrue(prediction.chunk(4,0).values().stream().anyMatch(s->s.is(Blocks.OAK_LOG)),prediction.diagnostics());
             assertEquals(2,calls.get());
-            assertEquals(1L,prediction.performanceSnapshot().get("localFailures"));
+            assertEquals(failureMode == 0 ? 0L : 1L,prediction.performanceSnapshot().get("localFailures"));
             assertEquals(0,prediction.performanceSnapshot().get("unsupportedFeatures"));
         }
     }
@@ -768,6 +771,10 @@ class PredictionVegetationTest {
         assertFalse(cache.supports(fallback));
         cache.place(selector, a, net.minecraft.util.RandomSource.create(1), new BlockPos(16,64,0));
         assertEquals(1, calls.get(), "selected custom branches must execute their original code");
+        assertEquals(3L,cache.performanceSnapshot().get("attempts"));
+        assertEquals(2L,cache.performanceSnapshot().get("built"));
+        assertEquals(2L,cache.performanceSnapshot().get("placed"));
+        assertEquals(1L,cache.performanceSnapshot().get("selectedExactFallbacks"));
     }
 
     @Test void reusableTreesRejectWaterAndProtectStructureBlocksBeforeWriting() {

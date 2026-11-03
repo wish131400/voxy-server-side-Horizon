@@ -125,7 +125,188 @@ fn float_compare(a: f32, b: f32) -> std::cmp::Ordering {
     };
     bits(a).cmp(&bits(b))
 }
+pub(super) fn interpolation_context(
+    original: Option<ModernVolume>,
+    base: [i32; 3],
+    grid: [i32; 3],
+    mode: Mode,
+) -> (Option<ModernVolume>, ModernVolume) {
+    let block_volume = original.map(|v| ModernVolume {
+        size: std::array::from_fn(|i| v.size[i] * v.step[i]),
+        origin: v.origin,
+        step: [1; 3],
+    });
+    let input_volume = if is_volume(mode) {
+        block_volume.map(|v| {
+            let origin = std::array::from_fn(|i| v.origin[i].div_euclid(grid[i]) * grid[i]);
+            let size = std::array::from_fn(|i| {
+                v.max(i).div_euclid(grid[i]) - v.origin[i].div_euclid(grid[i])
+                    + 1
+                    + i32::from(v.max(i).rem_euclid(grid[i]) != 0)
+            });
+            ModernVolume {
+                size,
+                origin,
+                step: grid,
+            }
+        })
+    } else {
+        None
+    }
+    .unwrap_or(ModernVolume {
+        size: [2; 3],
+        origin: base,
+        step: grid,
+    });
+    (block_volume, input_volume)
+}
+const DENSE_CORNER_POINTS: usize = 4096;
+pub(super) const DENSE_CORNER_BYTES: usize = 1024 * 1024;
+
+/// One lazy buffer per interpolator. Keep allocations across workspace resets,
+/// but never share values between different nested volumes or beard states.
+#[derive(Clone, Default)]
+pub(super) struct DenseCorners {
+    volume: Option<ModernVolume>,
+    values: Vec<Option<f32>>,
+}
+impl DenseCorners {
+    pub(super) fn invalidate(&mut self) {
+        self.volume = None;
+    }
+    fn prepare(&mut self, volume: ModernVolume, count: usize, total: &mut usize) -> bool {
+        if self.volume == Some(volume) {
+            return true;
+        }
+        if count > self.values.capacity() {
+            let previous = self.values.capacity() * std::mem::size_of::<Option<f32>>();
+            let remaining = DENSE_CORNER_BYTES - (*total - previous);
+            if count * std::mem::size_of::<Option<f32>>() > remaining {
+                return false;
+            }
+            let values = vec![None; count];
+            let bytes = values.capacity() * std::mem::size_of::<Option<f32>>();
+            if bytes > remaining {
+                return false;
+            }
+            self.values = values;
+            *total = *total - previous + bytes;
+        } else {
+            self.values.resize(count, None);
+            self.values.fill(None);
+        }
+        self.volume = Some(volume);
+        true
+    }
+}
+fn dense_corner_index(q: [i32; 3], volume: ModernVolume) -> Option<(usize, usize)> {
+    let count = volume.size.iter().try_fold(1usize, |n, &size| {
+        n.checked_mul(usize::try_from(size).ok()?)
+    })?;
+    if count == 0 || count > DENSE_CORNER_POINTS {
+        return None;
+    }
+    let mut index = [0usize; 3];
+    for axis in 0..3 {
+        let delta = q[axis] as i64 - volume.origin[axis] as i64;
+        let step = volume.step[axis] as i64;
+        if step <= 0 || delta < 0 || delta % step != 0 {
+            return None;
+        }
+        let coordinate = delta / step;
+        if coordinate >= volume.size[axis] as i64 {
+            return None;
+        }
+        index[axis] = coordinate as usize;
+    }
+    Some((
+        (index[0] * volume.size[1] as usize + index[1]) * volume.size[2] as usize + index[2],
+        count,
+    ))
+}
+pub(super) fn interpolation_corner(
+    g: &Graph,
+    input: Id,
+    slot: usize,
+    q: [i32; 3],
+    volume: ModernVolume,
+    s: &mut Scratch,
+) -> f32 {
+    if let Some((index, count)) = dense_corner_index(q, volume) {
+        if s.modern_dense[slot].prepare(volume, count, &mut s.modern_dense_bytes) {
+            if let Some(value) = s.modern_dense[slot].values[index] {
+                return value;
+            }
+            let original = s.modern_volume.replace(volume);
+            let value = g.compute_typed::<true, false>(input, q, Mode::Slice, s) as f32;
+            s.modern_volume = original;
+            // Nested evaluation may have replaced this slot's active volume.
+            if s.modern_dense[slot].volume == Some(volume) {
+                s.modern_dense[slot].values[index] = Some(value);
+            }
+            return value;
+        }
+    }
+    let key = (input, q, volume);
+    if let Some(v) = s.modern_corners.get(&key) {
+        return *v;
+    }
+    let original = s.modern_volume.replace(volume);
+    let v = g.compute_typed::<true, false>(input, q, Mode::Slice, s) as f32;
+    s.modern_volume = original;
+    if s.modern_corners.len() < 262144 {
+        s.modern_corners.insert(key, v);
+    }
+    v
+}
+pub(super) fn interpolation_corners(
+    g: &Graph,
+    input: Id,
+    slot: usize,
+    base: [i32; 3],
+    grid: [i32; 3],
+    volume: ModernVolume,
+    s: &mut Scratch,
+) -> [f32; 8] {
+    if let Some((_, _, values)) =
+        s.modern_cells[slot].filter(|(q, v, _)| *q == base && *v == volume)
+    {
+        return values;
+    }
+    let values = std::array::from_fn(|i| {
+        let q = std::array::from_fn(|axis| {
+            (base[axis] + ((i as i32 >> axis) & 1) * grid[axis]).min(volume.max(axis))
+        });
+        interpolation_corner(g, input, slot, q, volume, s)
+    });
+    s.modern_cells[slot] = Some((base, volume, values));
+    values
+}
+
 impl Node {
+    /// A subtree evaluated pointwise in every volume. Coordinate transforms,
+    /// cache markers and interpolation keep their existing volume semantics.
+    /// ColumnPlan separately proves independence from Y before allocating a slot.
+    pub fn volume_pointwise(&self, d: &[bool]) -> bool {
+        fn spline(s: &Spline, d: &[bool]) -> bool {
+            match s {
+                Spline::Constant(_) => true,
+                Spline::Multipoint { coordinate, points } => {
+                    d[*coordinate] && points.iter().all(|(_, s, _)| spline(s, d))
+                }
+            }
+        }
+        match self {
+            Self::Constant(_) | Self::End(_) | Self::Gradient { .. } | Self::Shift(_, _) => true,
+            Self::Noise { shifts, .. } => shifts.is_none_or(|s| s.iter().all(|&n| d[n])),
+            Self::Unary(_, n) | Self::Clamp(n, ..) => d[*n],
+            Self::Binary(_, a, b) | Self::Round(_, a, b) => d[*a] && d[*b],
+            Self::Range(a, _, _, b, c) | Self::Lerp(a, b, c) => d[*a] && d[*b] && d[*c],
+            Self::Interval(a, _, f) => d[*a] && f.iter().all(|&n| d[n]),
+            Self::Spline(s) => spline(s, d),
+            _ => false,
+        }
+    }
     pub fn uses_y(&self, d: &[bool]) -> bool {
         match self {
             Self::Constant(_) | Self::End(_) => false,
@@ -153,7 +334,7 @@ impl Node {
         }
     }
     pub fn compute(&self, g: &Graph, p: [i32; 3], mode: Mode, s: &mut Scratch) -> f32 {
-        let ev = |n, s: &mut Scratch| g.compute(n, p, mode, s) as f32;
+        let ev = |n, s: &mut Scratch| g.compute_typed::<true, false>(n, p, mode, s) as f32;
         match self {
             Self::Constant(v) => *v,
             Self::Unary(op, n) => {
@@ -336,7 +517,7 @@ impl Node {
                     std::array::from_fn(|i| p[i].wrapping_add(shifts[i] as i32))
                 };
                 let original = s.modern_volume.take();
-                let value = g.compute(*input, q, Mode::Single, s) as f32;
+                let value = g.compute_typed::<true, false>(*input, q, Mode::Single, s) as f32;
                 s.modern_volume = original;
                 value
             }
@@ -363,7 +544,7 @@ impl Node {
                         if (i == 0 && noise.result == 2) || (i == 1 && noise.result == 1) {
                             continue;
                         }
-                        let v = g.compute(input, position, Mode::Single, s) as f32;
+                        let v = g.compute_typed::<true, false>(input, position, Mode::Single, s) as f32;
                         if float_compare(v, min).is_lt() || float_compare(v, max).is_gt() {
                             value = fallback;
                         }
@@ -397,7 +578,7 @@ impl Node {
                 if is_volume(mode) {
                     s.modern_volume = original.map(|v| v.slice(*axis, *value));
                 }
-                let value = g.compute(*n, q, mode, s) as f32;
+                let value = g.compute_typed::<true, false>(*n, q, mode, s) as f32;
                 s.modern_volume = original;
                 value
             }
@@ -417,7 +598,7 @@ impl Node {
                     p[2].rem_euclid(*xz),
                 ];
                 if local == [0, 0, 0] && !is_volume(mode) {
-                    return g.compute(*input, p, Mode::Single, s) as f32;
+                    return g.compute_typed::<true, false>(*input, p, Mode::Single, s) as f32;
                 }
                 let grid = [*xz, *y, *xz];
                 let original = s.modern_volume;
@@ -429,62 +610,54 @@ impl Node {
                         })
                     })
                 {
-                    return g.compute(*input, p, mode, s) as f32;
+                    return g.compute_typed::<true, false>(*input, p, mode, s) as f32;
                 }
                 let base = std::array::from_fn(|i| p[i] - local[i]);
-                let block_volume = original.map(|v| ModernVolume {
-                    size: std::array::from_fn(|i| v.size[i] * v.step[i]),
-                    origin: v.origin,
-                    step: [1; 3],
-                });
-                let input_volume = if is_volume(mode) {
-                    block_volume.map(|v| {
-                        let origin =
-                            std::array::from_fn(|i| v.origin[i].div_euclid(grid[i]) * grid[i]);
-                        let size = std::array::from_fn(|i| {
-                            v.max(i).div_euclid(grid[i]) - v.origin[i].div_euclid(grid[i])
-                                + 1
-                                + i32::from(v.max(i).rem_euclid(grid[i]) != 0)
-                        });
-                        ModernVolume {
-                            size,
-                            origin,
-                            step: grid,
-                        }
-                    })
-                } else {
-                    None
-                }
-                .unwrap_or(ModernVolume {
-                    size: [2; 3],
-                    origin: base,
-                    step: grid,
-                });
+                let (block_volume, input_volume) =
+                    interpolation_context(original, base, grid, mode);
                 let values = if let Some((_, _, values)) =
                     s.modern_cells[*slot].filter(|(q, v, _)| *q == base && *v == input_volume)
                 {
                     values
                 } else {
-                    let mut values = [0f32; 8];
-                    for (i, v) in values.iter_mut().enumerate() {
+                    // At an X/Z lattice point only the two Y corners carry weight.
+                    // A finite child bound also proves that skipped differences cannot overflow.
+                    let bound = g.column_plan.bounds[*input];
+                    let edge = s.use_column_plan
+                        && local[0] == 0
+                        && local[2] == 0
+                        && !g.stateful_columns
+                        && bound.0.is_finite()
+                        && bound.1.is_finite()
+                        && bound.0.abs().max(bound.1.abs()) < f32::MAX as f64 / 4.;
+                    let corner = |i: usize, s: &mut Scratch| {
                         let q = std::array::from_fn(|axis| {
                             (base[axis] + ((i as i32 >> axis) & 1) * grid[axis])
                                 .min(input_volume.max(axis))
                         });
-                        let key = (*input, q, input_volume);
-                        *v = if let Some(v) = s.modern_corners.get(&key) {
-                            *v
-                        } else {
-                            s.modern_volume = Some(input_volume);
-                            let v = g.compute(*input, q, Mode::Slice, s) as f32;
-                            s.modern_volume = original;
-                            if s.modern_corners.len() < 262144 {
-                                s.modern_corners.insert(key, v);
-                            }
-                            v
-                        };
+                        interpolation_corner(g, *input, *slot, q, input_volume, s)
+                    };
+                    let mut values = [0f32; 8];
+                    if edge {
+                        values[0] = corner(0, s);
+                        values[2] = corner(2, s);
                     }
-                    s.modern_cells[*slot] = Some((base, input_volume, values));
+                    // Zero-valued corners retain full arithmetic for signed-zero parity.
+                    if edge && values[0] != 0. && values[2] != 0. {
+                        for i in [1, 4, 5] {
+                            values[i] = values[0];
+                        }
+                        for i in [3, 6, 7] {
+                            values[i] = values[2];
+                        }
+                    } else {
+                        for (i, value) in values.iter_mut().enumerate() {
+                            if !edge || i != 0 && i != 2 {
+                                *value = corner(i, s);
+                            }
+                        }
+                        s.modern_cells[*slot] = Some((base, input_volume, values));
+                    }
                     values
                 };
                 let fx = local[0] as f32 / *xz as f32;
@@ -542,7 +715,7 @@ impl Node {
                 if is_volume(mode) {
                     s.modern_volume = original.map(|v| v.slice(1, 0));
                 }
-                let bound = g.compute(
+                let bound = g.compute_typed::<true, false>(
                     *upper,
                     q,
                     if is_volume(mode) { mode } else { Mode::Single },
@@ -550,16 +723,42 @@ impl Node {
                 ) as f32;
                 s.modern_volume = original;
                 let mut probe = (bound / *step as f32).floor() as i32 * *step;
+                // Vanilla's computed upper bound is normally within a few
+                // samples of the surface. Keep those cheap probes direct;
+                // subdividing pays only when that estimate leaves a long gap.
+                for _ in 0..4 {
+                    if probe < *lower {
+                        return *lower as f32;
+                    }
+                    q[1] = probe;
+                    if g.compute_typed::<true, false>(*density, q, Mode::Single, s) > 0. {
+                        return probe as f32;
+                    }
+                    if probe == *lower {
+                        return *lower as f32;
+                    }
+                    probe = probe.saturating_sub(*step);
+                }
+                let distance = probe as i64 - *lower as i64;
+                if (0..=i32::MAX as i64).contains(&distance) {
+                    // Search precisely the same descending lattice as the
+                    // released loop. A lower bound between two lattice points
+                    // is a fallback, not an extra density sample.
+                    let min = probe - (distance as i32 / *step) * *step;
+                    return g
+                        .first_above(*density, p[0], p[2], min, probe, *step, 0., s)
+                        .unwrap_or(*lower) as f32;
+                }
                 while probe > *lower {
                     q[1] = probe;
-                    if g.compute(*density, q, Mode::Single, s) > 0. {
+                    if g.compute_typed::<true, false>(*density, q, Mode::Single, s) > 0. {
                         return probe as f32;
                     }
                     probe = probe.saturating_sub(*step);
                 }
                 if probe == *lower {
                     q[1] = probe;
-                    if g.compute(*density, q, Mode::Single, s) > 0. {
+                    if g.compute_typed::<true, false>(*density, q, Mode::Single, s) > 0. {
                         return probe as f32;
                     }
                 }
@@ -1274,3 +1473,7 @@ mod reference_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "modern_corner_tests.rs"]
+mod corner_tests;

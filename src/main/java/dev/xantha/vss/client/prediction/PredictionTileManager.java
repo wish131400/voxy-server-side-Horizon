@@ -149,6 +149,9 @@ public final class PredictionTileManager implements AutoCloseable {
             voxyDemand=new PredictionClientPreparation<>(voxySource::refreshDetails);
     private boolean voxyDemandRefill;
     private volatile Set<PredictionTileKey> voxyDetailTargets = PredictionInputSnapshots.concurrentSet();
+    // Waiting admission may change while a worker is already sampling. Only
+    // executing detail jobs retain their target until completion, not the backlog.
+    private final Set<PredictionTileKey> runningVoxyDetails = ConcurrentHashMap.newKeySet();
     private final Map<PredictionTileKey, PredictionDetailTrace> detailTraces = new ConcurrentHashMap<>();
     private void detailEvent(PredictionTileKey key,String event) {
         var trace=detailTraces.get(key);if(trace!=null)trace.event(event,System.nanoTime());
@@ -160,7 +163,13 @@ public final class PredictionTileManager implements AutoCloseable {
     }
     private final java.util.ArrayDeque<PredictionTileKey> voxyDetailWork = new java.util.ArrayDeque<>();
 
-    private boolean voxyDetail(PredictionTileKey key) { return unifiedVoxy && voxyDetailTargets.contains(key); }
+    private boolean voxyDetail(PredictionTileKey key) {
+        if (!unifiedVoxy) return false;
+        if (voxyDetailTargets.contains(key)) return true;
+        return runningVoxyDetails.contains(key) && key.lod() >= 0 && key.lod() < layout.levelCount()
+                && PredictionWorkOrder.distanceSquared(key, layout, cameraBlockX, cameraBlockZ)
+                    <= (double) layout.maxDistanceBlocks() * layout.maxDistanceBlocks();
+    }
 
     /** Source demand crosses the worker boundary as a snapshot; admission stays on the client thread. */
     private synchronized void refreshVoxyDetails(boolean refill) {
@@ -465,7 +474,7 @@ public final class PredictionTileManager implements AutoCloseable {
     private final java.util.ArrayDeque<PredictionTileKey> cacheCandidates = new java.util.ArrayDeque<>();
     private int nearCacheAdmissions;
     /** Keep several independent disk decodes in flight without opening an unbounded IO lane. */
-    private static final int CACHE_RESTORE_IN_FLIGHT = 4;
+    private static final int CACHE_RESTORE_IN_FLIGHT = 8;
     private final Set<PredictionTileKey> scopePending = tileStates.flag(6);
     private final java.util.ArrayDeque<BuildRequest> scopeCandidates = new java.util.ArrayDeque<>();
     /**
@@ -629,9 +638,10 @@ public final class PredictionTileManager implements AutoCloseable {
             thread.setPriority(Thread.NORM_PRIORITY - 1);
             return thread;
         });
-        // Cache hits never enter world generation. Two independent workers keep
-        // recovery moving even while generation is throttled by CPU pressure.
-        this.cacheExecutor = new ThreadPoolExecutor(2, 2, 15L, TimeUnit.SECONDS,
+        // Cache recovery has its own bounded lane. Small CPUs retain two workers;
+        // machines with at least eight logical processors can decode four tiles.
+        int cacheWorkers = Runtime.getRuntime().availableProcessors() >= 8 ? 4 : 2;
+        this.cacheExecutor = new ThreadPoolExecutor(cacheWorkers, cacheWorkers, 15L, TimeUnit.SECONDS,
                 new java.util.concurrent.ArrayBlockingQueue<>(CACHE_RESTORE_IN_FLIGHT), runnable -> {
             Thread thread = new Thread(runnable, "vss-cache-restore-" + dimension.identifier().getPath());
             thread.setDaemon(true);
@@ -874,6 +884,7 @@ public final class PredictionTileManager implements AutoCloseable {
     /** Navigation invalidates demand, never resident geometry or its content revision. */
     private synchronized void abandonOldViewWork() {
         navigationGeneration++;
+        runningVoxyDetails.clear();
         if (diskCache != null) diskCache.resetTerrainProbes();
         voxyOwnedTiles = Set.of(); renderSnapshot = null;
         planning.invalidate();
@@ -1435,6 +1446,13 @@ public final class PredictionTileManager implements AutoCloseable {
         PredictionMemoryBudget.Reservation previous = residentMemory.put(tile.key(), reservation);
         if (previous != null) previous.close();
         ready.put(tile.key(), tile);
+        // The source completes a full native request after this commit. Keep
+        // that completed demand resident while its asynchronous delta returns.
+        if (unifiedVoxy && runningVoxyDetails.contains(tile.key())
+                && tile.spacingBlocks() <= layout.sampleSpacing(tile.key().lod())) {
+            voxyDetailTargets.add(tile.key());
+            desiredKeys.add(tile.key());
+        }
         discardReclaim(tile.key());
         coverageSpatial.put(tile.key(), tile.key());
         if (current == null) coverageSpatialSize++;
@@ -1455,6 +1473,7 @@ public final class PredictionTileManager implements AutoCloseable {
         } else if (tile.data().voxyTile != null && tile.data().voxyTile.surfaceComplete()) surfaceReady.add(tile.key());
         else surfaceReady.remove(tile.key());
         dirtyTiles.remove(tile.key());
+        captureRefresh.completed(tile.key());
         invalidatedSurfaces.remove(tile.key());
         var trace=detailTraces.get(tile.key());
         if(trace!=null)trace.published(System.nanoTime(),captureEpoch);
@@ -2204,7 +2223,7 @@ public final class PredictionTileManager implements AutoCloseable {
             vegetation.invalidate((int) (column >> 32), (int) column);
         // Include neighboring columns used by seam walls. Retain old meshes
         // until their replacements are ready, and reject in-flight stale data.
-        Set<PredictionTileKey> affected = captureDependencies(columns);
+        Set<PredictionTileKey> affected = captureDependencies(columns, worldEdit);
         affected.removeIf(key -> !ready.containsKey(key) && !pending.contains(key));
         long now = System.nanoTime();
         for (PredictionTileKey key : affected) {
@@ -2223,10 +2242,18 @@ public final class PredictionTileManager implements AutoCloseable {
     }
 
     private Set<PredictionTileKey> captureDependencies(it.unimi.dsi.fastutil.longs.LongSet columns) {
+        return captureDependencies(columns, true);
+    }
+
+    private Set<PredictionTileKey> captureDependencies(it.unimi.dsi.fastutil.longs.LongSet columns, boolean worldEdit) {
         Set<PredictionTileKey> affected = new HashSet<>();
         for (int lod = 0; lod < layout.levelCount(); lod++) {
-            int margin = Math.max(64, layout.tileBlocks(lod) / sampler.initialTerrainCellAxis(lod) * VssLodLayout.SAMPLE_MARGIN);
             int span = layout.tileBlocks(lod);
+            // The coarsest preview has eight cells. Its border can read any
+            // intersecting area capture, even when no final-grid node lies in it.
+            int margin = span / Math.min(8, sampler.initialTerrainCellAxis(lod)) * VssLodLayout.SAMPLE_MARGIN;
+            // Only world edits change tree/building placement across its halo.
+            if (worldEdit) margin = Math.max(64, margin);
             for (long column : columns) {
                 int chunkX = (int) (column >> 32), chunkZ = (int) column;
                 for (int tz = Math.floorDiv(chunkZ * 16 - margin, span);
@@ -2601,6 +2628,8 @@ public final class PredictionTileManager implements AutoCloseable {
         var details=detailPipelineSnapshot();
         result.put("voxyDetailRemaining", details.get("remaining"));
         result.put("detailPipeline",details);
+        if (sampler instanceof PredictionDisplayGridSampler display)
+            result.put("displayCompute",display.displayPerformanceSnapshot());
         var admission=new java.util.LinkedHashMap<String,Long>();
         String[] reasons={"notDesired","released","medium","terrainNeeded","surfaceReady","noPrevious",
                 "noReservation","noDetailSlot","noSurfaceSlot","cpuBudget"};
@@ -2610,6 +2639,8 @@ public final class PredictionTileManager implements AutoCloseable {
         result.put("voxySource", voxySource.diagnostics());
         result.put("generationActive",executor.getActiveCount()); result.put("cacheActive",cacheExecutor.getActiveCount());
         result.put("generationQueued",executor.getQueue().size()); result.put("cachePending",cachePending.size());
+        result.put("cacheWorkerLimit",cacheExecutor.getCorePoolSize());
+        result.put("cacheQueued",cacheExecutor.getQueue().size()); result.put("cacheInFlightLimit",CACHE_RESTORE_IN_FLIGHT);
         result.put("sampleNanos",samplingNanos.sum()); result.put("surfaceNanos",decorationNanos.sum());
         result.put("meshNanos",meshingNanos.sum());
         result.put("diskNanos",diskReadNanos.sum()); result.put("nativeNanos",nativeSampleNanos.sum());
@@ -2905,7 +2936,6 @@ public final class PredictionTileManager implements AutoCloseable {
         long revision = meshRevision.get();
         long navigation = navigationGeneration;
         detailEvent(key,cacheOnly?"cache-queued":"generation-queued");
-        captureRefresh.started(key);
         if (background) backgroundPending.add(key);
         if (surface) surfacePending.add(key);
         if (ordinary) refinementPending.add(key);
@@ -2935,18 +2965,20 @@ public final class PredictionTileManager implements AutoCloseable {
             var buildOutcome = PredictionMemoryBudget.BuildOutcome.CANCELLED;
             boolean continueSurface = false;
             boolean buildAdmitted = false;
-            boolean captureDeferred = false;
-            if (dirtyTiles.contains(key) && ready.containsKey(key)) {
-                synchronized (this) {
-                    captureDeferred = captureRefresh.defer(key, System.nanoTime());
-                }
-            }
+            final boolean captureDeferred;
             // Read content validity and its epoch together; terrain generation stays outside the lock.
             final long captureEpoch;
             final boolean retainSurface;
             synchronized (this) {
+                captureDeferred = dirtyTiles.contains(key) && ready.containsKey(key)
+                        && captureRefresh.defer(key, System.nanoTime());
                 captureEpoch = captureEpochs.getOrDefault(key, 0L);
                 retainSurface = !invalidatedSurfaces.contains(key);
+                // Only publication consumes the burst. A cancelled attempt
+                // must keep its first capture so the next one can coalesce.
+                if (!captureDeferred) captureRefresh.attempted(key, buildStartedNanos);
+                if (unifiedVoxy && navigation == navigationGeneration && voxyDetailTargets.contains(key))
+                    runningVoxyDetails.add(key);
             }
             detailEvent(key,cacheOnly?"cache-running":"generation-running");
             activeBuildThreads.add(Thread.currentThread());
@@ -3337,6 +3369,7 @@ public final class PredictionTileManager implements AutoCloseable {
                     captureDiscardNanos.add(System.nanoTime() - buildStartedNanos);
                 if (diskLease != null) diskLease.close();
                 activeBuildThreads.remove(Thread.currentThread());
+                runningVoxyDetails.remove(key);
                 if (buildSlots != null) buildSlots.close();
                 if (reservation != null) { reservation.finishBuild(buildOutcome); reservation.close(); }
                 if (cpuLease != null) cpuLease.close();
@@ -3531,6 +3564,17 @@ public final class PredictionTileManager implements AutoCloseable {
             return samples;
         }
         long revision = meshRevision.get();
+        if (display && sampler instanceof PredictionDisplayGridSampler region) {
+            region.sampleDisplayRegion(baseBlockX - VssLodLayout.SAMPLE_MARGIN * stepBlocks,
+                    baseBlockZ - VssLodLayout.SAMPLE_MARGIN * stepBlocks, stepBlocks, gridSize, samples,
+                    () -> {
+                        if (!captureCurrent.getAsBoolean()) return false;
+                        if (closed || paused || revision != meshRevision.get() || Thread.currentThread().isInterrupted())
+                            throw new java.util.concurrent.CancellationException();
+                        return true;
+                    });
+            return samples;
+        }
         for (int z = 0; z < gridSize; z += 8) {
             for (int x = 0; x < gridSize; x += 8) {
                 if (!captureCurrent.getAsBoolean()) return samples;

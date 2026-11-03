@@ -131,7 +131,10 @@ class PredictionRefinementPipelineBenchmark {
         for (int duration : new int[]{0,400,1400}) for (int queueMs : new int[]{0,180,500}) {
             long[] old = replay(false,queueMs,duration), candidate = replay(true,queueMs,duration);
             assertEquals(0,candidate[0]);
-            assertTrue(candidate[2]<=old[2],"merging queued captures must not increase wasted sampling");
+            // A long queue could discard every old epoch without sampling it.
+            // The current policy deliberately grants a bounded progress attempt
+            // during continuous captures; compare its work to that bound.
+            assertTrue(candidate[1]<=duration/500+2,"continuous capture traffic must not cause unbounded restarts");
             assertTrue(candidate[3]<=old[3],"queue merging must not delay the final visible update");
             System.out.printf("CAPTURE_REPLAY updateDurationMs=%d queueMs=%d oldStaleBeforeWork=%d newStaleBeforeWork=%d oldBuilds=%d newBuilds=%d oldDiscardedWorkMs=%d newDiscardedWorkMs=%d oldAllCurrentAtMs=%d newAllCurrentAtMs=%d%n",
                     duration,queueMs,old[0],candidate[0],old[1],candidate[1],old[2],candidate[2],old[3],candidate[3]);
@@ -146,20 +149,27 @@ class PredictionRefinementPipelineBenchmark {
             long now=(ms+1)*1_000_000L;
             if (ms<=duration && ms%20==0) { epoch++; refresh.changed(key,now); }
             if (finish==ms) {
-                if(buildEpoch==epoch) { shown=epoch; last=ms; } else discarded+=60;
+                if(buildEpoch==epoch) {
+                    shown=epoch; last=ms;
+                    if(current)refresh.completed(key);
+                } else discarded+=60;
                 finish=-1;
             }
             if(pick==ms) {
                 pick=-1;
                 if(current) {
-                    if(!refresh.defer(key,now)) { buildEpoch=epoch; builds++; finish=ms+60; }
+                    if(!refresh.defer(key,now)) {
+                        refresh.attempted(key,now); buildEpoch=epoch; builds++; finish=ms+60;
+                    }
                 } else if(queuedEpoch!=epoch) stale++;
                 else { buildEpoch=queuedEpoch; builds++; finish=ms+60; }
             }
             if(ms%10==0 && shown!=epoch && pick<0 && finish<0 && !refresh.defer(key,now)) {
                 queuedEpoch=epoch;
-                refresh.started(key);
+                // Replay the old admission-time reset only for the historical policy.
+                if(!current)refresh.completed(key);
                 if(queueMs==0) {
+                    if(current)refresh.attempted(key,now);
                     buildEpoch=epoch; builds++; finish=ms+60;
                 } else pick=ms+queueMs;
             }

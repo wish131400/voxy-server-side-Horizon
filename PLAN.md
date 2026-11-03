@@ -14,7 +14,9 @@
 | 六组社区 Voxy | 固定实际发布包或提交适配，已做分阶段接口、GPU 与客户端检查 | [依赖矩阵](docs/compatibility/README.md) |
 | 标签、TerraBlender、BetterEnd、provider 与 Lithostitched | 上批世界生成快照和算法修复已有阶段验证，联机两端需一起更新 | [适配范围](docs/compatibility/worldgen.md) |
 | 可选模组与 Tectonic 非默认预设 | 饰品、FTB、树木模板与已应用噪声参数快照已补齐，通过八目标及固定发行文件验证 | [本轮验证](docs/history/validation.md#当前可选模组与-tectonic-构建) |
-| 当前八目标候选包 | `fabric-optional-20261030`；包含本轮适配与预设修复，标准文件名与摘要见 lib | [构建记录](docs/development/build.md#标准产物) |
+| FreeTerraForged / ReTerraForged 1.21.1 | 新旧生成缓存分别适配，八个实际发行包离线检查通过 | [兼容范围](docs/compatibility/freeterraforged.md) |
+| 当前八目标候选包 | `20261102-cross-version-pruning`；全部目标接入候选群系证明与装饰前排除，逐版本记录完整路径与分配量；标准文件名与摘要见 lib | [本轮结果](docs/history/performance/cross-version-pruning-20261102.md) |
+| 26.x 完整生成追平 1.21.1 | 尚未证实普遍追平；本轮 26.3 同路径中位数约 3.58 秒，NeoForge 1.21.1 约 3.15 秒；装饰仍是主要成本，各目标吞吐波动需按报告区分 | [本轮逐版本对照](docs/history/performance/cross-version-pruning-20261102.md) |
 
 ## 后续验收
 

@@ -55,9 +55,12 @@ class VoxyIngestProtectionTest {
         var method = VoxyClientInstanceServerIngestMixin.class.getDeclaredMethod("vss$allowServerIngest", Object.class);
         var redirect = method.getAnnotation(org.spongepowered.asm.mixin.injection.Redirect.class);
         assertNotNull(redirect);
-        assertEquals(1, redirect.at().length);
-        assertEquals("FIELD", redirect.at()[0].value());
-        assertEquals("Lme/cortex/voxy/client/config/VoxyConfig;ingestEnabled:Z", redirect.at()[0].target());
+        Object encoded = redirect.annotationType().getMethod("at").invoke(redirect);
+        var points = encoded instanceof org.spongepowered.asm.mixin.injection.At[] array ? array
+                : new org.spongepowered.asm.mixin.injection.At[]{(org.spongepowered.asm.mixin.injection.At) encoded};
+        assertEquals(1, points.length);
+        assertEquals("FIELD", points[0].value());
+        assertEquals("Lme/cortex/voxy/client/config/VoxyConfig;ingestEnabled:Z", points[0].target());
         assertEquals(0, VoxyClientInstanceServerIngestMixin.class.getDeclaredFields().length);
     }
 

@@ -17,6 +17,12 @@ public final class VSSSodiumOptionsEventBridge {
             registered = true;
         }
 
+        if (VSSVoxyOptionsIntegration.hasLegacyOptions()) {
+            // The optional constructor hook also covers installs without Options API.
+            VSSLogger.info("Using legacy Sodium screen hook for VSS options");
+            registered = true;
+        }
+
         if (!registered && VSSVoxyOptionsIntegration.isSodiumPresent()) {
             VSSLogger.info("Sodium is present, but no compatible VSS options UI bridge was found");
         }

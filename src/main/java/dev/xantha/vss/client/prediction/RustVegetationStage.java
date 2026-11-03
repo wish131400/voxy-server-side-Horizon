@@ -99,12 +99,13 @@ final class RustVegetationStage implements AutoCloseable {
         upload();
         try {
             long featureStarted = System.nanoTime();
-            RustWorldgenBackend.placedFeature(volume, features.name(index), x, z, index, step);
+            RustWorldgenBackend.applyPlacedFeature(volume, features.name(index), x, z, index, step);
             FEATURE_NANOS.add(System.nanoTime() - featureStarted);
             FEATURES_PLACED.increment();
             nativeChanged = true;
         } catch (IllegalArgumentException requiresJava) {
             // The native transaction restored both the blocks and random stream.
+            sampler.featureRequiresJava(features.name(index), requiresJava);
             features.reject(index, RustTerrainSampler.JavaFeatureReason.TRANSACTION);
             sampler.handle();
             return false;

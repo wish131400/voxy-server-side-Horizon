@@ -96,7 +96,7 @@ class RustBiomeIdentityTest {
         }
     }
 
-    @Test void exactPreviewDisplayAndDecorationRecordsCarryTheirIdentityImmediately() throws Exception {
+    @Test void renderSamplesCarryIdentityWhileDecorationRecordsDeferUnusedMetadata() throws Exception {
         var doc=fixedDocument();
         doc.getAsJsonObject("biome_source").addProperty("biome","minecraft:plains");
         var settings=doc.getAsJsonObject("settings");
@@ -116,11 +116,37 @@ class RustBiomeIdentityTest {
             for (var sample:sampler.sampleGrid(32,32,4,4)) assertEquals(1,sample.biomeIndex());
             for (var sample:sampler.sampleGrid(64,64,4,4,4,new ClientColumnSample[16],true)) assertEquals(1,sample.biomeIndex());
             var display=sampler.sampleDisplayGrid(-16,-16,1,8,8,new ClientColumnSample[64]);
-            assertEquals(point,display[0]);
+            assertEquals(point.surfaceY(),display[0].surfaceY());
             for (var sample:display) assertEquals(1,sample.biomeIndex());
             assertTrue(sampler.diagnostics().contains("\"adaptiveGrids\":1"));
-            for (var row:sampler.decorationDisplayPage(0,0)) assertEquals(1,sampler.surfaceSample(row).biomeIndex());
+            String beforeDecoration=sampler.diagnostics();
+            for (var row:sampler.decorationDisplayPage(0,0)) {
+                assertEquals(10,row.length);
+                assertEquals(-1,sampler.surfaceSample(row).biomeIndex());
+            }
+            assertEquals(beforeDecoration.substring(beforeDecoration.indexOf("biomeIdentity="),beforeDecoration.indexOf(",stageDetail=")),
+                    sampler.diagnostics().substring(sampler.diagnostics().indexOf("biomeIdentity="),sampler.diagnostics().indexOf(",stageDetail=")),
+                    "geometry-only decoration must not submit biome identity queries");
+            assertEquals(1,sampler.sample(0,0).biomeIndex(),"full sample resolves identity on demand");
             assertEquals(0,context.queries);
+        }
+    }
+
+    @Test void rawExactPagesResolveIdentityForFineGridsAndCannotDowngradeCompletedPoints() throws Exception {
+        var doc=fixedDocument();
+        try (var sampler=new RustTerrainSampler(RustWorldgenBackend.create(1,13,doc.toString()),PROFILE,new Context(false))) {
+            var raw=sampler.exactSurfacePage(-4,-4,4);
+            for (int i=0;i<16;i++) {
+                assertEquals(10,raw[i].length);
+                assertEquals(-1,sampler.surfaceSample(raw[i]).biomeIndex());
+            }
+            var fine=sampler.sampleGrid(-4,-4,1,4);
+            for (var sample:fine) assertEquals(0,sample.biomeIndex());
+            var remember=RustTerrainSampler.class.getDeclaredMethod("rememberPoint",long.class,int[].class);
+            remember.setAccessible(true);
+            remember.invoke(sampler,((long)-4<<32)|(-4&0xffffffffL),raw[0]);
+            assertEquals(11,sampler.surfaceRecord(-4,-4).length,"late raw page must preserve finished metadata");
+            assertEquals(fine[0],sampler.sample(-4,-4));
         }
     }
 
@@ -195,5 +221,33 @@ class RustBiomeIdentityTest {
             RustWorldgenBackend.cancel(world);
             assertThrows(IllegalArgumentException.class,()->RustWorldgenBackend.biomeIndices(world,input,output,1));
         } finally { RustWorldgenBackend.close(world); }
+    }
+
+    @Test void decorationNativeBiomesReturnOriginalSnapshotHoldersAndHonorCancellation() throws Exception {
+        var access=TerrainPredictionFixtures.access();
+        var swamp=access.lookupOrThrow(Registries.BIOME).getOrThrow(Biomes.SWAMP);
+        var settings=TerrainPredictionFixtures.noise().generatorSettings().value();
+        var generator=new NoiseBasedChunkGenerator(new FixedBiomeSource(swamp),Holder.direct(settings));
+        var state=RandomState.create(settings,access.lookupOrThrow(Registries.NOISE),1);
+        var context=new ClientTerrainSampler(1,PROFILE,generator,state,
+                net.minecraft.world.level.LevelHeightAccessor.create(-64,384),settings.seaLevel()) {
+            @Override Holder<Biome> noiseBiome(int x,int y,int z) {
+                throw new AssertionError("native decoration must not run Java climate selection");
+            }
+        };
+        assertSame(swamp,context.cacheBiomeHolder(0));
+        assertNull(context.cacheBiomeHolder(-1));
+        assertNull(context.cacheBiomeHolder(1));
+        long world=RustWorldgenBackend.create(1,13,fixedDocument().toString());
+        try (var sampler=new RustTerrainSampler(world,PROFILE,context)) {
+            var level=new PredictionDecorationLevel(sampler,context,access,0,0);
+            for (int y:new int[]{-16,0,16,64}) {
+                assertSame(swamp,level.getNoiseBiome(-17,y,23));
+                assertSame(swamp,level.getBiome(new net.minecraft.core.BlockPos(-17,y,23)));
+            }
+            assertTrue(sampler.diagnostics().contains("javaFallbacks=0"),sampler.diagnostics());
+            sampler.cancelWork();
+            assertThrows(java.util.concurrent.CancellationException.class,()->sampler.noiseBiome(-17,0,23));
+        }
     }
 }

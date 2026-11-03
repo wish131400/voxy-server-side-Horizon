@@ -44,6 +44,8 @@ public class VSSClientConfig extends JsonConfig {
     public boolean rememberTerrain = true;
     /** Supersample terrain samples at the finest two LOD levels. */
     public boolean predictionSupersample = false;
+    /** Optional 26.3 FP32 density offload; rendering continues through Voxy. */
+    public volatile boolean predictionVulkanAcceleration = false;
     /** Apply distant-terrain fog with the active Voxy pipeline. */
     public boolean predictionFog = true;
     /** True singleplayer pause only; zero disables the pause cap. */
@@ -83,6 +85,7 @@ public class VSSClientConfig extends JsonConfig {
         help.put("predictionSpyglassLoading", "是否允许望远镜额外加载目标区域的远处精细地形、植被和建筑；默认 true。关闭后仍可使用望远镜缩放。");
         help.put("rememberTerrain", "是否在客户端压缩保存预测地形、植被及地表建筑，重访时读取并允许释放闲置采样数据；默认 true。");
         help.put("predictionSupersample", "是否在最近两个 LOD 层级使用超采样；默认 false。");
+        help.put("predictionVulkanAcceleration", "Vulkan GPU 加速（26.3）；默认 false。需要支持 Vulkan 及双精度坐标运算的显卡和驱动。利用 GPU 分担预测密度计算，可提升加载速度，但会占用渲染算力，可能降低帧数；不支持时自动使用 Rust CPU。");
         help.put("predictionFog", "是否在 Voxy 管线中应用预测远景雾；默认 true。");
         help.put("predictionPausedFps", "预测开启时，单人游戏真正暂停后的帧率上限；默认 30，0 关闭；保留更低的原有上限，恢复游戏立即解除。多人游戏菜单不受影响。");
         help.put("debugLogging", "是否输出客户端 VSS 调试日志；默认 false。");

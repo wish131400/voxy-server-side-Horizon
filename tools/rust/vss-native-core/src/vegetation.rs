@@ -587,6 +587,7 @@ fn survives(w: &mut Volume, p: Pos, id: StateId) -> Result<bool> {
             let at = w.get(p);
             Ok(!w.palette.fluid(at) && w.palette.tag(below, "minecraft:bamboo_plantable_on"))
         }
+        "minecraft:bush" => Ok(w.palette.tag(below, "minecraft:supports_vegetation")),
         "minecraft:short_grass"
         | "minecraft:grass"
         | "minecraft:oak_sapling"
@@ -1670,7 +1671,7 @@ impl Modifier {
             "noise_based_count" => Self::NoiseCount(
                 integer(v, "noise_to_count_ratio")?,
                 number(v, "noise_factor")?,
-                number(v, "noise_offset")?,
+                if v.get("noise_offset").is_some() { number(v, "noise_offset")? } else { 0. },
             ),
             "noise_threshold_count" => Self::NoiseThreshold(
                 number(v, "noise_level")?,

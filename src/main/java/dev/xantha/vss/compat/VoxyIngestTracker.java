@@ -11,6 +11,7 @@ import java.util.ArrayList;
 public final class VoxyIngestTracker {
     private static final Object LOCK = new Object();
     private static final IdentityHashMap<Object, Ticket> TASKS = new IdentityHashMap<>();
+    private static final IdentityHashMap<Object, Long> PUBLICATIONS = new IdentityHashMap<>();
     private static final IdentityHashMap<Ticket, Boolean> ACTIVE_TICKETS = new IdentityHashMap<>();
     private static final IdentityHashMap<Object, Integer> SECTIONS = new IdentityHashMap<>();
     private static final ConcurrentHashMap<Long, Integer> COLUMNS = new ConcurrentHashMap<>();
@@ -18,7 +19,8 @@ public final class VoxyIngestTracker {
     private static final Map<Long, Integer> UNSCOPED_COLUMNS = new HashMap<>();
     private static final ThreadLocal<RawScope> RAW = new ThreadLocal<>();
     private static final ThreadLocal<WorkerScope> WORKER = new ThreadLocal<>();
-    private static long generation;
+    private static volatile long generation;
+    private static long authorityGeneration;
 
     private VoxyIngestTracker() { }
 
@@ -44,6 +46,8 @@ public final class VoxyIngestTracker {
     private static final class WorkerScope {
         final WorkerScope previous;
         Object task;
+        long generation = -1;
+        boolean committed;
         boolean done;
         WorkerScope(WorkerScope previous) { this.previous = previous; }
     }
@@ -128,6 +132,7 @@ public final class VoxyIngestTracker {
 
     /** Injected before publication, so even an immediately running worker finds its ticket. */
     public static void submitted(Object task, Object section) {
+        published(task);
         RawScope scope = RAW.get();
         if (scope == null || scope.ticket.section != section) return;
         Ticket ticket = scope.ticket;
@@ -141,6 +146,7 @@ public final class VoxyIngestTracker {
 
     /** Only injected at a verified rawIngest0 publication; the native task may contain a copy. */
     public static void submittedSnapshot(Object task) {
+        published(task);
         RawScope scope = RAW.get();
         if (scope != null) submitted(task, scope.ticket.section);
     }
@@ -148,8 +154,13 @@ public final class VoxyIngestTracker {
     /** Replaced/evicted tasks and actual worker tasks share the same exact-once settlement. */
     public static void discarded(Object task) {
         Ticket ticket;
-        synchronized (LOCK) { ticket = TASKS.get(task); }
+        synchronized (LOCK) { ticket = TASKS.get(task); PUBLICATIONS.remove(task); }
         complete(ticket, false);
+    }
+
+    /** Native local and VSS submissions share the same world-session lifetime. */
+    public static void published(Object task) {
+        if (task != null) synchronized (LOCK) { PUBLICATIONS.put(task, authorityGeneration); }
     }
 
     public static Object enterWorker() {
@@ -160,7 +171,38 @@ public final class VoxyIngestTracker {
 
     public static void workerTask(Object task) {
         WorkerScope scope = WORKER.get();
-        if (scope != null) scope.task = task;
+        if (scope != null) {
+            scope.task = task;
+            synchronized (LOCK) { scope.generation = PUBLICATIONS.getOrDefault(task, -1L); }
+        }
+    }
+
+    private record Position(java.lang.reflect.Field x, java.lang.reflect.Field y, java.lang.reflect.Field z) { }
+    private static final ClassValue<Position> POSITIONS = new ClassValue<>() {
+        @Override protected Position computeValue(Class<?> type) {
+            try { return new Position(type.getField("x"),type.getField("y"),type.getField("z")); }
+            catch (ReflectiveOperationException failure) { throw new IllegalStateException("Unsupported Voxy voxel position",failure); }
+        }
+    };
+
+    /** Injected only after WorldUpdater.insertUpdate returns successfully. */
+    public static void committed(Object engine,Object voxels) {
+        WorkerScope scope=WORKER.get();
+        if(scope==null)return;
+        int x,y,z,saves;
+        boolean changed;
+        synchronized(LOCK) {
+            if(scope.generation!=authorityGeneration)return;
+            scope.committed=true;
+            try {
+                Position position=POSITIONS.get(voxels.getClass());
+                x=position.x.getInt(voxels);y=position.y.getInt(voxels);z=position.z.getInt(voxels);
+            } catch(IllegalAccessException failure) { throw new IllegalStateException("Cannot read committed Voxy position",failure); }
+            changed=VoxyRealCoverage.of(engine).mark(x,y,z);
+            saves=VoxyRealIngestAccess.committed(engine,x,y,z);
+        }
+        if(changed)VoxyPredictionBridge.realSectionCommitted(engine,x,y,z);
+        VoxyRealIngestAccess.save(engine,x,y,z,saves);
     }
 
     public static void workerDone() { finishWorker(WORKER.get()); }
@@ -175,7 +217,8 @@ public final class VoxyIngestTracker {
         try {
             Ticket ticket;
             synchronized (LOCK) { ticket = TASKS.get(scope.task); }
-            complete(ticket, successful);
+            complete(ticket, successful && scope.committed);
+            synchronized (LOCK) { PUBLICATIONS.remove(scope.task); }
         } finally {
             scope.task = null;
             if (WORKER.get() == scope) {
@@ -224,6 +267,17 @@ public final class VoxyIngestTracker {
         StrictLodVisibility.workChanged();
         // A same-world renderer reset must not strand native timestamp entries as completed.
         for (Ticket ticket : retired) if (ticket.completion != null) ticket.completion.accept(false);
+    }
+
+    /** Renderer resets retire queue readiness only; a world disconnect retires real ownership too. */
+    static void resetWorld() {
+        synchronized (LOCK) {
+            authorityGeneration++;
+            PUBLICATIONS.clear();
+            VoxyRealCoverage.reset();
+            VoxyRealCoveragePersistence.reset();
+        }
+        reset();
     }
 
     private static long column(int x, int z) {

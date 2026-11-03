@@ -1,0 +1,21 @@
+// Opt-in: requires a real Vulkan GPU. Ordinary unit tests skip this class.
+allprojects { afterEvaluate {
+    if (providers.gradleProperty('mcTarget').getOrElse('') == '26.3') {
+        tasks.register('vulkanComputeTest', Test) {
+            dependsOn tasks.named('testClasses')
+            testClassesDirs = sourceSets.test.output.classesDirs
+            classpath = sourceSets.test.runtimeClasspath
+            useJUnitPlatform()
+            include providers.gradleProperty('vssVulkanTests').getOrElse('**/Vulkan*Test.class')
+            maxHeapSize = '2G'
+            systemProperty 'vss.testVulkan', 'true'
+            systemProperty 'vss.vulkanCase', providers.gradleProperty('vssVulkanCase').getOrElse('.*')
+            def os = System.getProperty('os.name').toLowerCase(java.util.Locale.ROOT)
+            def nativeName = os.contains('win') ? 'vss_native_core.dll' : os.contains('mac') ? 'libvss_native_core.dylib' : 'libvss_native_core.so'
+            systemProperty 'vss.testNativeLibrary', file(providers.gradleProperty('vssTestNativeLibrary')
+                    .getOrElse("tools/rust/vss-native-core/target/release/${nativeName}")).absolutePath
+            outputs.upToDateWhen { false }
+            testLogging { events 'passed', 'failed'; exceptionFormat 'full'; showStandardStreams = true }
+        }
+    }
+} }

@@ -68,4 +68,44 @@ class PredictionCaptureQueueTest {
         }
         assertEquals(0,budget.usedBytes());
     }
+
+    @Test void admissionRetainsTheCaptureBurstUntilPublication() throws Exception {
+        var profile = new DimensionProfile(Level.OVERWORLD.identifier(),42,-64,384,"noise","minecraft:overworld",77);
+        var sampler = new ClientTerrainSampler(42, profile);
+        var budget = new PredictionMemoryBudget(2048L * PredictionMemoryBudget.MIB, 0,
+                () -> Long.MAX_VALUE, System::nanoTime, 1);
+        var release = new CountDownLatch(1);
+        try (var manager = new PredictionTileManager(Level.OVERWORLD, sampler, budget, null,
+                new PredictionCpuBudget(() -> 8, System::nanoTime))) {
+            var tile = new PredictionTileManager.PredictionTileKey(Level.OVERWORLD, 0, 0,
+                    manager.layout().levelCount() - 1);
+            PredictionCaptureQueueTest.<Set<PredictionTileManager.PredictionTileKey>>field(manager, "desiredKeys").add(tile);
+            var refresh = PredictionCaptureQueueTest.<PredictionCaptureRefresh>field(manager, "captureRefresh");
+            long first = System.nanoTime();
+            refresh.changed(tile, first);
+            var executor = PredictionCaptureQueueTest.<ThreadPoolExecutor>field(manager, "executor");
+            var entered = new CountDownLatch(executor.getCorePoolSize());
+            for (int i = 0; i < executor.getCorePoolSize(); i++) executor.execute(() -> {
+                entered.countDown();
+                try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            });
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            var enqueue = PredictionTileManager.class.getDeclaredMethod("enqueue",
+                    PredictionTileManager.PredictionTileKey.class, int.class, int.class, boolean.class, boolean.class);
+            enqueue.setAccessible(true); enqueue.invoke(manager, tile, 0, 0, false, false);
+            assertEquals(1, manager.pendingCount());
+            refresh.changed(tile, first + 20_000_000L);
+            assertTrue(refresh.defer(tile, first + 30_000_000L),
+                    "one new capture during queue wait joins the admitted capture burst");
+            manager.setPaused(true);
+            assertEquals(0, manager.pendingCount());
+        } finally { release.countDown(); }
+        assertEquals(0, budget.usedBytes());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> T field(Object owner, String name) throws ReflectiveOperationException {
+        var field = owner.getClass().getDeclaredField(name);
+        field.setAccessible(true); return (T) field.get(owner);
+    }
 }

@@ -16,11 +16,17 @@ import net.minecraft.world.level.biome.BiomeManager;
 import net.minecraft.world.level.block.state.BlockState;
 
 /** Source-built Rust terrain, surface and tint backend. Work runs on prediction builders. */
-final class RustTerrainSampler extends ClientTerrainSampler implements AutoCloseable {
+final class RustTerrainSampler extends ClientTerrainSampler implements AutoCloseable, PredictionDisplayGridSampler {
     static final String ALGORITHM = "vanilla-rust-abi6-mc" + net.minecraft.SharedConstants.getCurrentVersion().name() + "-preliminary-height-r2";
     private static boolean attempted, loaded;
     private volatile long world;
     private volatile boolean cancelled;
+    private final VulkanPredictionCompute vulkan;
+    // Keep only native results, in their original grid context. Capture edits
+    // never populate this cache; new real captures still override every cell.
+    private record DisplayWindow(int x,int z,int step,int width,int height) {}
+    private final java.util.LinkedHashMap<DisplayWindow,ClientColumnSample[]> displayWindows = new java.util.LinkedHashMap<>(16,0.75f,true);
+    private final java.util.concurrent.atomic.LongAdder displayWindowHits = new java.util.concurrent.atomic.LongAdder();
     private final ClientTerrainSampler context;
     private final boolean terrablenderRouting;
     private final boolean signedSqrt;
@@ -38,6 +44,8 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
     private final String[][] featureOrder;
     private final Map<BlockState,Integer> stateIds = new IdentityHashMap<>();
     private final Map<String,Boolean> support = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.LongAdder staticFeatureRejections = new java.util.concurrent.atomic.LongAdder();
+    private final PredictionJavaFeatureMetrics javaFeatureMetrics = new PredictionJavaFeatureMetrics();
     private final RustVegetationDescriptors.Cache featureDescriptors = new RustVegetationDescriptors.Cache();
     private final PredictionTintCache tints = new PredictionTintCache(65536);
     private final java.util.concurrent.atomic.LongAdder tintNativeCalls = new java.util.concurrent.atomic.LongAdder();
@@ -115,6 +123,7 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
                 throw new IllegalStateException("Native library lacks required TerraBlender routing");
             timing.mark("stateMapping");
             sampler.colorFingerprint = colormapFingerprint(document);
+            context.bindHorizontalClimate(handle, document);
             handle = 0;
             timing.finish();
             if (VSSClientConfig.CONFIG.debugLogging) VSSLogger.debug("VSS prediction backend=" + ALGORITHM + ", dimension=" + profile.dimension());
@@ -145,6 +154,7 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
             Map<JsonElement, BlockState> stateLookup, BlockState[] canonical) {
         super(profile.seed(), profile);
         this.world = world; this.context = context;
+        this.vulkan = new VulkanPredictionCompute(world, profile.minY(), profile.height());
         var timing = new PredictionInitializationTiming(profile.dimension() + " stateMapping");
         String encoded = canonical == null ? RustWorldgenBackend.describe(world) : RustWorldgenBackend.describeCompact(world);
         timing.mark("nativeDescribe");
@@ -224,7 +234,37 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
         return proxyBlock(point(x,z), y);
     }
     /** Read-only native record; a bounded decoration job may retain it across shared-cache eviction. */
-    int[] surfaceRecord(int x, int z) { return point(x, z); }
+    int[] surfaceRecord(int x, int z) {
+        handle();
+        long key = (long)x << 32 | z & 0xffffffffL;
+        synchronized(points) { var row=points.getAndMoveToLast(key); if(row!=null)return row; }
+        return exactSurfacePage(x,z,1)[0];
+    }
+    /** Stable exact view, shared by neighboring placement attempts. No display metadata is prepared. */
+    int[][] exactSurfacePage(int x,int z,int side) {
+        handle();
+        if(side!=1 && side!=4)throw new IllegalArgumentException("Decoration page dimensions");
+        int count=side*side, pending=0;
+        int[][] rows=new int[count][];
+        int[] missing=missingScratch.get();
+        ByteBuffer input=positions.get(),output=scratch.get();input.clear();
+        synchronized(points) {
+            for(int i=0;i<count;i++) {
+                int xx=x+i/side,zz=z+i%side;
+                rows[i]=points.getAndMoveToLast((long)xx<<32|zz&0xffffffffL);
+                if(rows[i]==null) { missing[pending++]=i; input.putInt(xx).putInt(zz); }
+            }
+        }
+        if(pending==0)return rows;
+        if(RustWorldgenBackend.surfacePoints(handle(),input,output,pending)!=pending)
+            throw new IllegalStateException("Incomplete exact decoration page");
+        for(int n=0;n<pending;n++) {
+            int i=missing[n];int[] row=rows[i]=new int[10];
+            for(int j=0;j<10;j++)row[j]=output.getInt((n*10+j)*4);
+            rememberPoint((long)(x+i/side)<<32|(z+i%side)&0xffffffffL,row);
+        }
+        return rows;
+    }
     /** One aligned 4x4 page in x-major order, shared with native display queries.
      * Never insert these records in the exact Java point cache. */
     int[][] decorationDisplayPage(int x, int z) {
@@ -233,12 +273,8 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
         for (int i=0;i<16;i++) input.putInt(x+i/4).putInt(z+i%4);
         if (RustWorldgenBackend.decorationPoints(id,input,output,16)!=16)
             throw new IllegalStateException("Incomplete display decoration page");
-        int[][] rows = new int[16][11];
+        int[][] rows = new int[16][10];
         for (int i=0;i<16;i++) for (int j=0;j<10;j++) rows[i][j]=output.getInt((i*10+j)*4);
-        int[] queries=surfaceBiomePositions.get(), indices=surfaceBiomes.get();
-        for (int i=0;i<16;i++) surfaceBiomePosition(queries,i,x+i/4,z+i%4,rows[i][0],rows[i][1],rows[i][2]);
-        surfaceBiomeIndices(queries,16,indices);
-        for (int i=0;i<16;i++) rows[i][10]=indices[i];
         return rows;
     }
     ClientColumnSample surfaceSample(int[] record) { return sampleRecord(record, 0); }
@@ -250,6 +286,24 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
         }
         if((c[3]&(1<<29))!=0) return Blocks.AIR.defaultBlockState();
         return states[c[y==c[0]-1?4:c[0]-1-y<4?5:6]];
+    }
+    /** Same proxy states as proxyBlock, searched once per constant material band. */
+    int proxyHeight(int[] c, net.minecraft.world.level.levelgen.Heightmap.Types type) {
+        int floor = c[0], fluid = c[1], min = profile().minY();
+        int y = Math.min(Math.max(floor, fluid) - 1, min + profile().height() - 1);
+        var opaque = type.isOpaque();
+        while (y >= min) {
+            if (opaque.test(proxyBlock(c, y))) return y + 1;
+            if (y >= floor) {
+                if (c[2] == 0 || y >= fluid) y = floor - 1;
+                else if ((c[3] & 2) != 0 && y == fluid - 1) y--;
+                else y = floor - 1;
+            } else if ((c[3] & (1 << 29)) != 0) break;
+            else if (y == floor - 1) y--;
+            else if ((long) floor - 1 - y < 4) y = floor - 5;
+            else break;
+        }
+        return min;
     }
     private int[] colors(int x,int y,int z) {
         handle();
@@ -286,6 +340,37 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
             Arrays.fill(indices,0,count,-1); // Preserve deferred Java resolution for older libraries.
         } else sampleBiomeIndices(queries,count,indices);
     }
+    @Override net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome> noiseBiome(int x, int y, int z) {
+        handle();
+        if (nativeBiomeMapping == null || legacyBiomeIndices) {
+            biomeJavaFallbacks.increment();
+            return context.noiseBiome(x, y, z);
+        }
+        int[] query = surfaceBiomePositions.get(), result = surfaceBiomes.get();
+        query[0] = x; query[1] = y; query[2] = z;
+        sampleBiomeIndices(query, 1, result);
+        var biome = context.cacheBiomeHolder(result[0]);
+        if (biome != null) return biome;
+        biomeJavaFallbacks.increment();
+        return context.noiseBiome(x, y, z);
+    }
+
+    /** Only a missing implementation is stable across locations; terrain/transaction errors are not. */
+    void featureRequiresJava(String name, IllegalArgumentException failure) {
+        String message = failure.getMessage();
+        if (message != null && message.startsWith("unsupported block survival hook ")
+                && !Boolean.FALSE.equals(support.put(name, false))) {
+            staticFeatureRejections.increment();
+            featureDescriptors.clear();
+        }
+    }
+
+    Map<String,Object> javaFeatureSnapshot() {
+        return Map.of("attempts", javaFeatures.sum(), "nanos", javaFeatureNanos.sum(),
+                "withoutWrites", javaWithoutWrites.sum(), "failed", javaFailed.sum(),
+                "staticRejections", staticFeatureRejections.sum(), "byReason", javaFeatureMetrics.snapshot());
+    }
+
     @Override void sampleBiomeIndices(int[] quartPositions, int count, int[] indices) {
         handle();
         if (nativeBiomeMapping == null || legacyBiomeIndices) {
@@ -325,6 +410,37 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
         }
     }
     @Override long colorCacheFingerprint() { return colorFingerprint; }
+    private volatile boolean legacyPossibleBiomes;
+    private final ThreadLocal<ByteBuffer> possibleBiomeResults = new ThreadLocal<>();
+    java.util.BitSet possibleBiomes(int minX, int minZ, int maxX, int maxZ) {
+        long id = handle();
+        if (legacyPossibleBiomes || nativeBiomeMapping == null || legacyBiomeIndices) return null;
+        long nx = (long) maxX - minX + 1, nz = (long) maxZ - minZ + 1;
+        if (nx <= 0 || nz <= 0 || nx > 32 || nz > 32
+                || minX < -7_500_000 || maxX > 7_500_000 || minZ < -7_500_000 || maxZ > 7_500_000)
+            return null;
+        ByteBuffer output = possibleBiomeResults.get();
+        if (output == null) {
+            output = ByteBuffer.allocateDirect(Math.max(1, nativeBiomeMapping.length) * Integer.BYTES)
+                    .order(ByteOrder.LITTLE_ENDIAN);
+            possibleBiomeResults.set(output);
+        }
+        int count;
+        try { count = RustWorldgenBackend.possibleBiomes(id,minX,minZ,maxX,maxZ,output); }
+        catch (UnsatisfiedLinkError olderLibrary) { legacyPossibleBiomes = true; return null; }
+        if (count < 0) return null;
+        if (count > nativeBiomeMapping.length) throw new IllegalStateException("Invalid biome certificate count");
+        var found = new java.util.BitSet();
+        for (int i=0;i<count;i++) {
+            int nativeIndex = output.getInt(i*4);
+            if (nativeIndex < 0 || nativeIndex >= nativeBiomeMapping.length)
+                throw new IllegalStateException("Invalid biome certificate index");
+            int mapped = nativeBiomeMapping[nativeIndex];
+            if (mapped < 0) return null;
+            found.set(mapped);
+        }
+        return found;
+    }
     private static long colormapFingerprint(JsonObject maps) {
         return ((long) maps.get("grass_colormap").hashCode() << 32)
                 ^ Integer.toUnsignedLong(maps.get("foliage_colormap").hashCode());
@@ -336,10 +452,12 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
         RustWorldgenBackend.colormaps(handle(),maps.toString());
         colorFingerprint=colormapFingerprint(maps);tints.clear();
         synchronized(points) {points.clear();}
+        synchronized(displayWindows) {displayWindows.clear();}
     }
     void nativeFeatureCompleted() {nativeFeatures.increment();}
     void javaFeatureCompleted(JavaFeatureReason reason, int writes, boolean success, long nanos) {
         javaFeatures.increment();
+        javaFeatureMetrics.record(reason.name(), writes, success, nanos);
         javaFeatureReasons[reason.ordinal()].increment();
         if (writes == 0) javaWithoutWrites.increment();
         if (!success) javaFailed.increment();
@@ -358,7 +476,9 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
     String diagnostics() {return "backend="+ALGORITHM+",nativeFeatures="+nativeFeatures.sum()+",compatibilityFeatures="+javaFeatures.sum()
             +","+javaFeatureDiagnostics()
             +",tintCache={"+tints.diagnostics()+",nativeCalls="+tintNativeCalls.sum()+",seeded="+tintSeeded.sum()+"}"
+            +",displayWindowHits="+displayWindowHits.sum()+",displayWindows="+displayWindowCount()
             +",gridCacheHits="+gridCacheHits.sum()+",gridSubmittedPoints="+gridComputedPoints.sum()
+            +","+vulkan.diagnostics()
             +",biomeIdentity={nativeBatches="+biomeNativeBatches.sum()+",nativePoints="+biomeNativePoints.sum()
             +",javaFallbacks="+biomeJavaFallbacks.sum()+"}"
             +","+RustVegetationStage.diagnostics()+","+featureDescriptors.diagnostics()+",groundQueries="+groundDiagnostics();}
@@ -370,21 +490,24 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
     }
 
     private int[] point(int x, int z) {
-        long key = (long) x << 32 | z & 0xffffffffL;
-        synchronized (points) { int[] found = points.getAndMoveToLast(key); if (found != null) return found; }
-        long tintGeneration = tints.generation();
-        ByteBuffer input = positions.get(), output = scratch.get();
-        input.putInt(0,x).putInt(4,z);
-        if (RustWorldgenBackend.surfacePoints(handle(),input,output,1) != 1) throw new IllegalStateException("Incomplete native point");
-        int[] data = new int[11]; for (int i=0;i<10;i++) data[i]=output.getInt(i*4);
-        int[] queries=surfaceBiomePositions.get(), indices=surfaceBiomes.get();
+        int[] raw=surfaceRecord(x,z);
+        if(raw.length==11)return raw;
+        long generation=tints.generation();
+        int[] data=Arrays.copyOf(raw,11);
+        int[] queries=surfaceBiomePositions.get(),indices=surfaceBiomes.get();
         surfaceBiomePosition(queries,0,x,z,data[0],data[1],data[2]);
-        surfaceBiomeIndices(queries,1,indices); data[10]=indices[0];
-        rememberColors(x,z,data,tintGeneration);
-        rememberPoint(key,data); return data;
+        surfaceBiomeIndices(queries,1,indices);data[10]=indices[0];
+        rememberColors(x,z,data,generation);
+        rememberPoint((long)x<<32|z&0xffffffffL,data);
+        return data;
     }
     private void rememberPoint(long key,int[] data) {
-        synchronized(points) { points.putAndMoveToLast(key,data); while(points.size()>65536) points.removeFirst(); }
+        synchronized(points) {
+            // An in-flight raw page must not downgrade a concurrently completed record.
+            int[] old=points.get(key);
+            if(old==null || old.length<=data.length)points.putAndMoveToLast(key,data);
+            while(points.size()>65536)points.removeFirst();
+        }
     }
     ClientColumnSample[] sampleGrid(int x,int z,int spacing,int axis) {
         return sampleGrid(x, z, spacing, axis, axis, new ClientColumnSample[axis * axis], false, false, false);
@@ -417,13 +540,115 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
         if(retained.length!=width*height) throw new IllegalArgumentException("Retained grid dimensions");
         return sampleGrid(x,z,spacing,width,height,copyRetained ? retained.clone() : retained,0,width,preview,display);
     }
+    private int displayWindowCount() { synchronized(displayWindows) { return displayWindows.size(); } }
+    @Override public Map<String,Object> displayPerformanceSnapshot() {
+        return Map.of("vulkan",vulkan.performanceSnapshot(),"windowCacheHits",displayWindowHits.sum(),
+                "cachedWindows",displayWindowCount(),"maxCachedWindows",1024);
+    }
+    private void restoreDisplayWindow(DisplayWindow key,ClientColumnSample[] result,int offset,int stride) {
+        ClientColumnSample[] cached;
+        synchronized(displayWindows) { cached=displayWindows.get(key); }
+        if(cached==null)return;
+        for(int i=0;i<cached.length;i++) {
+            int target=offset+i/key.width*stride+i%key.width;
+            if((result[target]==null || !result[target].reusableForDisplay()) && cached[i]!=null) {
+                result[target]=cached[i];displayWindowHits.increment();
+            }
+        }
+    }
+    @Override public void sampleDisplayRegion(int x,int z,int step,int size,ClientColumnSample[] samples,
+                                              java.util.function.BooleanSupplier current) {
+        handle();
+        if(!vulkan.displayReady(step)) {
+            sampleDisplayCpu(x,z,step,size,size,samples,0,size,current);
+            return;
+        }
+        // Selection applies only to the complete, mostly cold blocks that were
+        // measured. Partial and retained work keeps the existing CPU path.
+        for(int bz=0;bz<size;bz+=16)for(int bx=0;bx<size;bx+=16) {
+            if(!current.getAsBoolean())return;
+            int width=Math.min(16,size-bx),height=Math.min(16,size-bz);
+            int xx=x+bx*step,zz=z+bz*step,offset=bz*size+bx;
+            var trial=vulkan.beginDisplayRegion(step,width==16&&height==16);
+            long start=System.nanoTime();
+            int coldColumns=0;
+            boolean attempted=false,gpuResult=false,complete=false;
+            try {
+                if(!trial.gpu()) {
+                    if(trial.measured()) {
+                        // This read-only preflight does not warm native records.
+                        // Exclude its instrumentation from the normal CPU cost.
+                        var request=prepareDisplayBlock(xx,zz,step,width,height,samples,offset,size);
+                        if(request.xz.length/2>=VulkanDisplayPolicy.MIN_COLD_COLUMNS)
+                            coldColumns=vulkan.coldDisplayColumns(request.xz);
+                        start=System.nanoTime();
+                    }
+                    complete=sampleDisplayCpu(xx,zz,step,width,height,samples,offset,size,current);
+                    continue;
+                }
+                // Includes restore, cold filtering, queue/fence, copies, Rust
+                // material fallback and Java record decoding in the GPU cost.
+                var request=prepareDisplayBlock(xx,zz,step,width,height,samples,offset,size);
+                int[] values=null;
+                if(request.xz.length/2>=VulkanDisplayPolicy.MIN_COLD_COLUMNS) {
+                    var heights=vulkan.displayRegionHeights(request.xz,step);
+                    values=heights.values();coldColumns=heights.coldColumns();attempted=heights.attempted();
+                }
+                gpuResult=values!=null;
+                int[] region=values==null?null:new int[width*height];
+                if(region!=null)java.util.Arrays.fill(region,Integer.MIN_VALUE);
+                if(values!=null)for(int i=0;i<request.mapping.length;i++)region[request.mapping[i]]=values[i];
+                for(int dz=0;dz<height;dz+=8)for(int dx=0;dx<width;dx+=8) {
+                    if(!current.getAsBoolean())return;
+                    int w=Math.min(8,width-dx),h=Math.min(8,height-dz);int[] floors=null;
+                    if(values!=null) { floors=new int[w*h];for(int i=0;i<floors.length;i++)floors[i]=region[(dz+i/w)*width+dx+i%w]; }
+                    sampleGrid(xx+dx*step,zz+dz*step,step,w,h,samples,offset+dz*size+dx,size,false,true,floors);
+                }
+                complete=true;
+            } finally {
+                vulkan.finishDisplayRegion(trial,System.nanoTime()-start,coldColumns,attempted,gpuResult,
+                        complete&&current.getAsBoolean()&&!Thread.currentThread().isInterrupted());
+            }
+        }
+    }
+    private boolean sampleDisplayCpu(int x,int z,int step,int width,int height,
+                                     ClientColumnSample[] samples,int offset,int stride,
+                                     java.util.function.BooleanSupplier current) {
+        for(int dz=0;dz<height;dz+=8)for(int dx=0;dx<width;dx+=8) {
+            if(!current.getAsBoolean())return false;
+            sampleGrid(x+dx*step,z+dz*step,step,Math.min(8,width-dx),Math.min(8,height-dz),
+                    samples,offset+dz*stride+dx,stride,false,true);
+        }
+        return true;
+    }
+    private record DisplayRequest(int[] xz,int[] mapping) {}
+    private DisplayRequest prepareDisplayBlock(int x,int z,int step,int width,int height,
+                                               ClientColumnSample[] samples,int offset,int stride) {
+        for(int dz=0;dz<height;dz+=8)for(int dx=0;dx<width;dx+=8)
+            restoreDisplayWindow(new DisplayWindow(x+dx*step,z+dz*step,step,Math.min(8,width-dx),Math.min(8,height-dz)),
+                    samples,offset+dz*stride+dx,stride);
+        int[] xz=new int[width*height*2],mapping=new int[width*height];int count=0;
+        for(int dz=0;dz<height;dz++)for(int dx=0;dx<width;dx++) {
+            var known=samples[offset+dz*stride+dx];
+            if(known!=null&&known.reusableForDisplay())continue;
+            xz[count*2]=x+dx*step;xz[count*2+1]=z+dz*step;mapping[count++]=dz*width+dx;
+        }
+        return new DisplayRequest(java.util.Arrays.copyOf(xz,count*2),java.util.Arrays.copyOf(mapping,count));
+    }
     private ClientColumnSample[] sampleGrid(int x,int z,int spacing,int width,int height,
                                             ClientColumnSample[] result,int offset,int rowStride,
                                             boolean preview,boolean display) {
+        return sampleGrid(x,z,spacing,width,height,result,offset,rowStride,preview,display,null);
+    }
+    private ClientColumnSample[] sampleGrid(int x,int z,int spacing,int width,int height,
+                                            ClientColumnSample[] result,int offset,int rowStride,
+                                            boolean preview,boolean display,int[] gpuFloors) {
         if(width<1||width>8||height<1||height>8||spacing<1) throw new IllegalArgumentException("Native grid dimensions");
         if(offset<0||rowStride<width||(long)offset+(long)(height-1)*rowStride+width>result.length)
             throw new IllegalArgumentException("Retained grid window");
         handle(); // Cached requests must still honor world cancellation.
+        DisplayWindow window=display?new DisplayWindow(x,z,spacing,width,height):null;
+        if(display)restoreDisplayWindow(window,result,offset,rowStride);
         ByteBuffer input=positions.get(),output=scratch.get();input.clear();
         int[] missing=missingScratch.get();
         int count=0;
@@ -434,8 +659,9 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
             int xx=x+i%width*spacing,zz=z+i/width*spacing;
             long key=(long)xx<<32|zz&0xffffffffL;
             int[] cached;
-            synchronized(points) { cached=points.getAndMoveToLast(key); }
-            if(cached!=null) { result[target]=sampleRecord(cached,0); continue; }
+            // Keep display policy independent of exact decoration prefetch.
+            synchronized(points) { cached=display ? null : points.getAndMoveToLast(key); }
+            if(cached!=null) { result[target]=sampleRecord(cached.length==10 ? point(xx,zz) : cached,0); continue; }
             missing[count++]=i;
         }
         // Refinement grids share aligned columns with their parents. Only
@@ -456,16 +682,29 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
             long mask = 0;
             for (int n = 0; n < count; n++) mask |= 1L << missing[n];
             try {
-                written = RustWorldgenBackend.displayGrid(handle(), x, z, spacing, mask, output);
+                if(gpuFloors!=null) {
+                    var floors=ByteBuffer.allocateDirect(64*4).order(ByteOrder.LITTLE_ENDIAN);
+                    for(int value:gpuFloors)floors.putInt(value);
+                    written=RustWorldgenBackend.displayGridGpu(handle(),x,z,spacing,mask,output,floors);
+                } else written = RustWorldgenBackend.displayGrid(handle(), x, z, spacing, mask, output);
                 if (written != 64) throw new IllegalStateException("Incomplete native display grid");
                 gridResult = true;
             } catch (UnsatisfiedLinkError olderLibrary) {
                 legacyDisplayGrid = true;
             }
         }
-        written=gridResult ? count : display ? RustWorldgenBackend.displayPoints(handle(),input,output,count)
-                : preview ? RustWorldgenBackend.previewPoints(handle(),input,output,count)
-                : RustWorldgenBackend.surfacePoints(handle(),input,output,count);
+        if (gridResult) written = count;
+        else if (display) {
+            if(gpuFloors!=null) {
+                var floors=ByteBuffer.allocateDirect(count*4).order(ByteOrder.LITTLE_ENDIAN);
+                for(int n=0;n<count;n++)floors.putInt(gpuFloors[missing[n]]);
+                written=RustWorldgenBackend.displayPointsGpu(handle(),input,output,count,floors);
+            } else written = RustWorldgenBackend.displayPoints(handle(),input,output,count);
+        }
+        else if (preview) {
+            written = vulkan.preview(input, output, count);
+            if (written < 0) written = RustWorldgenBackend.previewPoints(handle(),input,output,count);
+        } else written = RustWorldgenBackend.surfacePoints(handle(),input,output,count);
         if(written!=count) throw new IllegalStateException("Incomplete native grid");
         int[] queries=surfaceBiomePositions.get(), indices=surfaceBiomes.get();
         for (int n=0;n<count;n++) {
@@ -482,10 +721,20 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
             decoded[10]=indices[n];
             int xx=x+i%width*spacing,zz=z+i/width*spacing;
             rememberColors(xx,zz,decoded,tintGeneration);
-            boolean cache = !preview && (decoded[3] & ClientColumnSample.FLAG_APPROXIMATE)==0;
+            boolean cache = !preview && !display && (decoded[3] & ClientColumnSample.FLAG_APPROXIMATE)==0;
             int[] data = cache ? java.util.Arrays.copyOf(decoded, decoded.length) : decoded;
             if(cache) rememberPoint((long)xx<<32|zz&0xffffffffL,data);
             result[offset+i/width*rowStride+i%width]=sampleRecord(data,0);
+        }
+        if(display && tintGeneration==tints.generation()) {
+            synchronized(displayWindows) {
+                if(tintGeneration!=tints.generation())return result;
+                ClientColumnSample[] previous=displayWindows.get(window);
+                var saved=previous==null?new ClientColumnSample[width*height]:previous.clone();
+                for(int n=0;n<count;n++) {int i=missing[n];saved[i]=result[offset+i/width*rowStride+i%width];}
+                displayWindows.put(window,saved);
+                while(displayWindows.size()>1024)displayWindows.remove(displayWindows.keySet().iterator().next());
+            }
         }
         return result;
     }
@@ -616,16 +865,20 @@ final class RustTerrainSampler extends ClientTerrainSampler implements AutoClose
     @Override ClientTerrainSampler decorationContext() { return context; }
     synchronized void cancelWork() {
         cancelled=true;
+        vulkan.close();
         if(world!=0) RustWorldgenBackend.cancel(world);
     }
     @Override public synchronized void close() {
+        context.detachHorizontalClimate();
         long id = world; world = 0; cancelled=true;
+        vulkan.close();
         if (id == 0) return;
         try {
             try { RustWorldgenBackend.cancel(id); } finally { RustWorldgenBackend.close(id); }
         } finally {
             featureDescriptors.clear();
-            synchronized(points) { points.clear(); } synchronized(tints) { tints.clear(); }
+            synchronized(points) { points.clear(); }
+            synchronized(displayWindows) { displayWindows.clear(); } synchronized(tints) { tints.clear(); }
             context.close();
         }
     }

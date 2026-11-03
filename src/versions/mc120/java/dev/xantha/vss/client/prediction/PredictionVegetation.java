@@ -32,6 +32,9 @@ final class PredictionVegetation {
     static final int END_CLIMATE_SETTINGS_VERSION = 1 << 13;
     // Reject empty surfaces/finished voxels decoded without static registry context.
     static final int REGISTRY_CONTEXT_SETTINGS_VERSION = 1 << 14;
+    // Ordinary rejected writes no longer discard all valid placements of the feature.
+    static final int DECORATION_WRITE_SETTINGS_VERSION = 1 << 15;
+    static final int STABLE_GROUND_SETTINGS_VERSION = 1 << 16;
     private static final int PREDICATE_SETTINGS = FabricLoader.getInstance().isModLoaded("byepregen")
             ? PREDICATE_SETTINGS_VERSION : 0;
     private static final int MAX_CHUNKS = 512;
@@ -42,6 +45,7 @@ final class PredictionVegetation {
             net.minecraft.core.Direction.SOUTH, net.minecraft.core.Direction.WEST, net.minecraft.core.Direction.EAST};
     private final ClientTerrainSampler terrain;
     private final ClientTerrainSampler context;
+    private final PredictionBiomePruning biomePruning;
     private final RegistryAccess access;
     private final List<List<PlacedFeature>> featureSteps;
     private volatile EnabledFeatures enabledFeatures;
@@ -75,7 +79,8 @@ final class PredictionVegetation {
 
     static int predicateSettings() { return PREDICATE_SETTINGS; }
 
-    static int runtimeSettings() { return STRUCTURE_RUNTIME_SETTINGS_VERSION | REGISTRY_CONTEXT_SETTINGS_VERSION | PREDICATE_SETTINGS; }
+    static int runtimeSettings() { return STRUCTURE_RUNTIME_SETTINGS_VERSION | REGISTRY_CONTEXT_SETTINGS_VERSION
+                | DECORATION_WRITE_SETTINGS_VERSION | STABLE_GROUND_SETTINGS_VERSION | PREDICATE_SETTINGS; }
 
     static int runtimeSettings(net.minecraft.resources.ResourceLocation dimension) {
         return runtimeSettings() | (dimension.equals(net.minecraft.world.level.Level.END.location())
@@ -94,7 +99,9 @@ final class PredictionVegetation {
                 Map.entry("memoryHits",memoryHits.sum()),Map.entry("diskHits",diskHits.sum()),
                 Map.entry("activeChunks",generationJobs.size()),Map.entry("failedFeatures",failedFeatures.sum()),
                 Map.entry("localFailures",localFailures.sum()),Map.entry("unsupportedFeatures",unsupportedFeatures.size()),
-                Map.entry("disabledRegistryFeatures",missingRegistryFailures.size()),Map.entry("lastFailure",lastFeatureFailure));
+                Map.entry("disabledRegistryFeatures",missingRegistryFailures.size()),Map.entry("lastFailure",lastFeatureFailure),Map.entry("biomePruning",biomePruning.snapshot()),
+                Map.entry("treeModels",treeModels == null ? Map.of() : treeModels.performanceSnapshot()),
+                Map.entry("javaPlacement",terrain instanceof RustTerrainSampler rust ? rust.javaFeatureSnapshot() : Map.of()));
     }
 
     String diagnostics() {
@@ -124,6 +131,7 @@ final class PredictionVegetation {
         this.settings = 3
                 | (reuseTrees ? 28 : 0) | (terrain.interiorTerrain() ? 96 : 0) | runtimeSettings(terrain.profile().dimension());
         this.context = terrain.decorationContext();
+        this.biomePruning = new PredictionBiomePruning(terrain,context);
         this.access = context.decorationAccess();
         this.treeModels = reuseTrees ? new PredictionTreeModels(access, context.generatorContext()) : null;
         List<List<PlacedFeature>> found = List.of();
@@ -419,6 +427,7 @@ final class PredictionVegetation {
         long seed = random.setDecorationSeed(terrain.profile().seed(), origin.getX(), origin.getZ());
         Map<Boolean, List<net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>>> columnBiomes = null;
         var enabled = enabledFeatures().indices();
+        var pruning = biomePruning.job();
         // Native and Java placements share complete cave columns and ordered edits.
         try (var nativeStage = terrain instanceof RustTerrainSampler rust
                 ? new RustVegetationStage(rust, level, chunkX, chunkZ, treeModels != null) : null) {
@@ -433,6 +442,7 @@ final class PredictionVegetation {
                     requireCurrent(current);
                     PlacedFeature feature = features.get(index);
                     if (missingRegistryFailures.contains(feature) || unsupportedFeatures.contains(feature)) continue;
+                    if (pruning.excludes(feature,level,origin)) continue;
                     boolean reusableTree = treeModels != null && treeModels.supports(feature);
                     level.useDisplayTerrain(reusableTree);
                     if (!biomeFiltered.contains(feature)) {

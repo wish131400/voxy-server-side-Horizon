@@ -5,7 +5,10 @@ use super::{Binary, Graph, Marker, Mode, Node, Spline, Unary};
 pub(super) const NONE: usize = usize::MAX;
 pub(super) struct ColumnPlan {
     pub slots: Vec<usize>,
+    pub y_dependent: Vec<bool>,
     pub count: usize,
+    pub volume_pointwise: Vec<bool>,
+    pub corner_slots: std::sync::Arc<[usize]>,
     pub bounds: Vec<(f64, f64)>,
     pub height: Option<super::height_plan::HeightPlan>,
 }
@@ -13,7 +16,10 @@ impl ColumnPlan {
     pub fn empty() -> Self {
         Self {
             slots: vec![],
+            y_dependent: vec![],
             count: 0,
+            volume_pointwise: vec![],
+            corner_slots: std::sync::Arc::from([]),
             bounds: vec![],
             height: None,
         }
@@ -30,7 +36,14 @@ impl ColumnPlan {
         let mut dependent = Vec::with_capacity(g.nodes.len());
         let mut slots = Vec::with_capacity(g.nodes.len());
         let mut count = 0;
+        let mut volume_pointwise = Vec::with_capacity(g.nodes.len());
         for node in &g.nodes {
+            let pure = match node {
+                Node::Constant(_) => true,
+                Node::Modern(n) => n.volume_pointwise(&volume_pointwise),
+                _ => false,
+            };
+            volume_pointwise.push(pure);
             let y = match node {
                 Node::Modern(n) => n.uses_y(&dependent),
                 Node::Constant(_) | Node::End(_) | Node::FtfNoise(..) => false,
@@ -76,48 +89,9 @@ impl ColumnPlan {
         }
         let mut bounds: Vec<(f64, f64)> = Vec::with_capacity(g.nodes.len());
         let unknown = (f64::NEG_INFINITY, f64::INFINITY);
-        fn spline_bound(s: &Spline, bounds: &[(f64, f64)]) -> Option<f64> {
-            match s {
-                Spline::Constant(v) => v.is_finite().then_some((*v as f64).abs()),
-                Spline::Multipoint { coordinate, points } => {
-                    let (lo, hi) = bounds[*coordinate];
-                    if !lo.is_finite()
-                        || !hi.is_finite()
-                        || points.is_empty()
-                        || points.windows(2).any(|p| p[0].0 > p[1].0)
-                    {
-                        return None;
-                    }
-                    let mut magnitude = lo.abs().max(hi.abs());
-                    let (mut value, mut derivative) = (0f64, 0f64);
-                    for (x, s, d) in points {
-                        if !x.is_finite() || !d.is_finite() {
-                            return None;
-                        }
-                        magnitude = magnitude.max((*x as f64).abs());
-                        value = value.max(spline_bound(s, bounds)?);
-                        derivative = derivative.max((*d as f64).abs());
-                    }
-                    // Covers endpoint extrapolation and every Hermite term,
-                    // with generous f32 rounding headroom. Tiny knot gaps can
-                    // underflow their subtraction; leave those graphs unknown.
-                    // Equal knots are safe: the upper-bound search selects the
-                    // last <= coordinate and the first > coordinate, so an
-                    // interpolation interval never has two equal endpoints.
-                    if points.windows(2).any(|p| {
-                        let gap = p[1].0 - p[0].0;
-                        gap > 0. && gap < f32::MIN_POSITIVE
-                    }) {
-                        return None;
-                    }
-                    let bound = 16. * (1. + value + derivative * magnitude);
-                    (bound < f32::MAX as f64 / 16. && magnitude < f32::MAX as f64 / 16.)
-                        .then_some(bound)
-                }
-            }
-        }
         for node in &g.nodes {
             let value = match node {
+                Node::Modern(n) => super::modern_range::global(g, n, &bounds),
                 Node::Constant(v) => (*v, *v),
                 Node::Gradient(_, _, a, b) => (a.min(*b), a.max(*b)),
                 Node::Noise(n, xz, y)
@@ -219,6 +193,18 @@ impl ColumnPlan {
                     let (a, b) = bounds[*b];
                     (l.min(a), h.max(b))
                 }
+                Node::Select(_, fallback, choices) => {
+                    // interval_select (26.2+) returns exactly one branch.
+                    // Missing its finite envelope disables the lattice-edge
+                    // proof for the entire enclosing interpolator.
+                    std::iter::once(*fallback)
+                        .chain(choices.iter().map(|(_, _, id)| *id))
+                        .try_fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), id| {
+                            let (a, b) = bounds[id];
+                            (a.is_finite() && b.is_finite()).then_some((lo.min(a), hi.max(b)))
+                        })
+                        .unwrap_or(unknown)
+                }
                 _ => unknown,
             };
             let pad = |v: f64| {
@@ -230,14 +216,32 @@ impl ColumnPlan {
             };
             bounds.push(if value.0.is_nan() || value.1.is_nan() {
                 unknown
+            } else if matches!(node, Node::Modern(_)) {
+                // Float bounds already round outward at each operation. A
+                // double epsilon here would erase exact zero/one operands and
+                // prevent their released short-circuit rules from being used.
+                value
             } else {
                 (value.0 - pad(value.0), value.1 + pad(value.1))
             });
         }
+        let mut corner_slots = vec![NONE; g.nodes.len()];
+        let mut corner_count = 0;
+        for node in &g.nodes {
+            if let Node::Marker(Marker::Interpolated(_), child) = node {
+                if corner_slots[*child] == NONE {
+                    corner_slots[*child] = corner_count;
+                    corner_count += 1;
+                }
+            }
+        }
         Self {
+            corner_slots: corner_slots.into(),
             height: super::height_plan::HeightPlan::compile(g, &slots),
+            y_dependent: dependent,
             slots,
             count,
+            volume_pointwise,
             bounds,
         }
     }
@@ -266,5 +270,45 @@ impl HorizontalCache {
     pub fn put(&mut self, x: i32, z: i32, mode: Mode, value: f64) {
         self.entries[self.next] = Some(Entry { x, z, mode, value });
         self.next = (self.next + 1) & 3;
+    }
+}
+
+pub(super) fn spline_bound(s: &Spline, bounds: &[(f64, f64)]) -> Option<f64> {
+    match s {
+        Spline::Constant(v) => v.is_finite().then_some((*v as f64).abs()),
+        Spline::Multipoint { coordinate, points } => {
+            let (lo, hi) = bounds[*coordinate];
+            if !lo.is_finite()
+                || !hi.is_finite()
+                || points.is_empty()
+                || points.windows(2).any(|p| p[0].0 > p[1].0)
+            {
+                return None;
+            }
+            let mut magnitude = lo.abs().max(hi.abs());
+            let (mut value, mut derivative) = (0f64, 0f64);
+            for (x, s, d) in points {
+                if !x.is_finite() || !d.is_finite() {
+                    return None;
+                }
+                magnitude = magnitude.max((*x as f64).abs());
+                value = value.max(spline_bound(s, bounds)?);
+                derivative = derivative.max((*d as f64).abs());
+            }
+            // Covers endpoint extrapolation and every Hermite term,
+            // with generous f32 rounding headroom. Tiny knot gaps can
+            // underflow their subtraction; leave those graphs unknown.
+            // Equal knots are safe: the upper-bound search selects the
+            // last <= coordinate and the first > coordinate, so an
+            // interpolation interval never has two equal endpoints.
+            if points.windows(2).any(|p| {
+                let gap = p[1].0 - p[0].0;
+                gap > 0. && gap < f32::MIN_POSITIVE
+            }) {
+                return None;
+            }
+            let bound = 16. * (1. + value + derivative * magnitude);
+            (bound < f32::MAX as f64 / 16. && magnitude < f32::MAX as f64 / 16.).then_some(bound)
+        }
     }
 }

@@ -11,10 +11,22 @@ use serde_json::Value;
 // document strings keep the standard randomized maps below.
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
+mod arithmetic_plan;
+mod shared_corners;
+#[cfg(test)]
+mod dependency_tests;
 mod column_plan;
+mod horizontal_climate;
+#[cfg(test)]
+mod horizontal_climate_tests;
+
 mod height_plan;
 mod modern;
+#[cfg(test)]
+mod modern_compilation;
+mod modern_range;
 mod surface_plan;
+pub(crate) mod vulkan;
 pub(crate) use surface_plan::Sign as SurfaceSign;
 mod cache_order;
 use column_plan::{ColumnPlan, HorizontalCache};
@@ -135,6 +147,10 @@ impl GraphNoise {
 pub struct Graph {
     modern: bool,
     nodes: Vec<Node>,
+    horizontal_climate: Option<horizontal_climate::Shared>,
+    arithmetic_plan: arithmetic_plan::Plan,
+    shared_corner_safe: Vec<bool>,
+    shared_corners: std::sync::Arc<shared_corners::Pool>,
     column_plan: ColumnPlan,
     surface_plan: Option<surface_plan::SurfacePlan>,
     stateful_columns: bool,
@@ -164,6 +180,85 @@ impl Graph {
     }
     pub fn is_modern(&self) -> bool {
         self.modern
+    }
+    /// Split exterior searches on every modern interpolation boundary without
+    /// changing the logical NoiseChunk dimensions or volume evaluation order.
+    pub(crate) fn surface_search_height(&self, default: i32) -> i32 {
+        self.surface_search_grid(default, false)
+    }
+    /// A proof footprint separate from logical NoiseChunk dimensions. Cap it
+    /// at a divisor of the 16-block workspace so it never crosses its volume.
+    pub(crate) fn surface_search_width(&self, default: i32) -> i32 {
+        let width = self.surface_search_grid(0, true);
+        if width == 0 {
+            return default;
+        }
+        (1..=16)
+            .rev()
+            .find(|n| 16 % n == 0 && width % n == 0)
+            .unwrap_or(1)
+    }
+    fn surface_search_grid(&self, default: i32, horizontal: bool) -> i32 {
+        fn gcd(mut a: i32, mut b: i32) -> i32 {
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            a
+        }
+        fn spline(s: &Spline, heights: &[i32], default: i32) -> i32 {
+            match s {
+                Spline::Constant(_) => default,
+                Spline::Multipoint { coordinate, points } => {
+                    points.iter().fold(heights[*coordinate], |h, (_, s, _)| {
+                        gcd(h, spline(s, heights, default))
+                    })
+                }
+            }
+        }
+        let mut heights = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            let child = |id: &Id| heights[*id];
+            let h = if let Node::Modern(n) = node {
+                use modern::Node as M;
+                match &**n {
+                    M::Constant(_)
+                    | M::Gradient { .. }
+                    | M::Shift(..)
+                    | M::Distance(..)
+                    | M::End(_)
+                    | M::Blended(_)
+                    | M::Beard => default,
+                    M::Unary(_, n) | M::Clamp(n, ..) | M::Cache(n) | M::Slice(_, _, n) => child(n),
+                    M::Binary(_, a, b) | M::Round(_, a, b) => gcd(child(a), child(b)),
+                    M::Range(a, _, _, b, c) | M::Lerp(a, b, c) => {
+                        gcd(child(a), gcd(child(b), child(c)))
+                    }
+                    M::Interval(n, _, f) => f.iter().fold(child(n), |h, n| gcd(h, child(n))),
+                    M::Interpolated { input, xz, y, .. } => {
+                        gcd(if horizontal { *xz } else { *y }, child(input))
+                    }
+                    M::Noise { shifts, .. } | M::FastNoise(_, _, _, shifts) => shifts
+                        .iter()
+                        .flatten()
+                        .fold(default, |h, n| gcd(h, child(n))),
+                    M::TectonicNoise { shifts, .. } => {
+                        shifts.iter().fold(default, |h, n| gcd(h, child(n)))
+                    }
+                    M::CoordinateShift(n, shifts) => {
+                        shifts.iter().fold(child(n), |h, n| gcd(h, child(n)))
+                    }
+                    M::Cellular(_, d) => d.as_ref().map_or(default, |(n, ..)| child(n)),
+                    M::Spline(s) => spline(s, &heights, default),
+                    M::Top { density, upper, .. } => gcd(child(density), child(upper)),
+                }
+            } else {
+                default
+            };
+            heights.push(h);
+        }
+        self.roots
+            .get("final_density")
+            .map_or(default, |id| heights[*id])
     }
     pub(crate) fn uses_signed_sqrt(&self) -> bool {
         self.nodes
@@ -409,6 +504,10 @@ impl Graph {
         let graph = Self {
             modern: doc["vss_density_semantics"].as_str() == Some("float-26.3"),
             nodes: vec![],
+            horizontal_climate: None,
+            arithmetic_plan: arithmetic_plan::Plan::default(),
+            shared_corner_safe: vec![],
+            shared_corners: std::sync::Arc::new(shared_corners::Pool::default()),
             column_plan: ColumnPlan::empty(),
             surface_plan: None,
             stateful_columns: false,
@@ -475,6 +574,7 @@ impl Graph {
         }
         builder.graph.column_plan = ColumnPlan::compile(&builder.graph);
         builder.graph.surface_plan = surface_plan::SurfacePlan::compile(&builder.graph);
+        builder.graph.horizontal_climate = horizontal_climate::Shared::new(&builder.graph, &builder.intern, doc);
         Ok(builder.graph)
     }
 
@@ -542,6 +642,17 @@ impl Graph {
             dependencies.push(uses_y);
         }
         self.exposed_column_order = cache_order::exposed(self, &dependencies);
+        if !self.modern {
+            self.shared_corner_safe = cache_order::safe_corners(self, &dependencies);
+            self.arithmetic_plan = arithmetic_plan::Plan::compile(self);
+        }
+        self.shared_corners.close();
+        self.shared_corners = std::sync::Arc::new(shared_corners::Pool::default());
+    }
+
+    pub(crate) fn close_shared_corners(&self) {
+        self.shared_corners.close();
+        if let Some(shared) = &self.horizontal_climate { shared.close(); }
     }
 
     pub fn initialize_column_caches(&self, scratch: &mut Scratch) {
@@ -565,6 +676,10 @@ impl Graph {
         let placeholder = Self {
             modern: false,
             nodes: vec![],
+            horizontal_climate: None,
+            arithmetic_plan: arithmetic_plan::Plan::default(),
+            shared_corner_safe: vec![],
+            shared_corners: std::sync::Arc::new(shared_corners::Pool::default()),
             column_plan: ColumnPlan::empty(),
             surface_plan: None,
             stateful_columns: false,
@@ -595,6 +710,9 @@ impl Graph {
         b.graph.analyze_column_caches();
         b.graph.column_plan = ColumnPlan::compile(&b.graph);
         b.graph.surface_plan = surface_plan::SurfacePlan::compile(&b.graph);
+        if let Some(shared) = &mut b.graph.horizontal_climate {
+            shared.extend(b.graph.nodes.len(), ["temperature", "vegetation", "continents", "erosion", "depth", "ridges"].contains(&name));
+        }
         *self = b.graph;
         result
     }
@@ -722,6 +840,20 @@ impl Graph {
     pub(crate) fn raw_scratch(&self) -> Result<Scratch> {
         self.scratch_for_mode(0, 0, 4, 8, true)
     }
+    /// Raw climate proofs may omit Y only when the compiled dependency graph
+    /// proves independence. Stateful/modded column order is never inferred.
+    pub(crate) fn raw_y_independent(&self, id: Id) -> bool {
+        !self.stateful_columns && !self.exposed_column_order
+            && self.column_plan.y_dependent.get(id) == Some(&false)
+    }
+    pub(crate) fn global_range(&self, id: Id) -> (f64,f64) {
+        self.column_plan.bounds[id]
+    }
+    /// Raw climate interval. Its mode is distinct from Cell/Single and it
+    /// does not initialize terrain or interpolation workspaces.
+    pub(crate) fn raw_column_range(&self,id:Id,bottom:[i32;3],top:i32,s:&mut Scratch) -> (f64,f64) {
+        self.vertical_range(id,bottom,top,Mode::Raw,s)
+    }
     fn scratch_for_mode(
         &self,
         origin_x: i32,
@@ -739,10 +871,20 @@ impl Graph {
             span: 16,
             width,
             height,
+            range_width: width,
             memo: vec![None; self.nodes.len()],
             modern_memo_volumes: vec![None; if self.modern { self.nodes.len() } else { 0 }],
             modern_volume: None,
             modern_corners: FxHashMap::default(),
+            modern_dense: vec![
+                modern::DenseCorners::default();
+                if self.modern {
+                    self.interpolator_count
+                } else {
+                    0
+                }
+            ],
+            modern_dense_bytes: 0,
             modern_cells: vec![
                 None;
                 if self.modern {
@@ -790,6 +932,11 @@ impl Graph {
             cell_values: FxHashMap::default(),
             final_values: vec![],
             beard: 0.,
+            dependency_reuse: true,
+            shared_corner: None,
+            shared_attempted: false,
+            shared_suspended: false,
+            climate_targets: crate::climate::targets::Targets::default(),
         })
     }
     /// Conservative range within ONE vertical interpolation cell. Unknown
@@ -805,12 +952,24 @@ impl Graph {
                 plan.classify(self, p, top, s, 1e-12, false)
             })
     }
-    pub(crate) fn surface_cell_sign(&self, p: [i32; 3], top: i32, s: &mut Scratch) -> SurfaceSign {
-        self.surface_plan
+    pub(crate) fn surface_cell_sign(
+        &self,
+        p: [i32; 3],
+        top: i32,
+        width: i32,
+        s: &mut Scratch,
+    ) -> SurfaceSign {
+        // Range evaluation may cover a different footprint; interpolation and
+        // exact block evaluation continue to use the original scratch dimensions.
+        let original = std::mem::replace(&mut s.range_width, width);
+        let sign = self
+            .surface_plan
             .as_ref()
             .map_or(SurfaceSign::Unknown, |plan| {
                 plan.classify(self, p, top, s, 1e-12, true)
-            })
+            });
+        s.range_width = original;
+        sign
     }
     pub(crate) fn single_range(
         &self,
@@ -860,12 +1019,16 @@ impl Graph {
                 || mode == Mode::Single
                 || bottom[0] < s.origin_x
                 || bottom[2] < s.origin_z
-                || bottom[0] + if whole_cell { s.width } else { 0 } > s.origin_x + s.span
-                || bottom[2] + if whole_cell { s.width } else { 0 } > s.origin_z + s.span))
+                || bottom[0] + if whole_cell { s.range_width } else { 0 } > s.origin_x + s.span
+                || bottom[2] + if whole_cell { s.range_width } else { 0 } > s.origin_z + s.span))
             || bottom[1] > top
             || (mode == Mode::Cell && bottom[1].div_euclid(s.height) != top.div_euclid(s.height))
         {
             return unknown;
+        }
+        if mode == Mode::Raw && !whole_cell && self.raw_y_independent(id) {
+            let value=self.compute(id,bottom,mode,s);
+            return if value.is_finite() {(value,value)} else {unknown};
         }
         if mode == Mode::Single
             && self
@@ -879,6 +1042,9 @@ impl Graph {
         }
         let range = |n, s: &mut Scratch| self.spatial_range(n, bottom, top, mode, s, whole_cell);
         let result = match &self.nodes[id] {
+            Node::Modern(n) => {
+                return modern_range::spatial(self, id, n, bottom, top, mode, s, whole_cell)
+            }
             Node::Constant(v) => return (*v, *v),
             Node::Gradient(..) => {
                 let a = self.compute(id, bottom, mode, s);
@@ -888,6 +1054,9 @@ impl Graph {
                 }
                 (a.min(b), a.max(b))
             }
+            // Legacy NoiseChunk wrappers are transparent during raw climate
+            // sampling. A Cell interpolation bound is not a Raw bound.
+            Node::Marker(_, n) if mode == Mode::Raw => range(*n, s),
             Node::Marker(Marker::Interpolated(_), n) if mode == Mode::Single => range(*n, s),
             Node::Marker(Marker::Cache2d, n) if mode == Mode::Single => range(*n, s),
             Node::Marker(Marker::Interpolated(slot), child) => {
@@ -1124,7 +1293,32 @@ impl Graph {
             .or_else(|| self.first_above_interval(id, x, z, min, middle, step, threshold, s))
     }
 
+    #[inline(always)]
     pub fn compute(&self, id: Id, p: [i32; 3], mode: Mode, s: &mut Scratch) -> f64 {
+        if self.modern {
+            self.compute_typed::<true, false>(id, p, mode, s)
+        } else if s.dependency_reuse {
+            self.compute_typed::<false, true>(id, p, mode, s)
+        } else {
+            self.compute_typed::<false, false>(id, p, mode, s)
+        }
+    }
+    // A graph's density semantics is immutable and shared by all of its nodes.
+    // Specialize the dispatcher rather than testing both formats at every node.
+    #[inline(never)]
+    fn compute_typed<const MODERN: bool, const DEPENDENCIES: bool>(
+        &self, id: Id, p: [i32; 3], mode: Mode, s: &mut Scratch
+    ) -> f64 {
+        if mode == Mode::Raw {
+            if let Some(shared) = &self.horizontal_climate { if let Some(value) = shared.get(id, p) { return value; } }
+        }
+        // Float constants have no position, volume or cache-order dependency.
+        // Returning them directly avoids probing and updating memo per operand.
+        if let Node::Modern(n) = &self.nodes[id] {
+            if let modern::Node::Constant(value) = **n {
+                return value as f64;
+            }
+        }
         let slot = self
             .column_plan
             .slots
@@ -1133,7 +1327,7 @@ impl Graph {
             .unwrap_or(column_plan::NONE);
         let horizontal = s.use_column_plan
             && slot != column_plan::NONE
-            && (!self.modern || !modern::is_volume(mode));
+            && (!MODERN || !modern::is_volume(mode) || self.column_plan.volume_pointwise[id]);
         let volume = s.modern_volume;
         if horizontal {
             if let Some(v) = s.horizontal[slot].get(p[0], p[2], mode) {
@@ -1150,7 +1344,7 @@ impl Graph {
         });
         if let Some((q, m, v)) = s.memo[id].filter(|_| !self.stateful_columns || mode == Mode::Raw)
         {
-            if q == p && m == mode && (!self.modern || s.modern_memo_volumes[id] == volume) {
+            if q == p && m == mode && (!MODERN || s.modern_memo_volumes[id] == volume) {
                 return v;
             }
         }
@@ -1170,394 +1364,421 @@ impl Graph {
         #[cfg(feature = "profiling")]
         let __noise_start = std::time::Instant::now();
         let [x, y, z] = p;
-        let ev = |n, s: &mut Scratch| self.compute(n, p, mode, s);
-        let v = match &self.nodes[id] {
-            Node::Modern(n) => n.compute(self, p, mode, s) as f64,
-            Node::FindTopSurface {
-                density,
-                upper,
-                lower,
-                step,
-            } => {
-                let top = ((ev(*upper, s) / *step as f64).floor() as i32).wrapping_mul(*step);
-                let mut found = *lower;
-                let mut probe = top;
-                if top > *lower {
-                    while probe >= *lower {
-                        if self.compute(*density, [x, probe, z], Mode::Single, s) > 0. {
-                            found = probe;
-                            break;
-                        }
-                        let Some(next) = probe.checked_sub(*step) else {
-                            break;
-                        };
-                        probe = next;
-                    }
-                }
-                found as f64
+        let ev = |n, s: &mut Scratch| self.compute_typed::<MODERN, DEPENDENCIES>(n, p, mode, s);
+        // Only exact Single-mode interpolation inputs within the FlatCache
+        // lattice are independent of a NoiseChunk workspace. Beard and exposed
+        // stateful cache dependencies were excluded when compiling the graph.
+        let shared = !MODERN && mode == Mode::Single && DEPENDENCIES && !s.shared_suspended && s.use_column_plan
+            && !self.exposed_column_order && self.shared_corner_safe.get(id) == Some(&true)
+            && self.column_plan.corner_slots[id] != column_plan::NONE
+            && s.origin_x % 4 == 0 && s.origin_z % 4 == 0 && s.span >= 4
+            && (s.origin_x as i64..=s.origin_x as i64 + s.span as i64).contains(&(x as i64))
+            && (s.origin_z as i64..=s.origin_z as i64 + s.span as i64).contains(&(z as i64));
+        if shared {
+            if s.shared_corner.as_ref().is_some_and(|c| !c.belongs_to(&self.shared_corners)) {
+                s.release_shared_corners();
             }
-            Node::FtfNoise(noise, seed) => noise.compute(x as f32, z as f32, *seed) as f64,
-            Node::FtfUnit(input, resolution) => ftf_unit(ev(*input, s), *resolution),
-            Node::LinearSpline(input, points) => {
-                let value = ev(*input, s);
-                if value <= points[0].0 {
-                    ev(points[0].1, s)
-                } else if value >= points[points.len() - 1].0 {
-                    ev(points[points.len() - 1].1, s)
-                } else {
-                    let i = points
-                        .partition_point(|(x, _)| *x <= value)
-                        .saturating_sub(1)
-                        .min(points.len() - 2);
-                    let (x0, a) = points[i];
-                    let (x1, b) = points[i + 1];
-                    let from = ev(a, s);
-                    let to = ev(b, s);
-                    from + ((value - x0) / (x1 - x0)).clamp(0., 1.) * (to - from)
-                }
+            if !s.shared_attempted {
+                s.shared_attempted = true;
+                s.shared_corner = self.shared_corners.take();
             }
-            Node::Axis(axis) => p[*axis] as f64,
-            Node::Mix(input, a, b) => {
-                let t = ev(*input, s);
-                if t <= 0. {
-                    ev(*a, s)
-                } else if t >= 1. {
-                    ev(*b, s)
-                } else {
-                    ev(*a, s) * (1. - t) + ev(*b, s) * t
-                }
-            }
-            Node::Select(input, fallback, choices) => {
-                let t = ev(*input, s);
-                ev(
-                    choices
-                        .iter()
-                        .find(|(a, b, _)| t >= *a && t <= *b)
-                        .map_or(*fallback, |(_, _, n)| *n),
-                    s,
-                )
-            }
-            Node::CoordinateShift(input, shifts) => {
-                let q = std::array::from_fn(|i| (p[i] as f64 + ev(shifts[i], s)) as i32);
-                self.compute(
-                    *input,
-                    q,
-                    if mode == Mode::Raw {
-                        Mode::Raw
-                    } else {
-                        Mode::Single
-                    },
-                    s,
-                )
-            }
-            Node::FastNoise(noise, xz_scale, y_scale, shifts) => {
-                let nx = x as f64 * xz_scale + ev(shifts[0], s);
-                let ny = y as f64 * y_scale + ev(shifts[1], s);
-                let nz = z as f64 * xz_scale + ev(shifts[2], s);
-                noise.get_noise_3d(nx, ny, nz) as f64
-            }
-            Node::Constant(v) => *v,
-            Node::Beard => {
-                if mode == Mode::Raw {
-                    0.
-                } else {
-                    s.beard
-                }
-            }
-            Node::Gradient(a, b, c, d) => {
-                clamped_lerp((y as f64 - *a as f64) / (*b as f64 - *a as f64), *c, *d)
-            }
-            Node::Unary(op, n) => {
-                let v = ev(*n, s);
-                match op {
-                    Unary::Sin
-                    | Unary::Cos
-                    | Unary::Sqrt
-                    | Unary::Floor
-                    | Unary::Ceil
-                    | Unary::Reciprocal => unary(*op, v),
-                    Unary::Abs => v.abs(),
-                    Unary::Square => v * v,
-                    Unary::Cube => v * v * v,
-                    Unary::Half => {
-                        if v > 0. {
-                            v
-                        } else {
-                            v * 0.5
-                        }
-                    }
-                    Unary::Quarter => {
-                        if v > 0. {
-                            v
-                        } else {
-                            v * 0.25
-                        }
-                    }
-                    Unary::Squeeze => {
-                        let v = v.clamp(-1., 1.);
-                        v / 2. - v * v * v / 24.
-                    }
-                }
-            }
-            Node::Binary(op, a, b) => {
-                let a = ev(*a, s);
-                match op {
-                    Binary::Add => a + ev(*b, s),
-                    Binary::Mul => {
-                        if a == 0. {
-                            0.
-                        } else {
-                            a * ev(*b, s)
-                        }
-                    }
-                    Binary::Min => {
-                        if s.use_column_plan
-                            && !self.stateful_columns
-                            && self
-                                .column_plan
-                                .bounds
-                                .get(*b)
-                                .is_some_and(|(min, _)| a < *min)
-                        {
-                            a
-                        } else {
-                            java_min(a, ev(*b, s))
-                        }
-                    }
-                    Binary::Max => {
-                        if s.use_column_plan
-                            && !self.stateful_columns
-                            && self
-                                .column_plan
-                                .bounds
-                                .get(*b)
-                                .is_some_and(|(_, max)| a > *max)
-                        {
-                            a
-                        } else {
-                            java_max(a, ev(*b, s))
-                        }
-                    }
-                }
-            }
-            Node::Clamp(n, a, b) => ev(*n, s).clamp(*a, *b),
-            Node::Range(n, a, b, yes, no) => {
-                let v = ev(*n, s);
-                ev(if v >= *a && v < *b { *yes } else { *no }, s)
-            }
-            Node::Noise(n, a, b) => self.noise(*n, x as f64 * a, y as f64 * b, z as f64 * a),
-            Node::Shift(n, k) => {
-                let [a, b, c] = match k {
-                    0 => [x, y, z],
-                    1 => [x, 0, z],
-                    _ => [z, x, 0],
-                };
-                self.noise(*n, a as f64 * 0.25, b as f64 * 0.25, c as f64 * 0.25) * 4.
-            }
-            Node::Shifted(n, a, b, shifts) => self.noise(
-                *n,
-                x as f64 * a + ev(shifts[0], s),
-                y as f64 * b + ev(shifts[1], s),
-                z as f64 * a + ev(shifts[2], s),
-            ),
-            Node::TectonicNoise {
-                noise,
-                shifts,
-                scale,
-                multiplier,
-                offset,
-                smoother,
-            } => {
-                let shift_x = ev(shifts[0], s);
-                let nx = if *smoother {
-                    (x as f64 + shift_x) * scale
-                } else {
-                    x as f64 * scale + shift_x
-                };
-                let shift_z = ev(shifts[1], s);
-                let nz = if *smoother {
-                    (z as f64 + shift_z) * scale
-                } else {
-                    z as f64 * scale + shift_z
-                };
-                self.noise(*noise, nx, 0., nz) * multiplier + offset
-            }
-            Node::Weird(n, input, two) => {
-                let v = ev(*input, s);
-                let r = if *two {
-                    if v < -0.75 {
-                        0.5
-                    } else if v < -0.5 {
-                        0.75
-                    } else if v < 0.5 {
-                        1.
-                    } else if v < 0.75 {
-                        2.
-                    } else {
-                        3.
-                    }
-                } else if v < -0.5 {
-                    0.75
-                } else if v < 0. {
-                    1.
-                } else if v < 0.5 {
-                    1.5
-                } else {
-                    2.
-                };
-                r * self
-                    .noise(*n, x as f64 / r, y as f64 / r, z as f64 / r)
-                    .abs()
-            }
-            Node::Blended(n) => n.sample(x, y, z),
-            Node::End(n) => end_islands(n, x / 8, z / 8),
-            Node::Spline(sp) => self.spline(sp, p, mode, s) as f64,
-            Node::Marker(kind, n) => match kind {
-                Marker::Once
-                    if matches!(mode, Mode::Slice | Mode::Cell | Mode::Block)
-                        && s.arrays.contains_key(&id) =>
-                {
-                    s.arrays[&id][s.array_index]
-                }
-                Marker::Once
-                    if self.stateful_columns
-                        && matches!(mode, Mode::Slice | Mode::Cell | Mode::Block) =>
-                {
-                    if s.once[id].0 == s.counter {
-                        s.once[id].1
-                    } else {
-                        let v = ev(*n, s);
-                        s.once[id] = (s.counter, v);
-                        v
-                    }
-                }
-                Marker::Cell
-                    if matches!(mode, Mode::Cell | Mode::Block)
-                        && self.stateful_columns
-                        && s.prepared_cell.is_some() =>
-                {
-                    if let Some(i) = s.cell_index(p) {
-                        s.cell_values
-                            .get(&id)
-                            .and_then(|v| v.get(i))
-                            .copied()
-                            .unwrap_or(0.)
-                    } else {
-                        ev(*n, s)
-                    }
-                }
-                Marker::Cache2d if mode != Mode::Raw => {
-                    if self.stateful_columns {
-                        if let Some((qx, qz, value)) = s.last_2d[id] {
-                            if qx == x && qz == z {
-                                return value;
+            if let Some(value) = s.shared_corner.as_ref().and_then(|c| c.get(id, p)) { return value; }
+            s.shared_suspended = true;
+        }
+        let v = if MODERN {
+            let Node::Modern(n) = &self.nodes[id] else { unreachable!("double node in float graph") };
+            n.compute(self, p, mode, s) as f64
+        } else if DEPENDENCIES && s.use_column_plan && self.arithmetic_plan.selected(id) {
+            self.arithmetic_plan.eval(id, self, p, mode, s)
+        } else {
+            match &self.nodes[id] {
+                Node::Modern(_) => unreachable!("float node in double graph"),
+                Node::FindTopSurface {
+                    density,
+                    upper,
+                    lower,
+                    step,
+                } => {
+                    let top = ((ev(*upper, s) / *step as f64).floor() as i32).wrapping_mul(*step);
+                    let mut found = *lower;
+                    let mut probe = top;
+                    if top > *lower {
+                        while probe >= *lower {
+                            if self.compute_typed::<MODERN, DEPENDENCIES>(*density, [x, probe, z], Mode::Single, s) > 0. {
+                                found = probe;
+                                break;
                             }
+                            let Some(next) = probe.checked_sub(*step) else {
+                                break;
+                            };
+                            probe = next;
                         }
-                        let value = ev(*n, s);
-                        s.last_2d[id] = Some((x, z, value));
-                        return value;
                     }
-                    let key = (*n, x, z);
-                    if let Some(&v) = s.cached_2d.get(&key) {
-                        v
+                    found as f64
+                }
+                Node::FtfNoise(noise, seed) => noise.compute(x as f32, z as f32, *seed) as f64,
+                Node::FtfUnit(input, resolution) => ftf_unit(ev(*input, s), *resolution),
+                Node::LinearSpline(input, points) => {
+                    let value = ev(*input, s);
+                    if value <= points[0].0 {
+                        ev(points[0].1, s)
+                    } else if value >= points[points.len() - 1].0 {
+                        ev(points[points.len() - 1].1, s)
                     } else {
-                        let v = ev(*n, s);
-                        if s.cached_2d.len() < 16384 {
-                            s.cached_2d.insert(key, v);
-                        }
-                        v
+                        let i = points
+                            .partition_point(|(x, _)| *x <= value)
+                            .saturating_sub(1)
+                            .min(points.len() - 2);
+                        let (x0, a) = points[i];
+                        let (x1, b) = points[i + 1];
+                        let from = ev(a, s);
+                        let to = ev(b, s);
+                        from + ((value - x0) / (x1 - x0)).clamp(0., 1.) * (to - from)
                     }
                 }
-                Marker::Flat
-                    if mode != Mode::Raw
-                        && (s.origin_x..=s.origin_x + s.span).contains(&(x & !3))
-                        && (s.origin_z..=s.origin_z + s.span).contains(&(z & !3)) =>
-                {
-                    let key = (*n, x & !3, z & !3);
-                    if let Some(&v) = s.flat.get(&key) {
-                        v
+                Node::Axis(axis) => p[*axis] as f64,
+                Node::Mix(input, a, b) => {
+                    let t = ev(*input, s);
+                    if t <= 0. {
+                        ev(*a, s)
+                    } else if t >= 1. {
+                        ev(*b, s)
                     } else {
-                        let v = self.compute(*n, [x & !3, 0, z & !3], Mode::Single, s);
-                        s.flat.insert(key, v);
-                        v
+                        ev(*a, s) * (1. - t) + ev(*b, s) * t
                     }
                 }
-                Marker::Interpolated(slot) if mode == Mode::Block || mode == Mode::Cell => {
-                    let base = [
-                        x.div_euclid(s.width) * s.width,
-                        y.div_euclid(s.height) * s.height,
-                        z.div_euclid(s.width) * s.width,
-                    ];
-                    // Adjacent block samples share eight cell corners. Resolve
-                    // their hashes once per cell, retaining the exact vanilla
-                    // interpolation order below (Cell differs from Block).
-                    let v = if let Some((_, values)) = s.cells[*slot].filter(|(p, _)| *p == base) {
-                        values
-                    } else if let Some((_, edge)) = s.column_edges[*slot].filter(|(q, values)| {
-                        *q == base
-                            && x == base[0]
-                            && z == base[2]
-                            && values.iter().all(|v| v.is_finite() && *v != 0.)
-                            && (!self.stateful_columns
-                                || (!self.exposed_column_order
-                                    && base[0] >= s.origin_x
-                                    && base[2] >= s.origin_z
-                                    && base[0] + s.width <= s.origin_x + s.span
-                                    && base[2] + s.width <= s.origin_z + s.span))
-                    }) {
-                        // The preceding density-bound search already proved
-                        // all corners finite and loaded this vertical edge.
-                        // Reuse it for liquid-band block queries at the same
-                        // X/Z. The other corners have zero weight; duplicate
-                        // the endpoints only in this local interpolation,
-                        // never in the complete eight-corner cell cache.
-                        // Zero endpoints retain the original signed-zero path.
-                        [
-                            edge[0], edge[0], edge[1], edge[1], edge[0], edge[0], edge[1], edge[1],
-                        ]
+                Node::Select(input, fallback, choices) => {
+                    let t = ev(*input, s);
+                    ev(
+                        choices
+                            .iter()
+                            .find(|(a, b, _)| t >= *a && t <= *b)
+                            .map_or(*fallback, |(_, _, n)| *n),
+                        s,
+                    )
+                }
+                Node::CoordinateShift(input, shifts) => {
+                    let q = std::array::from_fn(|i| (p[i] as f64 + ev(shifts[i], s)) as i32);
+                    self.compute_typed::<MODERN, DEPENDENCIES>(
+                        *input,
+                        q,
+                        if mode == Mode::Raw {
+                            Mode::Raw
+                        } else {
+                            Mode::Single
+                        },
+                        s,
+                    )
+                }
+                Node::FastNoise(noise, xz_scale, y_scale, shifts) => {
+                    let nx = x as f64 * xz_scale + ev(shifts[0], s);
+                    let ny = y as f64 * y_scale + ev(shifts[1], s);
+                    let nz = z as f64 * xz_scale + ev(shifts[2], s);
+                    noise.get_noise_3d(nx, ny, nz) as f64
+                }
+                Node::Constant(v) => *v,
+                Node::Beard => {
+                    if mode == Mode::Raw {
+                        0.
                     } else {
-                        let mut values = [0.; 8];
-                        for (i, value) in values.iter_mut().enumerate() {
-                            let q = [
-                                base[0] + (i as i32 & 1) * s.width,
-                                base[1] + ((i as i32 >> 1) & 1) * s.height,
-                                base[2] + ((i as i32 >> 2) & 1) * s.width,
-                            ];
-                            let key = (*n, q);
-                            *value = if let Some(&v) = s.corners.get(&key) {
+                        s.beard
+                    }
+                }
+                Node::Gradient(a, b, c, d) => {
+                    clamped_lerp((y as f64 - *a as f64) / (*b as f64 - *a as f64), *c, *d)
+                }
+                Node::Unary(op, n) => {
+                    let v = ev(*n, s);
+                    match op {
+                        Unary::Sin
+                        | Unary::Cos
+                        | Unary::Sqrt
+                        | Unary::Floor
+                        | Unary::Ceil
+                        | Unary::Reciprocal => unary(*op, v),
+                        Unary::Abs => v.abs(),
+                        Unary::Square => v * v,
+                        Unary::Cube => v * v * v,
+                        Unary::Half => {
+                            if v > 0. {
                                 v
                             } else {
-                                let v = self.compute(*n, q, Mode::Single, s);
-                                if s.corners.len() < 262144 {
-                                    s.corners.insert(key, v);
-                                }
-                                v
-                            };
+                                v * 0.5
+                            }
                         }
-                        s.cells[*slot] = Some((base, values));
-                        values
-                    };
-                    let fx = (x - base[0]) as f64 / s.width as f64;
-                    let fy = (y - base[1]) as f64 / s.height as f64;
-                    let fz = (z - base[2]) as f64 / s.width as f64;
-                    // CacheAllInCell uses X,Y,Z; the block loop uses Y,X,Z.
-                    if mode == Mode::Cell {
-                        lerp(
-                            fz,
-                            lerp(fy, lerp(fx, v[0], v[1]), lerp(fx, v[2], v[3])),
-                            lerp(fy, lerp(fx, v[4], v[5]), lerp(fx, v[6], v[7])),
-                        )
-                    } else {
-                        lerp(
-                            fz,
-                            lerp(fx, lerp(fy, v[0], v[2]), lerp(fy, v[1], v[3])),
-                            lerp(fx, lerp(fy, v[4], v[6]), lerp(fy, v[5], v[7])),
-                        )
+                        Unary::Quarter => {
+                            if v > 0. {
+                                v
+                            } else {
+                                v * 0.25
+                            }
+                        }
+                        Unary::Squeeze => {
+                            let v = v.clamp(-1., 1.);
+                            v / 2. - v * v * v / 24.
+                        }
                     }
                 }
-                Marker::Cell if mode == Mode::Block => self.compute(*n, p, Mode::Cell, s),
-                _ => ev(*n, s),
-            },
+                Node::Binary(op, a, b) => {
+                    let a = ev(*a, s);
+                    match op {
+                        Binary::Add => a + ev(*b, s),
+                        Binary::Mul => {
+                            if a == 0. {
+                                0.
+                            } else {
+                                a * ev(*b, s)
+                            }
+                        }
+                        Binary::Min => {
+                            if s.use_column_plan
+                                && !self.stateful_columns
+                                && self
+                                    .column_plan
+                                    .bounds
+                                    .get(*b)
+                                    .is_some_and(|(min, _)| a < *min)
+                            {
+                                a
+                            } else {
+                                java_min(a, ev(*b, s))
+                            }
+                        }
+                        Binary::Max => {
+                            if s.use_column_plan
+                                && !self.stateful_columns
+                                && self
+                                    .column_plan
+                                    .bounds
+                                    .get(*b)
+                                    .is_some_and(|(_, max)| a > *max)
+                            {
+                                a
+                            } else {
+                                java_max(a, ev(*b, s))
+                            }
+                        }
+                    }
+                }
+                Node::Clamp(n, a, b) => ev(*n, s).clamp(*a, *b),
+                Node::Range(n, a, b, yes, no) => {
+                    let v = ev(*n, s);
+                    ev(if v >= *a && v < *b { *yes } else { *no }, s)
+                }
+                Node::Noise(n, a, b) => self.noise(*n, x as f64 * a, y as f64 * b, z as f64 * a),
+                Node::Shift(n, k) => {
+                    let [a, b, c] = match k {
+                        0 => [x, y, z],
+                        1 => [x, 0, z],
+                        _ => [z, x, 0],
+                    };
+                    self.noise(*n, a as f64 * 0.25, b as f64 * 0.25, c as f64 * 0.25) * 4.
+                }
+                Node::Shifted(n, a, b, shifts) => self.noise(
+                    *n,
+                    x as f64 * a + ev(shifts[0], s),
+                    y as f64 * b + ev(shifts[1], s),
+                    z as f64 * a + ev(shifts[2], s),
+                ),
+                Node::TectonicNoise {
+                    noise,
+                    shifts,
+                    scale,
+                    multiplier,
+                    offset,
+                    smoother,
+                } => {
+                    let shift_x = ev(shifts[0], s);
+                    let nx = if *smoother {
+                        (x as f64 + shift_x) * scale
+                    } else {
+                        x as f64 * scale + shift_x
+                    };
+                    let shift_z = ev(shifts[1], s);
+                    let nz = if *smoother {
+                        (z as f64 + shift_z) * scale
+                    } else {
+                        z as f64 * scale + shift_z
+                    };
+                    self.noise(*noise, nx, 0., nz) * multiplier + offset
+                }
+                Node::Weird(n, input, two) => {
+                    let v = ev(*input, s);
+                    let r = if *two {
+                        if v < -0.75 {
+                            0.5
+                        } else if v < -0.5 {
+                            0.75
+                        } else if v < 0.5 {
+                            1.
+                        } else if v < 0.75 {
+                            2.
+                        } else {
+                            3.
+                        }
+                    } else if v < -0.5 {
+                        0.75
+                    } else if v < 0. {
+                        1.
+                    } else if v < 0.5 {
+                        1.5
+                    } else {
+                        2.
+                    };
+                    r * self
+                        .noise(*n, x as f64 / r, y as f64 / r, z as f64 / r)
+                        .abs()
+                }
+                Node::Blended(n) => n.sample(x, y, z),
+                Node::End(n) => end_islands(n, x / 8, z / 8),
+                Node::Spline(sp) => self.spline(sp, p, mode, s) as f64,
+                Node::Marker(kind, n) => match kind {
+                    Marker::Once
+                        if matches!(mode, Mode::Slice | Mode::Cell | Mode::Block)
+                            && s.arrays.contains_key(&id) =>
+                    {
+                        s.arrays[&id][s.array_index]
+                    }
+                    Marker::Once
+                        if self.stateful_columns
+                            && matches!(mode, Mode::Slice | Mode::Cell | Mode::Block) =>
+                    {
+                        if s.once[id].0 == s.counter {
+                            s.once[id].1
+                        } else {
+                            let v = ev(*n, s);
+                            s.once[id] = (s.counter, v);
+                            v
+                        }
+                    }
+                    Marker::Cell
+                        if matches!(mode, Mode::Cell | Mode::Block)
+                            && self.stateful_columns
+                            && s.prepared_cell.is_some() =>
+                    {
+                        if let Some(i) = s.cell_index(p) {
+                            s.cell_values
+                                .get(&id)
+                                .and_then(|v| v.get(i))
+                                .copied()
+                                .unwrap_or(0.)
+                        } else {
+                            ev(*n, s)
+                        }
+                    }
+                    Marker::Cache2d if mode != Mode::Raw => {
+                        if self.stateful_columns {
+                            if let Some((_, _, value)) = s.last_2d[id].filter(|(qx,qz,_)| *qx==x && *qz==z) {
+                                value
+                            } else {
+                                let value = ev(*n, s);
+                                s.last_2d[id] = Some((x, z, value));
+                                value
+                            }
+                        } else {
+                            let key = (*n, x, z);
+                            if let Some(&v) = s.cached_2d.get(&key) {
+                                v
+                            } else {
+                                let v = ev(*n, s);
+                                if s.cached_2d.len() < 16384 {
+                                    s.cached_2d.insert(key, v);
+                                }
+                                v
+                            }
+                        }
+                    }
+                    Marker::Flat
+                        if mode != Mode::Raw
+                            && (s.origin_x..=s.origin_x + s.span).contains(&(x & !3))
+                            && (s.origin_z..=s.origin_z + s.span).contains(&(z & !3)) =>
+                    {
+                        let key = (*n, x & !3, z & !3);
+                        if let Some(&v) = s.flat.get(&key) {
+                            v
+                        } else {
+                            let v = self.compute_typed::<MODERN, DEPENDENCIES>(*n, [x & !3, 0, z & !3], Mode::Single, s);
+                            s.flat.insert(key, v);
+                            v
+                        }
+                    }
+                    Marker::Interpolated(slot) if mode == Mode::Block || mode == Mode::Cell => {
+                        let base = [
+                            x.div_euclid(s.width) * s.width,
+                            y.div_euclid(s.height) * s.height,
+                            z.div_euclid(s.width) * s.width,
+                        ];
+                        // Adjacent block samples share eight cell corners. Resolve
+                        // their hashes once per cell, retaining the exact vanilla
+                        // interpolation order below (Cell differs from Block).
+                        let v = if let Some((_, values)) = s.cells[*slot].filter(|(p, _)| *p == base) {
+                            values
+                        } else if let Some((_, edge)) = s.column_edges[*slot].filter(|(q, values)| {
+                            *q == base
+                                && x == base[0]
+                                && z == base[2]
+                                && values.iter().all(|v| v.is_finite() && *v != 0.)
+                                && (!self.stateful_columns
+                                    || (!self.exposed_column_order
+                                        && base[0] >= s.origin_x
+                                        && base[2] >= s.origin_z
+                                        && base[0] + s.width <= s.origin_x + s.span
+                                        && base[2] + s.width <= s.origin_z + s.span))
+                        }) {
+                            // The preceding density-bound search already proved
+                            // all corners finite and loaded this vertical edge.
+                            // Reuse it for liquid-band block queries at the same
+                            // X/Z. The other corners have zero weight; duplicate
+                            // the endpoints only in this local interpolation,
+                            // never in the complete eight-corner cell cache.
+                            // Zero endpoints retain the original signed-zero path.
+                            [
+                                edge[0], edge[0], edge[1], edge[1], edge[0], edge[0], edge[1], edge[1],
+                            ]
+                        } else {
+                            let mut values = [0.; 8];
+                            for (i, value) in values.iter_mut().enumerate() {
+                                let q = [
+                                    base[0] + (i as i32 & 1) * s.width,
+                                    base[1] + ((i as i32 >> 1) & 1) * s.height,
+                                    base[2] + ((i as i32 >> 2) & 1) * s.width,
+                                ];
+                                let key = (*n, q);
+                                *value = if let Some(&v) = s.corners.get(&key) {
+                                    v
+                                } else {
+                                    let v = self.compute_typed::<MODERN, DEPENDENCIES>(*n, q, Mode::Single, s);
+                                    if s.corners.len() < 262144 {
+                                        s.corners.insert(key, v);
+                                    }
+                                    v
+                                };
+                            }
+                            s.cells[*slot] = Some((base, values));
+                            values
+                        };
+                        let fx = (x - base[0]) as f64 / s.width as f64;
+                        let fy = (y - base[1]) as f64 / s.height as f64;
+                        let fz = (z - base[2]) as f64 / s.width as f64;
+                        // CacheAllInCell uses X,Y,Z; the block loop uses Y,X,Z.
+                        if mode == Mode::Cell {
+                            lerp(
+                                fz,
+                                lerp(fy, lerp(fx, v[0], v[1]), lerp(fx, v[2], v[3])),
+                                lerp(fy, lerp(fx, v[4], v[5]), lerp(fx, v[6], v[7])),
+                            )
+                        } else {
+                            lerp(
+                                fz,
+                                lerp(fx, lerp(fy, v[0], v[2]), lerp(fy, v[1], v[3])),
+                                lerp(fx, lerp(fy, v[4], v[6]), lerp(fy, v[5], v[7])),
+                            )
+                        }
+                    }
+                    Marker::Cell if mode == Mode::Block => self.compute_typed::<MODERN, DEPENDENCIES>(*n, p, Mode::Cell, s),
+                    _ => ev(*n, s),
+                },
+        }
         };
         #[cfg(feature = "profiling")]
         if __noise {
@@ -1566,8 +1787,15 @@ impl Graph {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+        if shared {
+            s.shared_suspended = false;
+            if let Some(cache) = s.shared_corner.as_mut() { cache.insert(id, p, v); }
+        }
+        if mode == Mode::Raw {
+            if let Some(shared) = &self.horizontal_climate { shared.put(id, p, v); }
+        }
         s.memo[id] = Some((p, mode, v));
-        if self.modern {
+        if MODERN {
             s.modern_memo_volumes[id] = volume;
         }
         if horizontal {
@@ -1646,15 +1874,23 @@ impl ModernVolume {
     }
 }
 pub struct Scratch {
+    dependency_reuse: bool,
+    shared_corner: Option<shared_corners::Lease>,
+    shared_attempted: bool,
+    shared_suspended: bool,
+    pub(crate) climate_targets: crate::climate::targets::Targets,
     origin_x: i32,
     origin_z: i32,
     pub span: i32,
     width: i32,
     height: i32,
+    range_width: i32,
     memo: Vec<Option<([i32; 3], Mode, f64)>>,
     modern_memo_volumes: Vec<Option<ModernVolume>>,
     pub(crate) modern_volume: Option<ModernVolume>,
     modern_corners: FxHashMap<(Id, [i32; 3], ModernVolume), f32>,
+    modern_dense: Vec<modern::DenseCorners>,
+    modern_dense_bytes: usize,
     modern_cells: Vec<Option<([i32; 3], ModernVolume, [f32; 8])>>,
     horizontal: Vec<HorizontalCache>,
     use_column_plan: bool,
@@ -1677,10 +1913,26 @@ pub struct Scratch {
     pub beard: f64,
 }
 impl Scratch {
+    // Display batches already reuse local cells. Keep their smaller dispatcher;
+    // cross-workspace leases and numeric plans pay off on the exact route.
+    pub(crate) fn set_exact_dependencies(&mut self, enabled: bool) {
+        self.dependency_reuse = enabled;
+        if !enabled { self.release_shared_corners(); }
+    }
+    /// Shared tables have their own 16 MiB/world and 64 MiB/process budget.
+    /// Return the lease before parking so idle jobs cannot monopolise it.
+    pub(crate) fn release_shared_corners(&mut self) {
+        self.shared_corner = None;
+        self.shared_attempted = false;
+        self.shared_suspended = false;
+    }
+
     /// Reuse allocations for another NoiseChunk in the same immutable graph.
     /// Even coordinate-keyed Flat/Cell memo can depend on the chunk origin;
     /// reset values before changing it, including fallback traversal state.
     pub(crate) fn reset_chunk(&mut self, x: i32, z: i32) {
+        self.release_shared_corners();
+        self.dependency_reuse = true;
         self.origin_x = x;
         self.origin_z = z;
         self.span = 16;
@@ -1692,6 +1944,9 @@ impl Scratch {
             volume
         });
         self.modern_corners.clear();
+        self.modern_dense
+            .iter_mut()
+            .for_each(modern::DenseCorners::invalidate);
         self.modern_cells.fill(None);
         self.horizontal.fill(HorizontalCache::default());
         self.corners.clear();
@@ -1708,6 +1963,7 @@ impl Scratch {
         self.cell_values.clear();
         self.final_values.clear();
         self.beard = 0.;
+        self.climate_targets.clear();
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
@@ -1717,11 +1973,15 @@ impl Scratch {
         self.memo.capacity() * size_of::<Option<([i32; 3], Mode, f64)>>()
             + self.horizontal.capacity() * size_of::<HorizontalCache>()
             + self.modern_memo_volumes.capacity() * size_of::<Option<ModernVolume>>()
+            + self.modern_dense.capacity() * size_of::<modern::DenseCorners>()
+            + self.modern_dense_bytes
             + self.modern_cells.capacity() * size_of::<Option<([i32; 3], ModernVolume, [f32; 8])>>()
             + self.modern_corners.capacity() * 128
             + self.cells.capacity() * size_of::<Option<([i32; 3], [f64; 8])>>()
             + self.column_edges.capacity() * size_of::<Option<([i32; 3], [f64; 2])>>()
-            + (self.corners.capacity() + self.flat.capacity() + self.cached_2d.capacity()) * 64
+            + self.corners.capacity() * 64
+            + self.climate_targets.retained_bytes()
+            + (self.flat.capacity() + self.cached_2d.capacity()) * 64
             + self.last_2d.capacity() * size_of::<Option<(i32, i32, f64)>>()
             + self.once.capacity() * size_of::<(u64, f64)>()
             + self.final_values.capacity() * 8
@@ -1768,6 +2028,9 @@ impl Scratch {
             self.cells.fill(None);
             self.modern_cells.fill(None);
             self.modern_corners.clear();
+            self.modern_dense
+                .iter_mut()
+                .for_each(modern::DenseCorners::invalidate);
             self.beard = value
         }
     }
@@ -1809,6 +2072,21 @@ impl Builder<'_> {
         }
         let key = v.to_string();
         if let Some(&id) = self.intern.get(&key).filter(|_| self.intern_values) {
+            return Ok(id);
+        }
+        // These float markers are exact pass-throughs in this evaluator.
+        // Resolve them once so their parents inherit the child's dependency
+        // plan and share its memo instead of hiding it behind another node.
+        // Keep the uninterned graph intact as a recursive numerical oracle.
+        if self.graph.modern
+            && self.intern_values
+            && matches!(
+                v.get("type").and_then(Value::as_str),
+                Some("minecraft:cache" | "minecraft:blend_density")
+            )
+        {
+            let id = self.parse(&v["input"])?;
+            self.intern.insert(key, id);
             return Ok(id);
         }
         let node = if self.graph.modern {
@@ -2549,3 +2827,7 @@ mod interval_select_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "density/legacy_optimization_tests.rs"]
+mod legacy_optimization_tests;

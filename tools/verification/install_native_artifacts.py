@@ -21,6 +21,7 @@ def native_source_files(root):
     core = root / "tools/rust/vss-native-core"
     files = [core / "Cargo.toml", core / "Cargo.lock"]
     files += list((core / "src").rglob("*.rs"))
+    files += list((core / "src").rglob("*.glsl"))
     if (core / "build.rs").is_file():
         files.append(core / "build.rs")
     return sorted(files, key=lambda p: p.relative_to(root).as_posix())

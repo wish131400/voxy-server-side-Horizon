@@ -120,7 +120,22 @@ class RustVegetationStageTest {
             assertTrue(sampler.diagnostics().contains("javaPlacement={ms=3,withoutWrites=3,failed=0,TREE_MODEL=1,ORDER_MISMATCH=1,"));
             assertThrows(IllegalArgumentException.class,()->RustWorldgenBackend.describe(volume));
             var cachedFeatures = List.of(firstFeature);
-            sampler.featureDescriptors(cachedFeatures, 0);
+            var originalDescriptor = sampler.featureDescriptors(cachedFeatures, 0);
+            assertTrue(new RustVegetationDescriptors.Job(originalDescriptor).supported(0));
+            sampler.featureRequiresJava("test:first",new IllegalArgumentException("volume outside bounded region"));
+            assertTrue(sampler.supports("test:first"),"location failures must stay local");
+            assertSame(originalDescriptor,sampler.featureDescriptors(cachedFeatures,0));
+            sampler.featureRequiresJava("test:first",new IllegalArgumentException(
+                    "unsupported block survival hook minecraft:brown_mushroom"));
+            assertFalse(sampler.supports("test:first"));
+            var updatedDescriptor = sampler.featureDescriptors(cachedFeatures,0);
+            assertNotSame(originalDescriptor,updatedDescriptor);
+            assertFalse(new RustVegetationDescriptors.Job(updatedDescriptor).supported(0));
+            sampler.featureRequiresJava("test:first",new IllegalArgumentException(
+                    "unsupported block survival hook minecraft:brown_mushroom"));
+            assertEquals(1L,sampler.javaFeatureSnapshot().get("staticRejections"));
+            assertEquals(3L,sampler.javaFeatureSnapshot().get("withoutWrites"));
+            assertFalse(((java.util.Map<?,?>)sampler.javaFeatureSnapshot().get("byReason")).isEmpty());
             sampler.close();
             assertThrows(java.util.concurrent.CancellationException.class, () -> sampler.featureDescriptors(cachedFeatures, 0),
                     "cached metadata must not bypass the closed native context");

@@ -10,6 +10,9 @@
 | 世界生成快照、TerraBlender、BetterEnd、Lithostitched | [世界生成适配](compatibility/worldgen.md) |
 | 构建命令、标准产物和源码目录 | [构建](development/build.md) |
 | 共享核心、版本适配与所有权 | [架构](development/architecture.md) |
+| 八版本原生计算对照与剩余性能差距 | [性能对照](history/performance-matrix-20261031.md) |
+| 26.3 密度、地表搜索、实测收益与参考实现 | [本轮优化](history/density-surface-optimization-20261031.md) |
+| 部分缓存细化与八目标核心同步 | [前轮优化](history/refinement-grid-20261031.md) |
 | Rust 计算与原生库 | [Rust 工具](../tools/rust/README.md) |
 | 当前构建与历史阶段的验证证据 | [阶段验证](history/validation.md) |
 | 当前计划与历史实施过程 | [PLAN](../PLAN.md) · [历史目录](history/README.md) |

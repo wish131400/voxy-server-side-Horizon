@@ -23,13 +23,27 @@ gradlew remapJar -PmcTarget=1.20.1
 gradlew jar -PmcTarget=26.1.2
 ```
 
-标准产物位于 `lib`，例如 `vss-0.3.6-fabric-1.21.11.jar`。文件名不追加临时修复后缀，构建标识和源码摘要写入 JAR 清单。
+标准产物位于 `lib`，例如 `vss-0.3.7-fabric-1.21.11.jar`。文件名不追加临时修复后缀，构建标识和源码摘要写入 JAR 清单。
+
+编译依赖与运行下限分别维护：`loader_version` 和目标表中的 `api` 固定常规构建依赖；`loader_min_version`、各目标可选的 `loaderMin` 和 `apiMin` 写入安装包的最低依赖声明。不要将编译版本直接用作运行下限。
+
+Loader 的编译基线同时约束 Mixin 注解格式：新版 `Redirect.at` 的数组编码不能直接供较旧的 MixinExtras 读取。1.x 的 Loader 编译版本固定为 0.17.3，较新目标使用各自的 Loader 基线；发布校验拒绝遗留的新数组编码，避免只放宽声明却在初始化时崩溃。降低下限时，使用真实最低依赖重新编译对应目标，例如：
+
+```text
+gradlew compileJava validateAccessWidener -PmcTarget=1.21.1 -PfabricCompatibilityBaseline=true
+```
+
+CI 对每个目标执行最低依赖编译，再使用固定编译依赖运行原有回归和打包。发布校验核对最终 JAR 的依赖声明与目标表一致。Minecraft 目标和 Java 要求继续分别维护；最低依赖编译不替代生产客户端启动与实机验收。
 
 ## 标准产物
 
-当前八目标候选包的构建标识为 `fabric-optional-20261030`，包含可选模组适配与 Tectonic 非默认预设修复。包内生产源码 SHA-256 为 `3b724bccaab22db2f06e7ef09573b198e351cdad428b8d7a04b44dfe1ce412d9`；该摘要使用构建脚本约定的生产输入集合计算，不等同于 Git 提交号。发布时逐目标核对生产源码、实际字节码、版本和五平台原生库，`lib/SHA256SUMS.txt` 列出各标准 JAR 和合包的校验值。
+依赖兼容更新 `fabric-dependency-baseline-20261030` 的旧派生包及记录保存在历史归档中；对应最低依赖编译和旧版启动范围见[阶段验证](../history/validation.md)。
 
-`lib/vss-0.3.6.zip` 按 Minecraft 版本分目录收纳构建，附带构建清单和源码摘要。该合包只包含本仓库的 Fabric 版本。
+当前八目标候选包的构建标识为 `20261102-modern-generation`，包含此前兼容修复，并修复 26.x 树木环境准入与 26.3 GPU 成本选择，按群系专门化材质规则和按需噪声输入。八目标均由源码重新构建，使用本轮重新编译并审查的五平台原生库。生产源码摘要记录在 JAR 清单和 `lib/manifest.json`；该摘要不等同于 Git 提交号。发布时逐目标核对生产源码、实际字节码、版本和五平台原生库，`lib/SHA256SUMS.txt` 列出各标准 JAR 和合包的校验值。
+
+`lib/vss-0.3.7.zip` 按 Minecraft 版本分目录收纳构建，附带构建清单和源码摘要。该合包只包含本仓库的 Fabric 版本。
+
+本轮原生源码摘要与五平台文件校验值记录在包内元数据，成品核对实际 GPU 调用链、现代装饰缓存身份及公共修复。Windows 完整生成复测与 Linux / macOS 交叉编译分别记录；其他平台硬件和游戏内帧率没有执行验证。26.3 首轮完整路径改善约 1.8%–4.0%，仍未追平 NeoForge 1.21.1，见[本轮记录](../history/performance/modern-generation-repair-20261102.md)。此前 FreeTerraForged 实际发行包检查保留其[阶段边界](../history/validation.md#freeterraforged-fabric-新旧运行时兼容2026-10-31)，不自动计作本轮重新执行。
 
 ## 源码组织
 
@@ -58,3 +72,5 @@ python tools/verification/optional_matrix.py --minecraft 1.21.1
 下载内容、日志、输入摘要和独立 XML 留在 `external/optional-compat/<目标版本>`，不提交第三方文件。八目标 CI 使用相同入口。依赖版本和范围见 [可选模组适配表](../compatibility/optional-mods.md)。
 
 Rust 由 [原生工具目录](../../tools/rust/README.md)维护；第三方输入遵守上游分发要求，不纳入源码仓库。构建身份和源码摘要放入 JAR 清单，标准文件名不追加临时后缀。固定构建的历史验证见 [阶段记录](../history/validation.md)。
+
+仅调整已发布文件的依赖兼容性时，`tools/verification/update_fabric_dependency_metadata.py` 可在独立目录派生产物。它校验原包清单，只更新依赖、构建派生记录和单元素 `Redirect.at` 编码；保留原代码构建身份、方法指令与原生库，单独记录配置与原包摘要到 `dependency-snapshot.json`。这种派生检查不计作当前工作树的完整重新构建，也不能用于交付正在开发中的算法改动。

@@ -74,6 +74,7 @@ tasks.register('fabricMigrationTest', Test) {
      'PredictionWorldgenCapabilitiesTest', 'PredictionLodBackendsTest', 'PredictionBackendSelectionTest',
      'TerraBlenderRequiredRoutingTest', 'TerraBlenderEndRoutingTest', 'TerraBlenderEndSnapshotTest', 'TerraBlenderEndBiomeSourceTest',
      'BetterEndCompatTest'].each { include "**/${it}.class" }
+    ['PredictionFeatureBiomeBoundsTest', 'RustBiomePruningTest', 'RustFeatureStatusTest'].each { include "**/${it}.class" }
     if (minecraft_version == '26.3') {
         ['FloatDensityCompilerTest', 'FloatMaterialPipelineTest'].each { include "**/${it}.class" }
     }

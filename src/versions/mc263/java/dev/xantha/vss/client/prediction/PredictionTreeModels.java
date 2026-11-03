@@ -31,6 +31,8 @@ import net.minecraft.world.level.levelgen.placement.PlacementContext;
 
 /** Visual tree geometry, scoped to one worldgen context. Placement still uses the actual biome features. */
 final class PredictionTreeModels {
+    // Changes only derived decoration/final-voxel identities; raw terrain stays reusable.
+    static final int SETTINGS_VERSION = 1 << 17;
     private static final int VARIANTS = 8, MAX_MODELS = 256, MAX_BLOCKS = 65_536;
     private static final BlockPos MODEL_ORIGIN = new BlockPos(0, FeatureStampLevel.GROUND_Y, 0);
     private final RegistryAccess access;
@@ -41,6 +43,10 @@ final class PredictionTreeModels {
     private int retainedBlocks;
     private final LongAdder builds = new LongAdder(), hits = new LongAdder(), fallbacks = new LongAdder();
     private final LongAdder placed = new LongAdder(), buildNanos = new LongAdder();
+    private final LongAdder attempts = new LongAdder(), candidates = new LongAdder(), filtered = new LongAdder();
+    private final LongAdder soilRejected = new LongAdder(), replayRejected = new LongAdder();
+    private final LongAdder environmentFallbacks = new LongAdder();
+    private final LongAdder selectedFallbacks = new LongAdder(), emptyModelFallbacks = new LongAdder();
 
     PredictionTreeModels(RegistryAccess access, ChunkGenerator generator) {
         this.access = access;
@@ -87,6 +93,7 @@ final class PredictionTreeModels {
     }
 
     void place(PlacedFeature feature, WorldGenLevel level, RandomSource random, BlockPos origin) {
+        attempts.increment();
         place(feature, level, random, origin, true);
     }
 
@@ -96,13 +103,24 @@ final class PredictionTreeModels {
         if (decoration != null && !supports(feature)) decoration.useDisplayTerrain(false);
         try {
         var context = new PlacementContext(level, generator, biomeCheck ? Optional.of(feature) : Optional.empty());
-        PredictionPlacementExecutor.stream(feature, context, random, origin,
-                pos -> placeConfigured(feature.feature().value(), level, random, pos));
+        var terminal = new java.util.function.Consumer<BlockPos>() {
+            boolean visited;
+            @Override public void accept(BlockPos pos) {
+                visited = true;
+                if (biomeCheck) candidates.increment();
+                placeConfigured(feature.feature().value(), level, random, pos);
+            }
+        };
+        if (PredictionPlacementExecutor.available())
+            PredictionPlacementExecutor.visit(feature, context, random, origin, terminal);
+        else PredictionPlacementExecutor.stream(feature, context, random, origin, terminal);
+        if (biomeCheck && !terminal.visited) filtered.increment();
         } finally { if (decoration != null) decoration.useDisplayTerrain(previous); }
     }
 
     private void placeConfigured(Feature feature, WorldGenLevel level, RandomSource random, BlockPos pos) {
         if (!supports(feature, 0)) {
+            selectedFallbacks.increment();
             fallbacks.increment();
             placeExact(feature,level,random,pos);
             return;
@@ -119,15 +137,32 @@ final class PredictionTreeModels {
             place((random.nextBoolean() ? config.featureTrue() : config.featureFalse()).value(), level, random, pos, false);
         } else {
             BlockState ground = level.getBlockState(pos.below());
-            // Don't invent an island/soil patch to make a cached tree fit.
-            if (!ground.is(BlockTags.DIRT) || !ground.getFluidState().isEmpty()
-                    || !level.getFluidState(pos).isEmpty()) return;
+            // Modern tree placement uses supports_vegetation for sapling survival;
+            // dirt now excludes grass, podzol, mud and other valid tree substrates.
+            // This is only a cache admission check. Unusual/wet environments keep
+            // the real feature's placement and below-trunk provider semantics.
+            if (!cacheableSoil(ground) || !level.getFluidState(pos).isEmpty()) {
+                soilRejected.increment();
+                environmentFallbacks.increment();
+                fallbacks.increment();
+                placeExact(feature, level, random, pos);
+                return;
+            }
             int variant = variant(level.getSeed(), pos);
             List<Cell> model = model(feature, ground, variant);
             if (model.isEmpty()) {
+                emptyModelFallbacks.increment();
                 fallbacks.increment();
                 placeExact(feature,level,random,pos);
-            } else if (replay(model, level, pos, (TreeFeature) feature, random)) placed.increment();
+            } else {
+                var result = replay(model, level, pos, (TreeFeature) feature, random);
+                if (result == ReplayResult.PLACED) placed.increment();
+                else if (result == ReplayResult.EXACT) {
+                    environmentFallbacks.increment();
+                    fallbacks.increment();
+                    placeExact(feature, level, random, pos);
+                } else replayRejected.increment();
+            }
         }
     }
 
@@ -205,24 +240,23 @@ final class PredictionTreeModels {
     }
 
     /** Preflight before writes: obstructed trunks reject a whole model; leaves can meet a cliff/other canopy. */
-    private static boolean replay(List<Cell> model, WorldGenLevel level, BlockPos origin,
+    private static ReplayResult replay(List<Cell> model, WorldGenLevel level, BlockPos origin,
                                   TreeFeature tree, RandomSource random) {
         // Preflight supplies the write pass too: no second block query for
         // every leaf. Nothing writes into this per-job level during preflight.
         BlockPos[] accepted = new BlockPos[model.size()];
-        BlockState[] soil = new BlockState[model.size()];
         for (int i = 0; i < model.size(); i++) {
             var cell = model.get(i);
             BlockPos pos = origin.offset(cell.offset);
-            if (!level.ensureCanWrite(pos)) return false;
+            if (!level.ensureCanWrite(pos)) return ReplayResult.BLOCKED;
             BlockState current = level.getBlockState(pos);
-            if (level instanceof PredictionDecorationLevel decoration && decoration.isStructureBlock(pos)) return false;
+            if (level instanceof PredictionDecorationLevel decoration && decoration.isStructureBlock(pos)) return ReplayResult.BLOCKED;
             if (cell.offset.getY() < 0) {
-                if (!current.is(BlockTags.DIRT) || !current.getFluidState().isEmpty()) return false;
-                soil[i] = tree.belowTrunkProvider().value().getOptionalState(level, random, pos);
-                if (soil[i] == null) continue;
+                // Preflight must not consume provider RNG before a possible
+                // exact fallback, nor turn an unfamiliar slope into cached dirt.
+                if (!cacheableSoil(current)) return ReplayResult.EXACT;
             } else if (!cell.state.is(BlockTags.LEAVES)
-                    && (!replaceable(current) || !current.getFluidState().isEmpty())) return false;
+                    && (!replaceable(current) || !current.getFluidState().isEmpty())) return ReplayResult.BLOCKED;
             if (!cell.state.is(BlockTags.LEAVES) || (replaceable(current) && current.getFluidState().isEmpty()))
                 accepted[i] = pos;
         }
@@ -232,7 +266,14 @@ final class PredictionTreeModels {
             BlockPos pos = accepted[i];
             if (pos == null) continue;
             var cell = model.get(i);
-            level.setBlock(pos, cell.offset.getY() < 0 ? soil[i] : cell.state, 19, 0);
+            BlockState state = cell.state;
+            if (cell.offset.getY() < 0) {
+                // Like TrunkPlacer.placeBelowTrunkBlock: evaluate once against
+                // the actual environment; null leaves the existing soil intact.
+                state = tree.belowTrunkProvider().value().getOptionalState(level, random, pos);
+                if (state == null) continue;
+            }
+            level.setBlock(pos, state, 19, 0);
             if (logs != null) {
                 if (cell.state.is(BlockTags.LOGS)) logs.add(pos);
                 else if (cell.state.is(BlockTags.LEAVES)) leaves.add(pos);
@@ -246,11 +287,26 @@ final class PredictionTreeModels {
             }, random, logs, leaves, Set.of());
             for (var decorator : tree.decorators()) decorator.place(context);
         }
-        return true;
+        return ReplayResult.PLACED;
+    }
+
+    private enum ReplayResult { PLACED, BLOCKED, EXACT }
+
+    private static boolean cacheableSoil(BlockState state) {
+        return state.is(BlockTags.SUPPORTS_VEGETATION) && state.getFluidState().isEmpty();
     }
 
     private static boolean replaceable(BlockState state) {
         return state.isAir() || state.is(BlockTags.REPLACEABLE_BY_TREES);
+    }
+
+    Map<String,Object> performanceSnapshot() {
+        return Map.ofEntries(Map.entry("attempts",attempts.sum()), Map.entry("candidates",candidates.sum()),
+                Map.entry("placementFiltered",filtered.sum()), Map.entry("soilRejected",soilRejected.sum()),
+                Map.entry("selectedExactFallbacks",selectedFallbacks.sum()), Map.entry("emptyModelFallbacks",emptyModelFallbacks.sum()),
+                Map.entry("built",builds.sum()), Map.entry("hits",hits.sum()), Map.entry("placed",placed.sum()),
+                Map.entry("replayRejected",replayRejected.sum()), Map.entry("environmentExactFallbacks", environmentFallbacks.sum()),
+                Map.entry("buildNanos",buildNanos.sum()));
     }
 
     String diagnostics() {

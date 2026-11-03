@@ -59,9 +59,9 @@ class PredictionDecorationQueryTest {
             assertTrue(chunks.add(chunk));
         }
         assertEquals(25, chunks.size());
-        assertThrows(UnsupportedOperationException.class,
+        assertThrows(PredictionDecorationLevel.LocalPlacementFailure.class,
                 () -> level.getChunk(-7, -7, net.minecraft.world.level.chunk.ChunkStatus.EMPTY, true));
-        assertThrows(UnsupportedOperationException.class,
+        assertThrows(PredictionDecorationLevel.LocalPlacementFailure.class,
                 () -> level.getChunk(-4, -4, net.minecraft.world.level.chunk.ChunkStatus.EMPTY, true));
     }
 
@@ -99,7 +99,7 @@ class PredictionDecorationQueryTest {
         assertTrue(level.predicateState(position, -1, 0, 0).is(Blocks.DIAMOND_BLOCK));
         level.endFeature(false);
         assertTrue(level.predicateState(position, -1, 0, 0).is(Blocks.GRASS_BLOCK));
-        assertThrows(UnsupportedOperationException.class, () -> level.predicateState(position, 64, 0, 0));
+        assertThrows(PredictionDecorationLevel.LocalPlacementFailure.class, () -> level.predicateState(position, 64, 0, 0));
     }
 
     @Test void heightCachesDistinguishPredicatesAndInvalidateOnWriteRollbackAndRemoval() {
@@ -153,5 +153,34 @@ class PredictionDecorationQueryTest {
         for (int i = 0; i < 100; i++) assertSame(expected, level.getBiome(pos));
         assertEquals(count, biomes.get(), "a block-position hit must bypass BiomeManager's corner queries");
         assertSame(level.getBiomeManager().getBiome(pos.above(64)), level.getBiome(pos.above(64)));
+    }
+
+    @Test void rejectedWritesKeepValidPlacementsAndExplicitRollbackStillWorks() {
+        var terrain = terrain();
+        var level = new PredictionDecorationLevel(terrain, terrain, access, 0, 0);
+        var pos = new BlockPos(0, 120, 0);
+        level.beginFeature();
+        assertTrue(level.setBlock(pos, Blocks.OAK_LOG.defaultBlockState(), 0, 0));
+        assertFalse(level.setBlock(pos.offset(512, 0, 0), Blocks.OAK_LOG.defaultBlockState(), 0, 0));
+        assertEquals(1, level.featureWriteCount());
+        level.endFeature(true);
+        assertTrue(level.getBlockState(pos).is(Blocks.OAK_LOG));
+        level.beginFeature();
+        level.setBlock(pos, Blocks.STONE.defaultBlockState(), 0, 0);
+        level.endFeature(false);
+        assertTrue(level.getBlockState(pos).is(Blocks.OAK_LOG));
+    }
+
+    @Test void decorationUsesActiveTerrainBiomeQueriesAndRetainsTheirAnswers() {
+        var terrain = terrain();
+        var context = new ClientTerrainSampler(42, PROFILE) {
+            @Override Holder<Biome> noiseBiome(int x, int y, int z) {
+                throw new AssertionError("decoration bypassed the active terrain backend");
+            }
+        };
+        var level = new PredictionDecorationLevel(terrain, context, access, 0, 0);
+        assertSame(warm, level.getNoiseBiome(-4, 20, 8));
+        assertSame(warm, level.getNoiseBiome(-4, 20, 8));
+        assertEquals(1, biomes.get());
     }
 }

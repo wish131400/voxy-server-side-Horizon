@@ -60,8 +60,18 @@ final class VoxyCompat {
     /** Resolve the world index once per composition, rather than once per voxel column. */
     static VoxyPredictionBridge.RealColumn confirmedPredictionColumns(Object engine) {
         LocalSectionIndex index = localIndexes.get(engine);
-        return index == null ? (x,z) -> false
-                : index::hasSettled;
+        VoxyRealIngestAccess.bind(engine);
+        VoxyRealCoverage sections=VoxyRealCoverage.of(engine);
+        return new VoxyPredictionBridge.RealColumn() {
+            public boolean contains(int x,int z) { return index!=null && index.hasSettled(x,z) || sections.contains(x,z); }
+            public boolean containsSection(int x,int y,int z) { return contains(x,z) || sections.containsSection(x,y,z); }
+            public boolean containsSectionAtLod(int x,int y,int z,int lod) {
+                return containsSection(x,y,z) || VoxyRealCoveragePersistence.contains(engine,x,y,z,lod);
+            }
+            public int coverageMask(int x,int y,int z,int count,int lod) {
+                return contains(x,z)?-1:sections.coverageMask(x,y,z,count,lod) | VoxyRealCoveragePersistence.coverageMask(engine,x,y,z,count,lod);
+            }
+        };
     }
 
     /** Record completion even before a render context exists; later ingests do not revoke it. */
@@ -148,7 +158,7 @@ final class VoxyCompat {
                                 return false;
                             }
                         }
-                        if (columnData.authoritative()) markLocalColumnPresent(level, chunkX, chunkZ);
+
                         ingestDiagnostics.record("columnsAccepted");
                         ingestDiagnostics.record("emptyColumnsAccepted");
                         if (VSSLogger.isDebugEnabled()) {
@@ -172,7 +182,7 @@ final class VoxyCompat {
                             return false;
                         }
                     }
-                    if (columnData.authoritative()) markLocalColumnPresent(level, chunkX, chunkZ);
+
                     ingestDiagnostics.record("columnsAccepted");
                     if (VSSLogger.isDebugEnabled()) {
                         lastAcceptedColumn = dimension.identifier() + "@" + chunkX + "," + chunkZ;
@@ -293,6 +303,7 @@ final class VoxyCompat {
     }
 
     static void onDisconnect() {
+        VoxyIngestTracker.resetWorld();
         synchronized (localIndexes) {
             for (LocalSectionIndex index : localIndexes.values()) {
                 index.cancelled = true;

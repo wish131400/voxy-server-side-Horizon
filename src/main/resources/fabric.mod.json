@@ -17,10 +17,10 @@
   "mixins": ["vss.compat.mixins.json", "vss.strict.mixins.json", "vss.lostcities.mixins.json"],
   "accessWidener": "vss.accesswidener",
   "depends": {
-    "fabricloader": ">=${loader_version}",
+    "fabricloader": ">=${loader_min_version}",
     "minecraft": "${minecraft_version}",
     "java": ">=${java_version}",
-    "fabric-api": ">=${fabric_version}"
+    "fabric-api": ">=${fabric_min_version}"
   },
   "suggests": {"voxy": "*", "modmenu": "*"}
 }

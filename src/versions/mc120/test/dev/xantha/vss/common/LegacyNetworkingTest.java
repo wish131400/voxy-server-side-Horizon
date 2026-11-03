@@ -31,6 +31,23 @@ class LegacyNetworkingTest {
         net.minecraft.server.Bootstrap.bootStrap();
     }
 
+    @Test void aClientDecliningTheOptionalLoginQueryIsNotDisconnected() {
+        var response = new AtomicReference<ServerLoginNetworking.LoginQueryResponseHandler>();
+        try (var play = mockStatic(ServerPlayNetworking.class);
+             var login = mockStatic(ServerLoginNetworking.class)) {
+            login.when(() -> ServerLoginNetworking.registerGlobalReceiver(eq(ServerIdentityS2CPayload.TYPE.id()),
+                    any(ServerLoginNetworking.LoginQueryResponseHandler.class))).thenAnswer(call -> {
+                response.set(call.getArgument(1)); return true;
+            });
+            VSSNetworking.register();
+            var server = mock(MinecraftServer.class);
+            var listener = mock(net.minecraft.server.network.ServerLoginPacketListenerImpl.class);
+            assertNotNull(response.get());
+            response.get().receive(server, listener, false, null, null, null);
+            verifyNoInteractions(server, listener);
+        }
+    }
+
     @Test void directionsCodecsAndReleasedBuffersKeepTheFullProtocolContract() throws Exception {
         var c2s = new HashMap<ResourceLocation, ServerPlayNetworking.PlayChannelHandler>();
         var s2c = new HashMap<ResourceLocation, ClientPlayNetworking.PlayChannelHandler>();

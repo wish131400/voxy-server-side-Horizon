@@ -28,6 +28,8 @@ import net.minecraft.world.level.levelgen.placement.PlacementContext;
 
 /** Visual tree geometry, scoped to one worldgen context. Placement still uses the actual biome features. */
 final class PredictionTreeModels {
+    // Changes only derived decoration/final-voxel identities; raw terrain stays reusable.
+    static final int SETTINGS_VERSION = 0;
     private static final int VARIANTS = 8, MAX_MODELS = 256, MAX_BLOCKS = 65_536;
     private static final BlockPos MODEL_ORIGIN = new BlockPos(0, FeatureStampLevel.GROUND_Y, 0);
     private final RegistryAccess access;
@@ -38,6 +40,9 @@ final class PredictionTreeModels {
     private int retainedBlocks;
     private final LongAdder builds = new LongAdder(), hits = new LongAdder(), fallbacks = new LongAdder();
     private final LongAdder placed = new LongAdder(), buildNanos = new LongAdder();
+    private final LongAdder attempts = new LongAdder(), candidates = new LongAdder(), filtered = new LongAdder();
+    private final LongAdder soilRejected = new LongAdder(), replayRejected = new LongAdder();
+    private final LongAdder selectedFallbacks = new LongAdder(), emptyModelFallbacks = new LongAdder();
 
     PredictionTreeModels(RegistryAccess access, ChunkGenerator generator) {
         this.access = access;
@@ -83,6 +88,7 @@ final class PredictionTreeModels {
     }
 
     void place(PlacedFeature feature, WorldGenLevel level, RandomSource random, BlockPos origin) {
+        attempts.increment();
         place(feature, level, random, origin, true);
     }
 
@@ -92,13 +98,24 @@ final class PredictionTreeModels {
         if (decoration != null && !supports(feature)) decoration.useDisplayTerrain(false);
         try {
         var context = new PlacementContext(level, generator, biomeCheck ? Optional.of(feature) : Optional.empty());
-        PredictionPlacementExecutor.stream(feature, context, random, origin,
-                pos -> placeConfigured(feature.feature().value(), level, random, pos));
+        var terminal = new java.util.function.Consumer<BlockPos>() {
+            boolean visited;
+            @Override public void accept(BlockPos pos) {
+                visited = true;
+                if (biomeCheck) candidates.increment();
+                placeConfigured(feature.feature().value(), level, random, pos);
+            }
+        };
+        if (PredictionPlacementExecutor.available())
+            PredictionPlacementExecutor.visit(feature, context, random, origin, terminal);
+        else PredictionPlacementExecutor.stream(feature, context, random, origin, terminal);
+        if (biomeCheck && !terminal.visited) filtered.increment();
         } finally { if (decoration != null) decoration.useDisplayTerrain(previous); }
     }
 
     private void placeConfigured(ConfiguredFeature<?, ?> feature, WorldGenLevel level, RandomSource random, BlockPos pos) {
         if (!supports(feature, 0)) {
+            selectedFallbacks.increment();
             fallbacks.increment();
             placeExact(feature,level,random,pos);
             return;
@@ -117,13 +134,15 @@ final class PredictionTreeModels {
             BlockState ground = level.getBlockState(pos.below());
             // Don't invent an island/soil patch to make a cached tree fit.
             if (!ground.is(BlockTags.DIRT) || !ground.getFluidState().isEmpty()
-                    || !level.getFluidState(pos).isEmpty()) return;
+                    || !level.getFluidState(pos).isEmpty()) { soilRejected.increment(); return; }
             int variant = variant(level.getSeed(), pos);
             List<Cell> model = model(feature, ground, variant);
             if (model.isEmpty()) {
+                emptyModelFallbacks.increment();
                 fallbacks.increment();
                 placeExact(feature,level,random,pos);
             } else if (replay(model, level, pos, (TreeConfiguration) feature.config(), random)) placed.increment();
+            else replayRejected.increment();
         }
     }
 
@@ -245,6 +264,14 @@ final class PredictionTreeModels {
 
     private static boolean replaceable(BlockState state) {
         return state.isAir() || state.is(BlockTags.REPLACEABLE_BY_TREES);
+    }
+
+    Map<String,Object> performanceSnapshot() {
+        return Map.ofEntries(Map.entry("attempts",attempts.sum()), Map.entry("candidates",candidates.sum()),
+                Map.entry("placementFiltered",filtered.sum()), Map.entry("soilRejected",soilRejected.sum()),
+                Map.entry("selectedExactFallbacks",selectedFallbacks.sum()), Map.entry("emptyModelFallbacks",emptyModelFallbacks.sum()),
+                Map.entry("built",builds.sum()), Map.entry("hits",hits.sum()), Map.entry("placed",placed.sum()),
+                Map.entry("replayRejected",replayRejected.sum()), Map.entry("buildNanos",buildNanos.sum()));
     }
 
     String diagnostics() {

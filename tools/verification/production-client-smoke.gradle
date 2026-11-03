@@ -26,6 +26,14 @@ gradle.projectsEvaluated {
             def target = generated.get().file('dev/xantha/vss/smoke/VSSClientSmoke.java').asFile
             target.parentFile.mkdirs()
             target.setText(text, 'UTF-8')
+            def optionsProbe = generated.get().file('dev/xantha/vss/smoke/SodiumOptionsSmoke.java').asFile
+            def optionsSource = project.file('tools/verification/client-smoke/java/dev/xantha/vss/smoke/SodiumOptionsSmoke.java').text
+            def showMarker = '    private static void show(Minecraft client, Screen screen)'
+            optionsProbe.setText(optionsSource.substring(0, optionsSource.indexOf(showMarker)) + '''    private static void show(Minecraft client, Screen screen) {
+        client.setScreen(screen);
+    }
+}
+''', 'UTF-8')
         }
     }
     def probe = project.sourceSets.create('productionClientSmoke') {

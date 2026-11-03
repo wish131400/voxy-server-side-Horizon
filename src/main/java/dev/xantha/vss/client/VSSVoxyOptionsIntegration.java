@@ -26,16 +26,20 @@ import net.minecraft.resources.Identifier;
 import net.fabricmc.loader.api.FabricLoader;
 
 public final class VSSVoxyOptionsIntegration {
-    private static final String OLD_OPTION_PAGE = "net.caffeinemc.mods.sodium.client.gui.options.OptionPage";
-    private static final String OLD_OPTION_GROUP = "net.caffeinemc.mods.sodium.client.gui.options.OptionGroup";
-    private static final String OLD_OPTION_IMPL = "net.caffeinemc.mods.sodium.client.gui.options.OptionImpl";
-    private static final String OLD_OPTION_IMPACT = "net.caffeinemc.mods.sodium.client.gui.options.OptionImpact";
-    private static final String OLD_OPTION_STORAGE = "net.caffeinemc.mods.sodium.client.gui.options.storage.OptionStorage";
-    private static final String OLD_OPTION = "net.caffeinemc.mods.sodium.client.gui.options.Option";
-    private static final String OLD_SLIDER_CONTROL = "net.caffeinemc.mods.sodium.client.gui.options.control.SliderControl";
-    private static final String OLD_TICK_BOX_CONTROL = "net.caffeinemc.mods.sodium.client.gui.options.control.TickBoxControl";
-    private static final String OLD_VALUE_FORMATTER = "net.caffeinemc.mods.sodium.client.gui.options.control.ControlValueFormatter";
-    private static final String OLD_CYCLING_CONTROL = "net.caffeinemc.mods.sodium.client.gui.options.control.CyclingControl";
+    // Sodium 0.5 and 0.6/0.7 share the option model, but not its package name.
+    // Select the family once so controls and storage never mix the two APIs.
+    private static final String OLD_GUI_PACKAGE = classExists("net.caffeinemc.mods.sodium.client.gui.options.OptionPage")
+            ? "net.caffeinemc.mods.sodium.client.gui" : "me.jellysquid.mods.sodium.client.gui";
+    private static final String OLD_OPTION_PAGE = OLD_GUI_PACKAGE + ".options.OptionPage";
+    private static final String OLD_OPTION_GROUP = OLD_GUI_PACKAGE + ".options.OptionGroup";
+    private static final String OLD_OPTION_IMPL = OLD_GUI_PACKAGE + ".options.OptionImpl";
+    private static final String OLD_OPTION_IMPACT = OLD_GUI_PACKAGE + ".options.OptionImpact";
+    private static final String OLD_OPTION_STORAGE = OLD_GUI_PACKAGE + ".options.storage.OptionStorage";
+    private static final String OLD_OPTION = OLD_GUI_PACKAGE + ".options.Option";
+    private static final String OLD_SLIDER_CONTROL = OLD_GUI_PACKAGE + ".options.control.SliderControl";
+    private static final String OLD_TICK_BOX_CONTROL = OLD_GUI_PACKAGE + ".options.control.TickBoxControl";
+    private static final String OLD_VALUE_FORMATTER = OLD_GUI_PACKAGE + ".options.control.ControlValueFormatter";
+    private static final String OLD_CYCLING_CONTROL = OLD_GUI_PACKAGE + ".options.control.CyclingControl";
 
     private static final String SODIUM_OPTIONS_API = "toni.sodiumoptionsapi.api.OptionGUIConstruction";
     private static final String SODIUM08_CONFIG_ENTRY_POINT = "net.caffeinemc.mods.sodium.api.config.ConfigEntryPoint";
@@ -48,7 +52,11 @@ public final class VSSVoxyOptionsIntegration {
     }
 
     public static boolean isSodiumPresent() {
-        return classExists(OLD_OPTION_PAGE) || classExists(SODIUM08_CONFIG_ENTRY_POINT);
+        return hasLegacyOptions() || classExists(SODIUM08_CONFIG_ENTRY_POINT);
+    }
+
+    public static boolean hasLegacyOptions() {
+        return classExists(OLD_OPTION_PAGE);
     }
 
     public static Screen createSodiumConfigScreen(Screen parent) {
@@ -139,19 +147,16 @@ public final class VSSVoxyOptionsIntegration {
 
         try {
             boolean added = false;
-            for (Object page : new Object[]{oldSyncPage(), oldPredictionPage()}) {
+            int insertAt = findVoxyPageIndex(pages) + 1;
+            if (insertAt <= 0) insertAt = pages.size();
+            String[] names = {"vss.voxy_options.sync_title", "vss.voxy_options.prediction_title"};
+            for (int i = 0; i < names.length; i++) {
+                if (containsPageNamed(pages, Component.translatable(names[i]).getString())) continue;
+                Object page = i == 0 ? oldSyncPage() : oldPredictionPage();
                 if (page == null) {
                     continue;
                 }
-                String name = pageName(page);
-                if (containsPageNamed(pages, name)) {
-                    continue;
-                }
-                int insertAt = findVoxyPageIndex(pages) + 1;
-                if (insertAt <= 0) {
-                    insertAt = pages.size();
-                }
-                ((List) pages).add(insertAt, page);
+                ((List) pages).add(insertAt++, page);
                 added = true;
             }
             if (added) {
@@ -248,6 +253,16 @@ public final class VSSVoxyOptionsIntegration {
                                 value -> VSSServerConfig.CONFIG.enablePredictionSync = value,
                                 () -> VSSServerConfig.CONFIG.enablePredictionSync,
                                 VSSVoxyOptionsIntegration::saveServerConfig)));
+            }
+
+            if (dev.xantha.vss.client.prediction.VulkanPredictionCompute.supported()) {
+                invokeByName(predictionPage, "addOptionGroup", sodium08Group(configBuilder,
+                        "vss.voxy_options.group.prediction_compute",
+                        sodium08BooleanOption(configBuilder, "prediction_vulkan", "vss.voxy_options.prediction_vulkan",
+                                "vss.voxy_options.prediction_vulkan.tooltip", "HIGH", false,
+                                value -> VSSClientConfig.CONFIG.predictionVulkanAcceleration = value,
+                                () -> VSSClientConfig.CONFIG.predictionVulkanAcceleration,
+                                VSSVoxyOptionsIntegration::saveClientConfig)));
             }
 
             invokeByName(predictionPage, "addOptionGroup", sodium08Group(
@@ -945,6 +960,13 @@ public final class VSSVoxyOptionsIntegration {
                             (VSSClientConfig config, Boolean value) -> config.predictionSpyglassLoading = value,
                             config -> config.predictionSpyglassLoading)));
 
+            if (dev.xantha.vss.client.prediction.VulkanPredictionCompute.supported()) {
+                groups.add(oldGroup(oldBooleanOption(clientStorage, "vss.voxy_options.prediction_vulkan",
+                        "vss.voxy_options.prediction_vulkan.tooltip", "HIGH",
+                        (VSSClientConfig config, Boolean value) -> config.predictionVulkanAcceleration = value,
+                        config -> config.predictionVulkanAcceleration)));
+            }
+
             groups.add(oldGroup(
                     oldIntOption(
                             clientStorage,
@@ -1234,34 +1256,35 @@ public final class VSSVoxyOptionsIntegration {
     }
 
     private static Screen createOldSodiumConfigScreen(Screen parent) {
+        if (!hasLegacyOptions()) return null;
         try {
-            Object syncPage = oldSyncPage();
-            Object predictionPage = oldPredictionPage();
-            if (syncPage == null) {
-                return null;
-            }
-
-            Class<?> videoSettingsScreen = Class.forName("net.caffeinemc.mods.sodium.client.gui.SodiumOptionsGUI");
-            Object screen = invokeStatic(videoSettingsScreen, "createScreen", parent, syncPage);
-            if (screen == null) {
-                return null;
-            }
-            // Make sure both pages exist on the screen's tab strip.
+            Class<?> videoSettingsScreen = Class.forName(OLD_GUI_PACKAGE + ".SodiumOptionsGUI");
+            // Sodium 0.5-0.7 use a one-argument factory. Keep its corrupted-config
+            // recovery screen intact rather than bypassing it with a constructor.
+            Object screen = invokeStatic(videoSettingsScreen, "createScreen", parent);
+            if (!videoSettingsScreen.isInstance(screen)) return screen instanceof Screen result ? result : null;
+            addPage(screen);
             Field pagesField = findPagesField(screen.getClass());
-            if (pagesField != null && predictionPage != null) {
+            if (pagesField != null) {
                 pagesField.setAccessible(true);
                 Object value = pagesField.get(screen);
-                if (value instanceof List<?> existing) {
-                    List<Object> pages = (List<Object>) existing;
-                    for (Object page : new Object[]{syncPage, predictionPage}) {
-                        if (page != null && !containsPageNamed(pages, pageName(page))) {
-                            pages.add(page);
+                if (value instanceof List<?> pages) {
+                    String name = Component.translatable("vss.voxy_options.sync_title").getString();
+                    for (Object page : pages) {
+                        if (name.equals(pageName(page))) {
+                            // setPage immediately rebuilds widgets and requires Screen.init's
+                            // font/client. Choose the initial page without running UI work early.
+                            Field currentPage = videoSettingsScreen.getDeclaredField("currentPage");
+                            currentPage.setAccessible(true);
+                            currentPage.set(screen, page);
+                            break;
                         }
                     }
                 }
             }
             return screen instanceof Screen sodiumScreen ? sodiumScreen : null;
-        } catch (Throwable ignored) {
+        } catch (ReflectiveOperationException | RuntimeException failure) {
+            VSSLogger.warn("Failed to open VSS Sodium options screen", failure);
             return null;
         }
     }

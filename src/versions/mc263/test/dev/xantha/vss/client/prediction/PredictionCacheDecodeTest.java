@@ -42,6 +42,11 @@ class PredictionCacheDecodeTest {
         generator.add("settings",net.minecraft.world.level.levelgen.NoiseGeneratorSettings.DIRECT_CODEC
                 .encodeStart(ops,source.lookupOrThrow(net.minecraft.core.registries.Registries.NOISE_SETTINGS)
                         .getOrThrow(net.minecraft.world.level.levelgen.NoiseGeneratorSettings.OVERWORLD).value()).result().orElseThrow());
+        // Real server snapshots carry dimension metadata even for the cache-only stage.
+        generator.add("vss_dimension_type",net.minecraft.world.level.dimension.DimensionType.DIRECT_CODEC
+                .encodeStart(ops,source.lookupOrThrow(net.minecraft.core.registries.Registries.DIMENSION_TYPE)
+                        .getOrThrow(net.minecraft.world.level.dimension.BuiltinDimensionTypes.OVERWORLD).value()).result().orElseThrow());
+        generator.add("vss_structure_origin",com.google.gson.JsonParser.parseString("[12,-34]"));
         generator.add("biome_source",com.google.gson.JsonParser.parseString("{\"type\":\"minecraft:fixed\",\"biome\":\"minecraft:plains\"}"));
         byte[] data=generator.toString().getBytes(StandardCharsets.UTF_8),registry=registries.toString().getBytes(StandardCharsets.UTF_8);
         var profile=new DimensionProfile(Level.OVERWORLD.identifier(),42,-64,384,"noise","minecraft:overworld",123,0,data.length,data);
@@ -60,11 +65,17 @@ class PredictionCacheDecodeTest {
             session.decode(Level.OVERWORLD,()->true,(key,full)->{
                 owned.add(full);stages.add("generation");assertInstanceOf(RustTerrainSampler.class,full);
                 var cached=owned.get(0);assertEquals(cached.cacheBiomes(),full.cacheBiomes());
+                assertEquals(encodedDimension(cached),encodedDimension(full));
+                assertEquals(cached.structureOriginContext(),full.decorationContext().structureOriginContext());
                 assertEquals(cached.predictionCacheNamespace(),full.predictionCacheNamespace());
                 assertArrayEquals(PredictionVoxelCache.identity(cached),PredictionVoxelCache.identity(full));
             },(key,cached)->{
                 owned.add(cached);stages.add("cache");assertInstanceOf(PredictionCacheSampler.class,cached);
                 assertNull(cached.generatorContext());assertNull(cached.randomStateContext());
+                assertNull(cached.decorationAccess());
+                assertEquals(1.0,cached.dimensionTypeContext().coordinateScale());
+                assertThrows(IllegalStateException.class,()->cached.sample(0,0));
+                assertEquals(new net.minecraft.world.level.ChunkPos(12,-34),cached.structureOriginContext());
             });
             assertEquals(List.of("cache","generation"),stages);
         } finally {owned.forEach(PredictionResources::releaseSampler);}
@@ -104,4 +115,12 @@ class PredictionCacheDecodeTest {
                 codec.encodeStart(ops,holder.value()).result().orElseThrow()));root.add(name,encoded);
     }
 
+    private static com.google.gson.JsonElement encodedDimension(ClientTerrainSampler sampler) {
+        // Use the registry owners that decoded this metadata. Turn callback
+        // fixture errors into assertions so session diagnostics cannot swallow them.
+        var ops = ClientWorldgenRegistries.decode(TerrainPredictionFixtures.emptyRegistries(),
+                TerrainPredictionFixtures.access()).ops();
+        return assertDoesNotThrow(() -> net.minecraft.world.level.dimension.DimensionType.DIRECT_CODEC
+                .encodeStart(ops, sampler.decorationContext().dimensionTypeContext()).result().orElseThrow());
+    }
 }

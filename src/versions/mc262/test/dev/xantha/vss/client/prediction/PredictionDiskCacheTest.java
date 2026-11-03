@@ -69,7 +69,7 @@ class PredictionDiskCacheTest {
             assertTrue(Files.exists(PredictionCacheTestFiles.storage(cache).path(key)));
 
             PredictionCacheTestFiles.legacy(cache,key,bytes);
-            var field=PredictionDiskCache.class.getDeclaredField("COMMITS"); field.setAccessible(true);
+            var field=PredictionDiskCache.class.getDeclaredField("PROBES"); field.setAccessible(true);
             var executor=(java.util.concurrent.ExecutorService)field.get(null);
             var entered=new java.util.concurrent.CountDownLatch(1);
             var release=new java.util.concurrent.CountDownLatch(1);
@@ -133,7 +133,7 @@ class PredictionDiskCacheTest {
         var grid=new ClientColumnSample[66*66];Arrays.fill(grid,samples()[0]);
         try(var cache=new PredictionDiskCache(directory,77);var lease=cache.lease(last)) {assertTrue(cache.writeTerrain(lease,grid));}
         try(var cache=new PredictionDiskCache(directory,77)) {
-            var field=PredictionDiskCache.class.getDeclaredField("COMMITS");field.setAccessible(true);
+            var field=PredictionDiskCache.class.getDeclaredField("PROBES");field.setAccessible(true);
             var executor=(java.util.concurrent.ExecutorService)field.get(null);
             var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
             var gate=executor.submit(()->{entered.countDown();release.await();return true;});
@@ -244,8 +244,9 @@ class PredictionDiskCacheTest {
         var terrain = PredictionDiskCache.Key.terrain(-1, -1, 0);
         var border = PredictionDiskCache.Key.terrain(0, 0, 0);
         var parent = PredictionDiskCache.Key.terrain(0, 0, 10);
-        var vegetation = PredictionDiskCache.Key.surface(1, -1, 3);
-        var outside = PredictionDiskCache.Key.surface(2, -1, 3);
+        int settings = 3 | PredictionVegetation.runtimeSettings();
+        var vegetation = PredictionDiskCache.Key.surface(1, -1, settings);
+        var outside = PredictionDiskCache.Key.surface(2, -1, settings);
         assertTrue(affected.containsAll(List.of(terrain, border, parent, vegetation)));
         assertFalse(affected.contains(outside));
         try (var cache = new PredictionDiskCache(directory, 77)) {

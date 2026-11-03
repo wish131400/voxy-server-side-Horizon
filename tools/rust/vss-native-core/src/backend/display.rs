@@ -2,6 +2,7 @@
 //! chunk caches. Only explicitly visual vegetation may use this proxy ground.
 //! Unhandled rules and liquid settings fall back.
 use super::*;
+type GpuHeights = rustc_hash::FxHashMap<(i32, i32), i32>;
 const DISPLAY: i32 = (1 << 26) | (1 << 27) | (1 << 28);
 
 // Experimental visual-envelope sampling.  Level two uses four-block sample
@@ -12,6 +13,15 @@ const DISPLAY: i32 = (1 << 26) | (1 << 27) | (1 << 28);
 const EXPERIMENTAL_MAX_STEP: i32 = 4;
 const EXPERIMENTAL_HEIGHT_RESIDUAL: f64 = 0.75;
 const EXPERIMENTAL_COLOR_CHANNEL_DELTA: i32 = 12;
+
+fn adaptive_probe_mask(step: i32) -> u64 {
+    (0..64).filter(|i| {
+        let (x, z) = (i % 8, i / 8);
+        x == 0 || x == 7 || z == 0 || z == 7
+            || ((x == 3 || x == 4) && (z == 3 || z == 4))
+            || (step >= 4 && (x == 2 || x == 5) && (z == 2 || z == 5))
+    }).fold(0, |mask, i| mask | (1u64 << i))
+}
 
 fn color_close(a: i32, b: i32) -> bool {
     let a = a as u32;
@@ -114,6 +124,19 @@ impl World {
     /// Keep a caller's sparse reuse mask without destroying the regular grid.
     /// Known Java records are not replaced; fallback evaluates only missing cells.
     pub fn display_grid(&self, x: i32, z: i32, step: i32, missing: u64) -> Result<Vec<SurfaceColumn>> {
+        self.display_grid_impl(x, z, step, missing, None)
+    }
+
+    pub fn display_grid_gpu(&self, x: i32, z: i32, step: i32, missing: u64, heights: &[i32]) -> Result<Vec<SurfaceColumn>> {
+        if heights.len() != 64 { return Err("display grid GPU heights".into()); }
+        if !(1..=EXPERIMENTAL_MAX_STEP).contains(&step) { return Err("display grid spacing".into()); }
+        let points = (0..64).map(|i| Ok((x.checked_add(i%8*step).ok_or("display grid coordinates")?,
+            z.checked_add(i/8*step).ok_or("display grid coordinates")?))).collect::<Result<Vec<_>>>()?;
+        let hints = self.display_gpu_heights(&points, heights)?;
+        self.display_grid_impl(x, z, step, missing, Some(&hints))
+    }
+
+    fn display_grid_impl(&self, x: i32, z: i32, step: i32, missing: u64, heights: Option<&GpuHeights>) -> Result<Vec<SurfaceColumn>> {
         self.check_active()?;
         if !(1..=EXPERIMENTAL_MAX_STEP).contains(&step) {
             return Err("display grid spacing".into());
@@ -127,11 +150,20 @@ impl World {
             }
             points.push((xx, zz));
         }
-        if missing == u64::MAX { return self.display_points(&points); }
+        if missing == u64::MAX { return self.display_points_impl(&points, heights); }
         let count = missing.count_ones();
         let probes = if step >= 4 { 36 } else { 32 };
-        if count > probes && !self.terrain.graph.requires_complete_column_order() {
-            if let Some(grid) = self.adaptive_display_grid(&points)? {
+        // Java may have restored retained cells from disk or a parent grid,
+        // without warming this native cache. Do not regenerate those cells
+        // just to speculate on an interpolation that may be rejected.
+        let retained_probes = adaptive_probe_mask(step) & !missing;
+        let probes_available = if count > probes && retained_probes != 0 {
+            let cache = self.display_columns.lock().map_err(|_| "display cache lock")?;
+            (0..64).filter(|i| retained_probes & (1u64 << i) != 0).all(|i|
+                cache.get(&points[i]).is_some_and(|r| r.values[3] & (1 << 26) != 0))
+        } else { true };
+        if count > probes && probes_available && !self.terrain.graph.requires_complete_column_order() {
+            if let Some(grid) = self.adaptive_display_grid(&points, heights)? {
                 self.display_queries[0].fetch_add(count as u64, Ordering::Relaxed);
                 self.display_queries[2].fetch_add(1, Ordering::Relaxed);
                 return Ok(grid);
@@ -140,17 +172,60 @@ impl World {
         let indices: Vec<_> = (0..64).filter(|&i| missing & (1u64 << i) != 0).collect();
         let requests: Vec<_> = indices.iter().map(|&i| points[i]).collect();
         let mut result = vec![SurfaceColumn { values: [0; 10] }; 64];
-        for (i, value) in indices.into_iter().zip(self.display_points(&requests)?) {
+        for (i, value) in indices.into_iter().zip(self.display_points_impl(&requests, heights)?) {
             result[i] = value;
         }
         Ok(result)
     }
 
     pub fn display_points(&self, points: &[(i32, i32)]) -> Result<Vec<SurfaceColumn>> {
-        self.display_points_impl(points, true)
+        self.display_points_impl(points, None)
     }
 
-    fn display_points_impl(&self, points: &[(i32, i32)], reuse_exact: bool) -> Result<Vec<SurfaceColumn>> {
+    /// Only display records consume these boundaries; exact terrain caches and
+    /// surface/decoration APIs retain their original generation policy.
+    pub fn display_points_gpu(&self, points: &[(i32, i32)], heights: &[i32]) -> Result<Vec<SurfaceColumn>> {
+        let hints = self.display_gpu_heights(points, heights)?;
+        self.display_points_impl(points, Some(&hints))
+    }
+
+    fn display_gpu_heights(&self, points: &[(i32, i32)], heights: &[i32]) -> Result<GpuHeights> {
+        if !self.terrain.graph.is_modern() || points.len() != heights.len() || points.len() > 64
+            || points.iter().any(|&(x,z)| x.abs_diff(0)>29999990 || z.abs_diff(0)>29999990)
+            || heights.iter().any(|&h| h != i32::MIN && !(self.terrain.min_y..=self.terrain.min_y+self.terrain.height).contains(&h)) {
+            return Err("display GPU inputs".into());
+        }
+        Ok(points.iter().copied().zip(heights.iter().copied()).filter(|(_,h)| *h!=i32::MIN).collect())
+    }
+
+    /// Skip warm columns before submitting GPU work. This is a hint only: the
+    /// consuming display route rechecks cache, structure and surface admission.
+    pub fn display_gpu_mask(&self, points: &[(i32, i32)]) -> Result<u64> {
+        self.check_active()?;
+        if points.len()>64 || points.iter().any(|&(x,z)| x.abs_diff(0)>29999990 || z.abs_diff(0)>29999990) { return Err("display GPU mask inputs".into()); }
+        if !self.terrain.graph.is_modern() || self.terrain.graph.requires_complete_column_order() { return Ok(0); }
+        let cache=self.display_columns.lock().map_err(|_| "display cache lock")?;
+        Ok(points.iter().enumerate().fold(0, |mask,(i,&p)| {
+            if cache.contains_key(&p) || self.adjustments.contains_key(&(p.0>>4,p.1>>4)) { mask } else { mask | (1u64<<i) }
+        }))
+    }
+
+    /// Independent Cell-mode oracle for device admission, bypassing all display
+    /// caches. It also verifies chunk volume semantics at negative coordinates.
+    pub fn display_density_floors(&self, points: &[(i32, i32)]) -> Result<Vec<i32>> {
+        self.check_active()?;
+        if points.len()>64 || points.iter().any(|&(x,z)| x.abs_diff(0)>29999990 || z.abs_diff(0)>29999990) { return Err("display density inputs".into()); }
+        let mut job=None; let mut chunk=None; let mut result=Vec::with_capacity(points.len());
+        for &(x,z) in points {
+            self.check_active()?;
+            let key=(x>>4,z>>4);
+            if chunk!=Some(key) { job=Some(self.terrain.job(key.0*16,key.1*16,false)?);chunk=Some(key); }
+            result.push(job.as_mut().unwrap().density_surface(x,z).map_or(self.terrain.min_y, |y|y+1));
+        }
+        Ok(result)
+    }
+
+    fn display_points_impl(&self, points: &[(i32, i32)], heights: Option<&GpuHeights>) -> Result<Vec<SurfaceColumn>> {
         let _total_scope = crate::prof::Scope::new(&crate::prof::DISPLAY[0]);
         self.check_active()?;
         self.display_queries[0].fetch_add(points.len() as u64, Ordering::Relaxed);
@@ -174,7 +249,7 @@ impl World {
                 .map_err(|_| "display cache lock")?;
             if let Some(rows) = points
                 .iter()
-                .map(|p| cache.get(p).copied().filter(|r| reuse_exact || r.values[3] & (1 << 26) != 0))
+                .map(|p| cache.get(p).copied())
                 .collect::<Option<Vec<_>>>()
             {
                 self.display_queries[1].fetch_add(points.len() as u64, Ordering::Relaxed);
@@ -182,7 +257,7 @@ impl World {
             }
         }
         let adaptive_scope = crate::prof::Scope::new(&crate::prof::DISPLAY[2]);
-        let adaptive = self.adaptive_display_grid(points)?;
+        let adaptive = self.adaptive_display_grid(points, heights)?;
         adaptive_scope.finish();
         if let Some(grid) = adaptive {
             self.display_queries[2].fetch_add(1, Ordering::Relaxed);
@@ -198,7 +273,7 @@ impl World {
                 .lock()
                 .map_err(|_| "display cache lock")?;
             for (i, &(x, z)) in points.iter().enumerate() {
-                if let Some(value) = cache.get(&(x, z)).copied().filter(|r| reuse_exact || r.values[3] & (1 << 26) != 0) {
+                if let Some(value) = cache.get(&(x, z)).copied() {
                     self.display_queries[1].fetch_add(1, Ordering::Relaxed);
                     result[i] = value;
                 } else {
@@ -260,25 +335,28 @@ impl World {
                 self.terrain.job(cx * 16, cz * 16, false)?
             };
             job.display = eligible;
+            job.scratch.set_exact_dependencies(!eligible);
             // Whole-cell bounds pay off only when multiple requested columns
             // share a horizontal noise cell. Sparse grids keep column bounds.
             job.reuse_density_cells = indices.windows(2).any(|pair| {
                 let (a,b) = (points[pair[0]],points[pair[1]]);
-                a.0.div_euclid(t.cell_width) == b.0.div_euclid(t.cell_width)
-                    && a.1.div_euclid(t.cell_width) == b.1.div_euclid(t.cell_width)
+                a.0.div_euclid(t.surface_cell_width) == b.0.div_euclid(t.surface_cell_width)
+                    && a.1.div_euclid(t.surface_cell_width) == b.1.div_euclid(t.surface_cell_width)
             });
             job.beard = self.adjustments.get(&(cx, cz));
             self.attach_tops(&mut job);
 
             job_scope.finish();
+            // Shared material-height corners live only for this chunk group.
+            // They remain separate from the terrain job's Cell volume caches.
+            let mut material_workspace = None;
             for i in indices {
                 self.check_active()?;
                 let (x, z) = points[i];
-                let exact = if reuse_exact { self.cached_surface_point(x, z)? } else { None };
-                let row = match exact {
-                    Some(row) => row,
-                    None => match if eligible {
-                        self.display_record(x, z, &mut job, scratch)?
+                // The requested view determines the result. Exact cache warmth must not
+                // change visual ground or the placement of model vegetation.
+                let row = match if eligible {
+                        self.display_record(x, z, &mut job, scratch, heights, &mut material_workspace)?
                     } else {
                         None
                     } {
@@ -298,7 +376,6 @@ impl World {
                             job.display = display;
                             row
                         }
-                    },
                 };
                 result[i] = row;
             }
@@ -334,10 +411,12 @@ impl World {
         z: i32,
         job: &mut Job<'_>,
         scratch: &mut crate::density::Scratch,
+        heights: Option<&GpuHeights>,
+        material_workspace: &mut Option<crate::density::Scratch>,
     ) -> Result<Option<SurfaceColumn>> {
         let t = &self.terrain;
         if job.display {
-            return self.display_density_record(x, z, job, scratch);
+            return self.display_density_record(x, z, job, scratch, heights, material_workspace);
         }
         let Some((mut y, mut block)) = job.surface_top(x, z) else {
             return Ok(None);
@@ -384,7 +463,6 @@ impl World {
         // Summarize the three visible material depths instead of filling a
         // column and locating four independent neighbour tops. Steep rules
         // retain a local density slope test, with the same original graph.
-        let steep = job.display_steep(x, y, z);
         let materials = self.surface.display_materials(
             t,
             x,
@@ -394,7 +472,8 @@ impl World {
             name,
             biome,
             &self.colors,
-            steep,
+            || job.display_steep(x, y, z),
+            material_workspace,
         );
         if materials
             .iter()
@@ -419,11 +498,14 @@ impl World {
     fn display_density_record(
         &self, x: i32, z: i32, job: &mut Job<'_>,
         scratch: &mut crate::density::Scratch,
+        heights: Option<&GpuHeights>,
+        material_workspace: &mut Option<crate::density::Scratch>,
     ) -> Result<Option<SurfaceColumn>> {
         let _record_scope = crate::prof::Scope::new(&crate::prof::DISPLAY[6]);
         let t = &self.terrain;
         let boundary_scope=crate::prof::Scope::new(&crate::prof::DISPLAY[9]);
-        let floor = job.density_surface(x, z).map_or(t.min_y, |y| y + 1);
+        let floor = heights.and_then(|h| h.get(&(x,z))).copied()
+            .unwrap_or_else(|| job.density_surface(x, z).map_or(t.min_y, |y| y + 1));
         boundary_scope.finish();
         let biome_scope=crate::prof::Scope::new(&crate::prof::DISPLAY[10]);
         let (fluid_y, fluid) = t.preview_fluid(floor);
@@ -454,7 +536,7 @@ impl World {
         } else {
             self.surface.display_materials(t, x, z, floor,
                 if fluid == 0 { i32::MIN } else { fluid_y }, name, biome,
-                &self.colors, job.display_steep(x, floor - 1, z))
+                &self.colors, || job.display_steep(x, floor - 1, z), material_workspace)
         };
         if floor != t.min_y && materials.iter().any(|&id| self.palette.is_air(id) || self.palette.fluid(id)) {
             return Ok(None);
@@ -473,7 +555,7 @@ impl World {
          self.display_queries[4].load(Ordering::Relaxed)]
     }
 
-    fn adaptive_display_grid(&self, points: &[(i32, i32)]) -> Result<Option<Vec<SurfaceColumn>>> {
+    fn adaptive_display_grid(&self, points: &[(i32, i32)], heights: Option<&GpuHeights>) -> Result<Option<Vec<SurfaceColumn>>> {
         if points.len() != 64
             || points
                 .iter()
@@ -499,23 +581,13 @@ impl World {
         }
         // Borders are exact display queries so adjacent batches always share
         // the same seam. Four centre probes reject curvature/material changes.
-        let indices: Vec<_> = (0..64)
-            .filter(|i| {
-                let x = i % 8;
-                let z = i / 8;
-                x == 0 || x == 7 || z == 0 || z == 7
-                    || ((x == 3 || x == 4) && (z == 3 || z == 4))
-                    // Four extra probes are only needed for the new step=4
-                    // path. They catch a narrow interior ridge without
-                    // turning the grid back into a full 64-point query.
-                    || (step >= 4 && (x == 2 || x == 5) && (z == 2 || z == 5))
-            })
-            .collect();
+        let mask = adaptive_probe_mask(step);
+        let indices: Vec<_> = (0..64).filter(|i| mask & (1u64 << i) != 0).collect();
         let probes: Vec<_> = indices.iter().map(|&i| points[i]).collect();
         // A previously exact point has different provenance flags. Evaluate
         // probes consistently under the visual policy; the Java caller still
         // retains its exact cells, and these results never enter exact caches.
-        let values = self.display_points_impl(&probes, false)?;
+        let values = self.display_points_impl(&probes, heights)?;
         let first = values[0].values;
         if first[3] & (1 << 29) != 0
             || first[3] & (1 << 26) == 0
@@ -594,7 +666,8 @@ impl World {
     }
     fn check_display_liquids(&self) -> bool {
         let s = &self.document["settings"];
-        if s["aquifers_enabled"].as_bool() == Some(false) {
+        let modern = self.terrain.graph.is_modern();
+        if if modern { s["aquifers"].is_null() } else { s["aquifers_enabled"].as_bool() == Some(false) } {
             return true;
         }
         // Only the vanilla fluid router qualifies for the dry-land shortcut.
@@ -609,6 +682,7 @@ impl World {
             }
             None
         }
+        let router = if modern { &s["aquifers"] } else { &s["noise_router"] };
         for (key, noise, scale, octave) in [
             ("barrier", "minecraft:aquifer_barrier", 0.5, -3),
             (
@@ -625,22 +699,49 @@ impl World {
             ),
             ("lava", "minecraft:aquifer_lava", 1., -1),
         ] {
-            let Some(v) = resolve(&self.document, &s["noise_router"][key]) else {
+            let Some(v) = resolve(&self.document, &router[key]) else {
                 return false;
             };
             if v["type"] != "minecraft:noise"
                 || v["noise"] != noise
                 || v["xz_scale"].as_f64() != Some(1.)
-                || v["y_scale"].as_f64() != Some(scale)
+                || if modern { v["y_scale"].as_f64().map(|n|n as f32) != Some(scale as f32) }
+                   else { v["y_scale"].as_f64() != Some(scale) }
             {
                 return false;
             }
             let definition = &self.document["noises"][noise];
-            if definition["firstOctave"].as_i64() != Some(octave)
-                || definition["amplitudes"] != json!([1.])
-            {
+            let vanilla = if modern {
+                definition["base_octave"].as_i64() == Some(octave)
+                    && definition["base_amplitude"].as_f64() == Some(0.955388882960065)
+            } else {
+                definition["firstOctave"].as_i64() == Some(octave) && definition["amplitudes"] == json!([1.])
+            };
+            if !vanilla {
                 return false;
             }
+        }
+        if modern {
+            // 26.3 also makes the exclusion and surface sampler configurable.
+            // Keep customized fluid policies on the existing band validation.
+            fn same(doc:&Value,a:&Value,b:&Value,depth:usize)->bool {
+                if depth==0 {return false;}
+                if a==b {return true;}
+                let (Some(a),Some(b))=(resolve(doc,a),resolve(doc,b)) else {return false;};
+                match (a,b) {
+                    (Value::Number(a),Value::Number(b))=>a.as_f64().map(|n|n as f32)==b.as_f64().map(|n|n as f32),
+                    (Value::Object(a),Value::Object(b))=>a.len()==b.len()&&a.iter().all(|(k,v)|b.get(k).is_some_and(|w|same(doc,v,w,depth-1))),
+                    _=>a==b,
+                }
+            }
+            let noise=&s["noise_router"];
+            let exclusion=json!({"type":"minecraft:min",
+                "left":{"type":"minecraft:sub","left":-0.225,"right":noise["erosion"]},
+                "right":{"type":"minecraft:max","left":{"type":"minecraft:sub","left":noise["depth"],"right":0.9},"right":0.0}});
+            if !same(&self.document,&router["exclusion"],&exclusion,64) {return false;}
+            let Some(surface)=resolve(&self.document,&noise["chunk_surface_level"]) else {return false;};
+            if surface["type"]!="minecraft:interpolated" || surface["cell_size_xz"]!=16 || surface["cell_size_y"]!=1
+                || !same(&self.document,&router["surface_level"],&surface["input"],64) {return false;}
         }
         true
     }
@@ -649,6 +750,44 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn visual_columns_ignore_exact_cache_warmup_and_eviction() {
+        let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/worldgen");
+        let read=|f:&str|serde_json::from_str::<Value>(&std::fs::read_to_string(root.join(f)).unwrap()).unwrap();
+        let mut doc=read("overworld.json");
+        for(k,f)in[("block_definitions","blocks.json"),("biomes","biomes.json"),
+            ("grass_colormap","grass.json"),("foliage_colormap","foliage.json")] {doc[k]=read(f);}
+        for seed in [0,42] {
+            let cold=World::new(seed,seed,doc.clone()).unwrap();
+            let warm=World::new(seed,seed,doc.clone()).unwrap();
+            let points:Vec<_>=(0..16).map(|i|(100000+i/4,-100000+i%4)).collect();
+            let expected=cold.display_points(&points).unwrap();
+            warm.surface_points(&points).unwrap();
+            assert_eq!(warm.display_points(&points).unwrap().iter().map(|r|r.values).collect::<Vec<_>>(),
+                expected.iter().map(|r|r.values).collect::<Vec<_>>());
+            cold.surface_points(&points).unwrap();
+            cold.display_columns.lock().unwrap().clear();
+            assert_eq!(cold.display_points(&points).unwrap().iter().map(|r|r.values).collect::<Vec<_>>(),
+                expected.iter().map(|r|r.values).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn exact_page_matches_scalar_requests_in_reverse_order() {
+        let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/worldgen");
+        let read=|f:&str|serde_json::from_str::<Value>(&std::fs::read_to_string(root.join(f)).unwrap()).unwrap();
+        let mut doc=read("overworld.json");
+        for(k,f)in[("block_definitions","blocks.json"),("biomes","biomes.json"),
+            ("grass_colormap","grass.json"),("foliage_colormap","foliage.json")] {doc[k]=read(f);}
+        let batch=World::new(42,42,doc.clone()).unwrap();
+        let scalar=World::new(42,42,doc).unwrap();
+        let points:Vec<_>=(0..16).map(|i|(-20+i/4,-36+i%4)).collect();
+        let rows=batch.surface_points(&points).unwrap();
+        for(i,&(x,z))in points.iter().enumerate().rev() {
+            assert_eq!(rows[i].values,scalar.surface_point(x,z).unwrap().values,"point={x},{z}");
+        }
+    }
+
     #[test]
     fn display_cache_overflow_preserves_other_columns_and_updates_do_not_duplicate_fifo() {
         let mut cache = DisplayColumns::new(65536);
@@ -684,8 +823,8 @@ mod tests {
                 let mut a = t.job(x & !15,z & !15,false).unwrap();
                 let mut b = t.job(x & !15,z & !15,false).unwrap();
                 a.display = w.display_liquids_supported(); b.display = a.display;
-                let expected = w.display_record(x,z,&mut a,&mut full).unwrap();
-                let actual = w.display_record(x,z,&mut b,&mut raw).unwrap();
+                let expected = w.display_record(x,z,&mut a,&mut full,None,&mut None).unwrap();
+                let actual = w.display_record(x,z,&mut b,&mut raw,None,&mut None).unwrap();
                 assert_eq!(actual.map(|v|v.values),expected.map(|v|v.values),"seed={seed},point={x},{z}");
                 // The exact exterior fallback uses this same workspace only for biomes.
                 a.display=false; b.display=false;
@@ -707,7 +846,7 @@ mod tests {
         for i in 0..256 {
             let(x,z)=(100000+i%16*64,100000+i/16*64);
             let mut job=world.terrain.job(x,z,false).unwrap();job.display=true;
-            if let Some(row)=world.display_record(x,z,&mut job,&mut scratch).unwrap() {
+            if let Some(row)=world.display_record(x,z,&mut job,&mut scratch,None,&mut None).unwrap() {
                 let v=row.values;let expected=world.record_surface(x,z,v[0],v[1],v[2],[v[4]as u32,v[5]as u32,v[6]as u32],&mut scratch,&mut None).unwrap();
                 assert_eq!(row.values,expected.values,"point={x},{z}");
                 if v[2]==0 {dry+=1;}else{liquid+=1;}
@@ -752,5 +891,65 @@ mod tests {
             row.is_some(),
             "ordinary surface rules must support display records, preliminary={h}"
         );
+    }
+
+    #[test]
+    fn modern_aquifer_admission_uses_current_fields_and_checks_custom_policies() {
+        let mut doc:Value=serde_json::from_str(include_str!("../../tests/fixtures/worldgen263/features.json")).unwrap();
+        let overworld:Value=serde_json::from_str(include_str!("../../tests/fixtures/worldgen263/overworld.json")).unwrap();
+        for key in ["vss_density_semantics","settings","density_functions","noises"] {doc[key]=overworld[key].clone();}
+        doc["biome_source"]=json!({"type":"minecraft:fixed","biome":"minecraft:plains"});
+        doc["possible_biomes"]=json!(["minecraft:plains"]);
+        assert!(World::new(0,0,doc.clone()).unwrap().display_liquids_supported());
+        for (field,value) in [("exclusion",json!(1.0)),("surface_level",json!(100.0))] {
+            let mut custom=doc.clone();custom["settings"]["aquifers"][field]=value;
+            custom["settings"]["aquifers_enabled"]=json!(false); // Obsolete modern flag has no authority.
+            assert!(!World::new(0,0,custom).unwrap().display_liquids_supported(),"custom {field}");
+        }
+        let mut custom=doc.clone();custom["noises"]["minecraft:aquifer_barrier"]["base_amplitude"]=json!(0.5);
+        assert!(!World::new(0,0,custom).unwrap().display_liquids_supported());
+        let mut disabled=doc;disabled["settings"]["aquifers"]=Value::Null;
+        assert!(World::new(0,0,disabled).unwrap().display_liquids_supported());
+    }
+
+    #[test]
+    fn modern_material_batch_workspace_matches_fresh_columns_and_stays_bounded() {
+        let base: Value = serde_json::from_str(include_str!("../../tests/fixtures/worldgen263/features.json")).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/worldgen263");
+        let mut checked = 0;
+        for file in ["overworld.json", "nether.json", "end.json"] {
+            let density: Value = serde_json::from_slice(&std::fs::read(root.join(file)).unwrap()).unwrap();
+            let mut doc = base.clone();
+            for key in ["vss_density_semantics", "settings", "density_functions", "noises"] {
+                doc[key] = density[key].clone();
+            }
+            doc["biome_source"] = json!({"type":"minecraft:fixed","biome":"minecraft:plains"});
+            doc["possible_biomes"] = json!(["minecraft:plains"]);
+            for seed in [0, -917] {
+                let world = World::new(seed, 0, doc.clone()).unwrap();
+                let t = &world.terrain;
+                let biome = world.biomes.get("minecraft:plains").unwrap();
+                for (cx, cz) in [(-2, 1), (6250, -6250)] {
+                    let mut shared = None;
+                    // Reversed traversal and a revisit exercise memo replacement
+                    // without assuming column order or monotone surface heights.
+                    for i in (0..256).rev().chain([0, 255, 17]) {
+                        let (x, z) = (cx * 16 + i % 16, cz * 16 + i / 16);
+                        let floor = t.min_y + 8 + (i * 17) % (t.height - 8);
+                        let water = if i % 2 == 0 { i32::MIN } else { floor + 4 };
+                        let steep = i % 3 == 0;
+                        let material = |workspace: &mut Option<crate::density::Scratch>| world.surface.display_materials(t, x, z,
+                            floor, water, "minecraft:plains", biome, &world.colors, || steep, workspace);
+                        let expected = material(&mut None);
+                        assert_eq!(material(&mut shared), expected, "{file} seed={seed} {x},{z}");
+                        checked += 1;
+                    }
+                    let shared = shared.expect("modern material work must actually be reused");
+                    assert!(shared.modern_volume.is_none(), "terrain Cell volume must stay separate");
+                    assert!(shared.retained_bytes() < 4 * 1024 * 1024);
+                }
+            }
+        }
+        assert_eq!(checked, 3108);
     }
 }

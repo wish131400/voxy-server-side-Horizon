@@ -49,10 +49,18 @@ class PredictionCaptureStageTest {
             assertEquals(0, colored.get(), "stale samples must never enter tint/decoration work");
             assertEquals(0, manager.readyCount());
             assertEquals(0, budget.usedBytes(), "aborted work must release its reservation");
+            invalidated.set(false);
+            enqueue.invoke(manager, target, 0, 0, false, false);
+            awaitIdle(manager);
+            assertEquals(2, sampled.get());
+            PredictionCaptureRefresh refresh = field(manager, "captureRefresh");
+            assertTrue(refresh.defer(target, System.nanoTime()),
+                    "a cancelled build must not reset the capture burst before the next capture");
             enqueue.invoke(manager, target, 0, 0, false, false);
             awaitIdle(manager);
             assertEquals(1, manager.readyCount(), manager.surfaceDiagnostics());
             assertEquals(0, manager.failedTileCount());
+            assertFalse(refresh.defer(target, System.nanoTime()), "only a current publication completes the burst");
         } finally {
             config.predictionDistanceBlocks = distance;
         }
@@ -66,6 +74,66 @@ class PredictionCaptureStageTest {
         var plants = new PredictionVegetation(source);
         assertThrows(CancellationException.class,
                 () -> plants.tile(0, 0, 64, 1, true, (x, z) -> false, () -> false));
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void waitingQueueReorderPreservesExecutingDetailButNavigationStillCancelsIt(boolean navigation) throws Exception {
+        var current = new AtomicReference<PredictionTileManager>();
+        var target = new PredictionTileManager.PredictionTileKey(Level.OVERWORLD, 0, 0, 0);
+        var sampled = new AtomicInteger();
+        var changed = new AtomicBoolean();
+        var source = new ClientTerrainSampler(42, PredictionDecorationQueryTest.PROFILE) {
+            @Override public ClientColumnSample sample(int x, int z) {
+                sampled.incrementAndGet();
+                if (changed.compareAndSet(false, true)) {
+                    var manager = current.get();
+                    synchronized (manager) {
+                        try {
+                            PredictionCaptureStageTest.<Set<?>>field(manager, "voxyDetailTargets").remove(target);
+                            PredictionCaptureStageTest.<Set<?>>field(manager, "desiredKeys").remove(target);
+                            if (navigation) {
+                                var abandon = PredictionTileManager.class.getDeclaredMethod("abandonOldViewWork");
+                                abandon.setAccessible(true); abandon.invoke(manager);
+                            }
+                        } catch (ReflectiveOperationException error) { throw new AssertionError(error); }
+                    }
+                }
+                return PredictionVoxelFixtures.sample(120);
+            }
+            @Override public ClientColumnSample sampleSurface(int x, int z) { return sample(x, z); }
+            @Override public ClientColumnSample sampleForLod(int x, int z, int step) { return sample(x, z); }
+            @Override int surfaceColorForLod(int x, int y, int z, boolean preview) { return 0xff669944; }
+            @Override int foliageColorForLod(int x, int y, int z, boolean preview) { return 0xff669944; }
+        };
+        var budget = new PredictionMemoryBudget(2048L * PredictionMemoryBudget.MIB, 0,
+                () -> Long.MAX_VALUE, System::nanoTime, 1);
+        try (var manager = new PredictionTileManager(Level.OVERWORLD, source, budget, null,
+                new PredictionCpuBudget(() -> 8, System::nanoTime))) {
+            current.set(manager);
+            var unified = PredictionTileManager.class.getDeclaredField("unifiedVoxy");
+            unified.setAccessible(true); unified.setBoolean(manager, true);
+            PredictionCaptureStageTest.<Set<PredictionTileManager.PredictionTileKey>>field(manager, "voxyDetailTargets").add(target);
+            PredictionCaptureStageTest.<Set<PredictionTileManager.PredictionTileKey>>field(manager, "desiredKeys").add(target);
+            var enqueue = PredictionTileManager.class.getDeclaredMethod("enqueue",
+                    PredictionTileManager.PredictionTileKey.class, int.class, int.class, boolean.class, boolean.class);
+            enqueue.setAccessible(true); enqueue.invoke(manager, target, 0, 0, false, false);
+            awaitIdle(manager);
+            assertTrue(sampled.get() > 0, "the queue change must happen after sampling starts");
+            assertEquals(navigation ? 0 : 1, manager.readyCount(), manager.surfaceDiagnostics());
+            if (!navigation) assertEquals(manager.layout().cellAxis(0), manager.readyTiles().iterator().next().cellAxis(),
+                    "an executing native detail request retains its full target after admission reorder");
+            assertTrue(PredictionCaptureStageTest.<Set<?>>field(manager, "runningVoxyDetails").isEmpty(),
+                    "execution pin releases on both completion and cancellation");
+            assertEquals(0, manager.failedTileCount());
+        }
+        assertEquals(0, budget.usedBytes());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> T field(Object owner, String name) throws ReflectiveOperationException {
+        var field = owner.getClass().getDeclaredField(name);
+        field.setAccessible(true); return (T) field.get(owner);
     }
 
     private static void awaitIdle(PredictionTileManager manager) throws InterruptedException {

@@ -145,6 +145,7 @@ impl ImprovedNoise {
         derivative[2] += gradients[2] + smooth_derivative(z) * dz;
         lerp3(sx, sy, sz, dots)
     }
+    #[inline(always)]
     pub fn sample_scaled(&self, x: f64, y: f64, z: f64, y_scale: f64, y_max: f64) -> f64 {
         let x = x + self.offsets[0];
         let y = y + self.offsets[1];
@@ -205,6 +206,9 @@ impl ImprovedNoise {
 #[derive(Clone)]
 pub struct SimplexNoise(ImprovedNoise);
 impl SimplexNoise {
+    pub(crate) fn vulkan_permutation(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.p.iter().map(|v| *v as u32)
+    }
     pub fn new(random: &mut Random) -> Self {
         Self(ImprovedNoise::new(random))
     }
@@ -218,6 +222,20 @@ impl SimplexNoise {
         }
     }
     pub fn sample2(&self, x: f64, y: f64) -> f64 {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            // SAFETY: preserve the scalar algorithm under the checked ISA.
+            return unsafe { self.sample2_sse41(x, y) };
+        }
+        self.sample2_inner(x, y)
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn sample2_sse41(&self, x: f64, y: f64) -> f64 {
+        self.sample2_inner(x, y)
+    }
+    #[inline(always)]
+    fn sample2_inner(&self, x: f64, y: f64) -> f64 {
         let f = 0.5 * (3.0_f64.sqrt() - 1.0);
         let g = (3.0 - 3.0_f64.sqrt()) / 6.0;
         let skew = (x + y) * f;
@@ -351,6 +369,7 @@ impl PerlinNoise {
             value: 2.0_f64.powi(n as i32 - 1) / (2.0_f64.powi(n as i32) - 1.0),
         })
     }
+    #[inline(always)]
     pub fn sample(&self, x: f64, y: f64, z: f64) -> f64 {
         self.sample_scaled(x, y, z, 0.0, 0.0, false)
     }
@@ -370,6 +389,7 @@ impl PerlinNoise {
         }
         result
     }
+    #[inline(always)]
     pub fn sample_scaled(
         &self,
         x: f64,
@@ -508,6 +528,20 @@ impl NormalNoise {
         })
     }
     pub fn sample(&self, x: f64, y: f64, z: f64) -> f64 {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            // SAFETY: the feature is checked once for this complete stack.
+            return unsafe { self.sample_sse41(x, y, z) };
+        }
+        self.sample_inner(x, y, z)
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn sample_sse41(&self, x: f64, y: f64, z: f64) -> f64 {
+        self.sample_inner(x, y, z)
+    }
+    #[inline(always)]
+    fn sample_inner(&self, x: f64, y: f64, z: f64) -> f64 {
         const SCALE: f64 = 1.0181268882175227;
         (self.first.sample(x, y, z) + self.second.sample(x * SCALE, y * SCALE, z * SCALE))
             * self.factor
@@ -529,3 +563,7 @@ impl NormalNoise {
 }
 
 pub mod modern;
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+#[path = "noise_cpu_tests.rs"]
+mod cpu_dispatch_tests;

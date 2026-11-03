@@ -222,7 +222,7 @@ def validate_remapped_vss(path, minecraft, expected=None):
 
 
 def run(minecraft, artifacts_path, inputs_path, base, gradle_home, java, without_iris=False,
-        runtime_directory=None):
+        runtime_directory=None, sodium_options=False):
     artifacts = json.loads(Path(artifacts_path).read_text())
     if artifacts["minecraft"] != minecraft:
         raise ValueError("Wrong remapped smoke artifact target")
@@ -275,6 +275,8 @@ def run(minecraft, artifacts_path, inputs_path, base, gradle_home, java, without
                "--versionType", "release", "--width", "854", "--height", "480"]
     if os_name() == "osx":
         command.insert(1, "-XstartOnFirstThread")
+    if sodium_options:
+        command.insert(1, "-Dvss.smoke.sodiumOptions=true")
     log_path = report_path.with_suffix(".log")
     result = {"minecraft": minecraft, "runtime": "production", "development": False,
               "gameplayValidated": False, "irisInstalled": "iris" in selected,
@@ -305,8 +307,9 @@ if __name__ == "__main__":
                     if os.environ.get("JAVA_HOME") else Path(shutil.which("java") or "java"))
     parser.add_argument("--java", type=Path, default=default_java)
     parser.add_argument("--without-iris", action="store_true")
+    parser.add_argument("--sodium-options", action="store_true")
     args = parser.parse_args()
     result = run(args.minecraft, args.artifacts, args.inputs, args.destination, args.gradle_user_home,
-                 args.java, args.without_iris, args.runtime_directory)
+                 args.java, args.without_iris, args.runtime_directory, args.sodium_options)
     print(json.dumps(result, indent=2))
     raise SystemExit(0 if result["passed"] else 1)

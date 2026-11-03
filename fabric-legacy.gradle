@@ -31,8 +31,8 @@ repositories {
 dependencies {
     minecraft "com.mojang:minecraft:${selectedMinecraft}"
     mappings loom.officialMojangMappings()
-    modImplementation "net.fabricmc:fabric-loader:${loader_version}"
-    modImplementation "net.fabricmc.fabric-api:fabric-api:${selectedTarget.api}"
+    modImplementation "net.fabricmc:fabric-loader:${fabricCompileLoader}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${fabricCompileApi}"
     modCompileOnly "maven.modrinth:modmenu:${selectedTarget.menu}"
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
     testImplementation 'org.mockito:mockito-core:5.23.0'
@@ -108,10 +108,10 @@ sourceSets.main.resources.setSrcDirs(overlays.collect { new File(it, 'resources'
 tasks.named('processResources', ProcessResources).configure {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     inputs.properties(version: project.version, minecraft_version: selectedMinecraft,
-            loader_version: loader_version, fabric_version: selectedTarget.api, java_version: java_version)
+            loader_min_version: fabricLoaderMinimum, fabric_min_version: fabricApiMinimum, java_version: java_version)
     filesMatching('fabric.mod.json') {
         expand(version: project.version, minecraft_version: selectedMinecraft,
-                loader_version: loader_version, fabric_version: selectedTarget.api, java_version: java_version)
+                loader_min_version: fabricLoaderMinimum, fabric_min_version: fabricApiMinimum, java_version: java_version)
     }
 }
 

@@ -10,7 +10,7 @@
     "client": ["dev.xantha.vss.smoke.VSSClientSmoke"]
   },
   "depends": {
-    "fabricloader": ">=0.18.4",
+    "fabricloader": ">=0.17.3",
     "fabric-api": "*",
     "minecraft": "*",
     "java": ">=21"

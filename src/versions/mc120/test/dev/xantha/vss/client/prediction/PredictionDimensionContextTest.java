@@ -23,7 +23,7 @@ class PredictionDimensionContextTest {
         var sampler = sampler(ResourceLocation.parse("vss:custom_world"), access);
         var root = new JsonObject();
         root.add("vss_dimension_type", DimensionType.DIRECT_CODEC.encodeStart(JsonOps.INSTANCE, nether).getOrThrow(false, message -> { throw new IllegalArgumentException(message); }));
-        sampler.bindDimensionType(root);
+        sampler.bindDimensionType(root, dimensionOps());
         assertEquals(encoded(nether), encoded(sampler.dimensionTypeContext()));
         var wrapped = ClientTerrainSampler.withSurfaceOverride(sampler, (x, z) -> 70);
         assertSame(sampler.dimensionTypeContext(), wrapped.dimensionTypeContext());
@@ -42,7 +42,7 @@ class PredictionDimensionContextTest {
         var type = access.registryOrThrow(Registries.DIMENSION_TYPE).getOrThrow(BuiltinDimensionTypes.END);
         var root = new JsonObject();
         root.add("vss_dimension_type", DimensionType.DIRECT_CODEC.encodeStart(JsonOps.INSTANCE, type).getOrThrow(false, message -> { throw new IllegalArgumentException(message); }));
-        nativeAdapter.bindDimensionType(root);
+        nativeAdapter.bindDimensionType(root, dimensionOps());
         assertEquals(encoded(type), encoded(java.dimensionTypeContext()));
     }
 
@@ -65,10 +65,45 @@ class PredictionDimensionContextTest {
         assertNull(PredictionWorldgenCapabilities.nativeTerrainRejection(document, new JsonObject()));
         try (var baseline = new RustTerrainSampler(RustWorldgenBackend.create(42,0,original.toString()),java.profile(),java);
              var nativeSampler = new RustTerrainSampler(RustWorldgenBackend.create(42,0,document.toString()),java.profile(),java)) {
-            nativeSampler.bindDimensionType(document);
+            nativeSampler.bindDimensionType(document, dimensionOps());
             assertEquals(encoded(type), encoded(nativeSampler.decorationContext().dimensionTypeContext()));
             assertEquals(baseline.sample(17,-19), nativeSampler.sample(17,-19), "structure metadata cannot change native terrain");
         }
+    }
+
+    @Test void cacheOnlyContextBindsSyncedDimensionWithoutAGenerationContext() {
+        var access = TerrainPredictionFixtures.access();
+        var profile = new DimensionProfile(ResourceLocation.parse("vss:custom_world"), 42, -64, 384,
+                "noise", "minecraft:overworld", 1);
+        var source = new net.minecraft.world.level.biome.FixedBiomeSource(
+                access.registryOrThrow(Registries.BIOME).getHolderOrThrow(net.minecraft.world.level.biome.Biomes.PLAINS));
+        var cached = new PredictionCacheSampler(profile, source, new JsonObject());
+        var type = access.registryOrThrow(Registries.DIMENSION_TYPE).getOrThrow(BuiltinDimensionTypes.NETHER);
+        var root = new JsonObject();
+        root.add("vss_dimension_type", encoded(type));
+        assertNull(cached.decorationAccess());
+        cached.bindDimensionType(root, dimensionOps());
+        assertEquals(encoded(type), encoded(cached.dimensionTypeContext()));
+        var wrapped = ClientTerrainSampler.withSurfaceOverride(cached, (x, z) -> 70);
+        assertSame(cached.dimensionTypeContext(), wrapped.dimensionTypeContext());
+        assertNull(cached.generatorContext());
+        assertNull(cached.randomStateContext());
+        assertThrows(IllegalStateException.class, () -> cached.sample(0, 0));
+        assertThrows(IllegalStateException.class, () -> cached.surfaceY(0, 0));
+    }
+
+    @Test void invalidDimensionMetadataCannotSilentlySelectAnotherDimension() {
+        var sampler = new ClientTerrainSampler(42, new DimensionProfile(ResourceLocation.parse("vss:custom_world"),
+                42, -64, 384, "noise", "minecraft:overworld", 1));
+        var root = new JsonObject();
+        root.addProperty("vss_dimension_type", "invalid");
+        assertThrows(RuntimeException.class, () -> sampler.bindDimensionType(root, dimensionOps()));
+        assertThrows(UnsupportedOperationException.class, sampler::dimensionTypeContext);
+    }
+
+    private static com.mojang.serialization.DynamicOps<com.google.gson.JsonElement> dimensionOps() {
+        return ClientWorldgenRegistries.decode(TerrainPredictionFixtures.emptyRegistries(),
+                TerrainPredictionFixtures.access()).ops();
     }
 
     private static com.google.gson.JsonElement encoded(DimensionType type) {

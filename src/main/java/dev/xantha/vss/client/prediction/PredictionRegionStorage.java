@@ -99,7 +99,7 @@ final class PredictionRegionStorage implements AutoCloseable {
                 }
             } finally { release(region); }
             Path old = legacy(key);
-            if (!Files.isRegularFile(old)) return null;
+            if (!old.toFile().isFile()) return null;
             try {
                 long size = Files.size(old);
                 if (size <= 0 || size > MAX_RECORD_BYTES) throw new IOException("legacy cache size");
@@ -118,7 +118,7 @@ final class PredictionRegionStorage implements AutoCloseable {
                 if (entry != null) return entry.deleted ? null : entry.header.clone();
             } finally { release(region); }
             Path old = legacy(key);
-            if (!Files.isRegularFile(old)) return null;
+            if (!old.toFile().isFile()) return null;
             try (var in = new InflaterInputStream(new BufferedInputStream(Files.newInputStream(old)))) {
                 byte[] bytes = in.readNBytes(36);
                 if (bytes.length != 36) throw new EOFException("legacy cache header");
@@ -387,9 +387,9 @@ final class PredictionRegionStorage implements AutoCloseable {
     }
 
     private Region loadRegion(Path path, boolean create) throws IOException {
-        if (!Files.exists(path)) {
+        if (!path.toFile().exists()) {
             if (!create) return null;
-            if (!Files.isDirectory(path.getParent())) Files.createDirectories(path.getParent());
+            if (!path.getParent().toFile().isDirectory()) Files.createDirectories(path.getParent());
             Path temporary = Files.createTempFile(path.getParent(), "region-init-", ".tmp");
             try {
                 try (var f = new RandomAccessFile(temporary.toFile(), "rw")) { initialize(f); f.getChannel().force(true); }

@@ -1,0 +1,27 @@
+// Execute the real climate Mixin from a named offline copy of a Fabric 1.21.1 release.
+// Original downloaded JARs remain unchanged; remap_worldgen_test_jar.py prepares the copy.
+allprojects {
+    afterEvaluate {
+        tasks.register('ftfClimateMixinTest', Test) {
+            dependsOn tasks.named('testClasses')
+            testClassesDirs = sourceSets.test.output.classesDirs
+            classpath = sourceSets.test.runtimeClasspath
+            useJUnitPlatform()
+            include '**/FreeTerraForgedClimateMixinTest.class'
+            // Keep real Sponge global state out of ordinary optional-mod suites.
+            systemProperty 'vss.ftfClimateMixin', 'true'
+            doFirst {
+                if (selectedMinecraft != '1.21.1') throw new GradleException('FTF release target must be Fabric 1.21.1')
+                def released = project.file(providers.gradleProperty('vssFreeTerraForgedJar').get())
+                if (!released.isFile()) throw new GradleException('Released FTF test JAR not found: ' + released)
+                systemProperty 'vss.freeTerraForgedJar', released.absolutePath
+                if (providers.gradleProperty('vssFtfEvidenceDirectory').isPresent()) {
+                    systemProperty 'vss.ftfEvidenceDirectory', project.file(providers.gradleProperty('vssFtfEvidenceDirectory').get()).absolutePath
+                }
+            }
+            maxParallelForks = 1
+            maxHeapSize = '2G'
+            testLogging { events 'failed', 'skipped'; exceptionFormat 'full' }
+        }
+    }
+}

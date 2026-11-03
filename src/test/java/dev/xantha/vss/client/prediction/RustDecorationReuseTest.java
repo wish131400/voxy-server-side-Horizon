@@ -28,13 +28,23 @@ class RustDecorationReuseTest {
     }
 
     private static RustTerrainSampler sampler(boolean orientedSurface, boolean interior) throws Exception {
-        var doc = interior ? PredictionNetherDecorationTest.nativeDocument("minecraft:nether_wastes")
+        var doc = interior ? com.google.gson.JsonParser.parseString(java.nio.file.Files.readString(
+                java.nio.file.Path.of("tools/rust/vss-native-core/tests/fixtures/worldgen/nether.json"))).getAsJsonObject()
                 : LithostitchedNativeTest.document();
+        if (interior) {
+            var common=LithostitchedNativeTest.document();
+            for (String key: new String[]{"block_definitions","biomes","grass_colormap","foliage_colormap"})
+                doc.add(key,common.get(key));
+        }
         doc.add("possible_biomes", new JsonArray());
         if (orientedSurface) {
-            doc.getAsJsonObject("settings").add("surface_rule", com.google.gson.JsonParser.parseString("""
-                    {"type":"minecraft:block","result_state":{"Name":"minecraft:oak_log","Properties":{"axis":"x"}}}
-                    """));
+            var settings = doc.getAsJsonObject("settings");
+            var rule = new com.google.gson.JsonObject();
+            rule.addProperty("type", "minecraft:block");
+            rule.add("result_state", BlockState.CODEC.encodeStart(com.mojang.serialization.JsonOps.INSTANCE,
+                    Blocks.OAK_LOG.defaultBlockState().setValue(net.minecraft.world.level.block.RotatedPillarBlock.AXIS,
+                            net.minecraft.core.Direction.Axis.X)).result().orElseThrow());
+            settings.add(settings.has("material_rule") ? "material_rule" : "surface_rule", rule);
         }
         var profile = new DimensionProfile(Identifier.withDefaultNamespace(interior ? "the_nether" : "overworld"),
                 interior ? 0 : -64, interior ? 256 : 384, "noise", interior ? "minecraft:nether" : "minecraft:overworld", 1L);
@@ -104,7 +114,7 @@ class RustDecorationReuseTest {
             var level=new PredictionDecorationLevel(sampler,sampler,RegistryAccess.EMPTY,-1,-1);
             int exactSize=sharedPoints(sampler).size();
             level.useDisplayTerrain(true);
-            assertEquals(display[0],level.column(-16,-16));
+            assertEquals(display[0].withBiomeIndex(-1),level.column(-16,-16));
             var retainedDisplay = level.column(-16, -16);
             assertSame(retainedDisplay, level.column(-16, -16));
             var stats=com.google.gson.JsonParser.parseString(RustWorldgenBackend.decorationQueryStats(sampler.handle())).getAsJsonObject();
@@ -115,7 +125,7 @@ class RustDecorationReuseTest {
             assertEquals(net.minecraft.core.Direction.Axis.X,level.getBlockState(ground)
                 .getValue(net.minecraft.world.level.block.RotatedPillarBlock.AXIS));
             level.beginFeature();level.setBlock(ground.above(),Blocks.OAK_LOG.defaultBlockState(),0,0);level.endFeature(true);
-            assertEquals(display[0],level.exteriorColumn(-16,-16));
+            assertSame(retainedDisplay,level.exteriorColumn(-16,-16));
             level.useDisplayTerrain(false);
             assertEquals(sampler.sample(-16,-16),level.column(-16,-16));
             level.beginStructure();level.setBlock(ground.above(),Blocks.OAK_PLANKS.defaultBlockState(),0,0);level.endFeature(true);

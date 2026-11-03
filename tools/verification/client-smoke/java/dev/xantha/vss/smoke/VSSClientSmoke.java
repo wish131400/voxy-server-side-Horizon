@@ -47,6 +47,7 @@ public final class VSSClientSmoke implements ClientModInitializer {
     private long titleStartedNanos;
     private volatile String lastScreen = "unobserved";
     private boolean predictionResourceAtlasValidated;
+    private JsonObject sodiumOptionsValidation;
 
     @Override
     public void onInitializeClient() {
@@ -103,6 +104,9 @@ public final class VSSClientSmoke implements ClientModInitializer {
                 if (probe.invoke(null, client) == null)
                     throw new IllegalStateException("Prediction block atlas returned no resource sprite");
                 predictionResourceAtlasValidated = true;
+                if (Boolean.getBoolean("vss.smoke.sodiumOptions")) {
+                    sodiumOptionsValidation = SodiumOptionsSmoke.verify(client, (TitleScreen) screen);
+                }
                 finish(true, "title_screen_initialized", null, true);
             }
         } catch (ReflectiveOperationException | RuntimeException failure) {
@@ -120,6 +124,7 @@ public final class VSSClientSmoke implements ClientModInitializer {
         report.addProperty("validation", "client_initialization_and_title_screen");
         report.addProperty("gameplayValidated", false);
         report.addProperty("predictionResourceAtlasValidated", predictionResourceAtlasValidated);
+        if (sodiumOptionsValidation != null) report.add("sodiumOptions", sodiumOptionsValidation);
         report.addProperty("startedAt", startedAt);
         report.addProperty("finishedAt", Instant.now().toString());
         report.addProperty("elapsedSeconds", (System.nanoTime() - startedNanos) / 1_000_000_000.0);

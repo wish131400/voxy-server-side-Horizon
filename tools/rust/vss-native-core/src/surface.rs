@@ -10,7 +10,16 @@ use crate::{
 use serde_json::Value;
 mod exterior;
 mod material;
+#[cfg(test)]
+mod display_query_tests;
+#[cfg(test)]
+mod plan_tests;
+#[cfg(test)]
+mod specialization_tests;
+#[cfg(test)]
+mod noise_tests;
 pub(crate) use exterior::ExteriorColumn;
+#[derive(Clone)]
 enum Rule {
     Block(StateId),
     Sequence(Vec<Rule>),
@@ -57,11 +66,126 @@ enum Condition {
         threshold: f64,
     },
 }
+// Positional factories are immutable seed pairs. Copy their state directly:
+// specializing material rules must not advance any world or feature RNG.
+fn copy_positional(random: &Positional) -> Positional {
+    match *random {
+        Positional::Legacy(seed) => Positional::Legacy(seed),
+        Positional::Xoroshiro(lo, hi) => Positional::Xoroshiro(lo, hi),
+    }
+}
+impl Clone for Condition {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Biome(names) => Self::Biome(names.clone()),
+            Self::Noise(id, min, max, spatial) => Self::Noise(*id, *min, *max, *spatial),
+            Self::Gradient(random, min, max) => Self::Gradient(copy_positional(random), *min, *max),
+            Self::Y(anchor, multiplier, stone) => Self::Y(*anchor, *multiplier, *stone),
+            Self::Water(offset, multiplier, stone) => Self::Water(*offset, *multiplier, *stone),
+            Self::Cold => Self::Cold,
+            Self::Steep => Self::Steep,
+            Self::Hole => Self::Hole,
+            Self::Above => Self::Above,
+            Self::Not(condition) => Self::Not(condition.clone()),
+            Self::Stone(offset, add, secondary, ceiling) => Self::Stone(*offset, *add, *secondary, *ceiling),
+            Self::AcSimplex { min, max, scale, y_scale, offset } => Self::AcSimplex {
+                min: *min, max: *max, scale: *scale, y_scale: *y_scale, offset: *offset,
+            },
+            Self::QuadNoise { id, radius, threshold } => Self::QuadNoise {
+                id: *id, radius: *radius, threshold: *threshold,
+            },
+        }
+    }
+}
+
+struct BiomeRule {
+    rule: Rule,
+    needs_cold: bool,
+    needs_secondary: bool,
+}
+impl Rule {
+    fn needs_cold(&self) -> bool {
+        match self {
+            Self::Condition(condition, rule) => condition.needs_cold() || rule.needs_cold(),
+            Self::Sequence(rules) => rules.iter().any(Self::needs_cold),
+            Self::Namespaced { base, sources } => base.needs_cold()
+                || sources.iter().any(|(_, rule)| rule.needs_cold()),
+            _ => false,
+        }
+    }
+    fn needs_secondary(&self) -> bool {
+        match self {
+            Self::Condition(condition, rule) => condition.needs_secondary() || rule.needs_secondary(),
+            Self::Sequence(rules) => rules.iter().any(Self::needs_secondary),
+            Self::Namespaced { base, sources } => base.needs_secondary()
+                || sources.iter().any(|(_, rule)| rule.needs_secondary()),
+            _ => false,
+        }
+    }
+
+    /// Resolve only immutable biome predicates and namespace dispatch. Every
+    /// dynamic condition and Ore rule keeps its evaluation order and state.
+    fn for_biome(&self, biome: &str) -> Option<Self> {
+        match self {
+            Self::Condition(condition, rule) => match condition.known_biome(biome) {
+                Some(false) => None,
+                Some(true) => rule.for_biome(biome),
+                None => Some(Self::Condition(condition.clone(), Box::new(
+                    rule.for_biome(biome).unwrap_or_else(|| Self::Sequence(Vec::new()))))),
+            },
+            Self::Sequence(rules) => Some(Self::Sequence(rules.iter()
+                .filter_map(|rule| rule.for_biome(biome)).collect())),
+            Self::Namespaced { base, sources } => {
+                let namespace = biome.split(':').next().unwrap_or("");
+                let mut rules = Vec::with_capacity(2);
+                if let Some((_, rule)) = sources.iter().find(|(name, _)| name == namespace) {
+                    if let Some(rule) = rule.for_biome(biome) { rules.push(rule); }
+                }
+                if let Some(rule) = base.for_biome(biome) { rules.push(rule); }
+                Some(Self::Sequence(rules))
+            }
+            _ => Some(self.clone()),
+        }
+    }
+}
+impl Condition {
+    fn known_biome(&self, biome: &str) -> Option<bool> {
+        match self {
+            Self::Biome(names) => Some(names.iter().any(|name| name == biome)),
+            Self::Not(condition) => condition.known_biome(biome).map(|value| !value),
+            _ => None,
+        }
+    }
+    fn needs_cold(&self) -> bool {
+        match self {
+            Self::Cold => true,
+            Self::Not(condition) => condition.needs_cold(),
+            _ => false,
+        }
+    }
+    fn needs_secondary(&self) -> bool {
+        match self {
+            Self::Stone(_, _, range, _) => *range != 0,
+            Self::Not(condition) => condition.needs_secondary(),
+            _ => false,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum Steepness<'a> {
+    Known(bool),
+    Lazy(&'a dyn Fn() -> bool),
+}
+impl Steepness<'_> {
+    fn get(self) -> bool {
+        match self { Self::Known(value) => value, Self::Lazy(query) => query() }
+    }
+}
 struct Context<'a> {
     p: Pos,
     biome: &'a str,
     cold: bool,
-    steep: bool,
+    steep: Steepness<'a>,
     depth: i32,
     secondary: f64,
     above: i32,
@@ -71,8 +195,16 @@ struct Context<'a> {
 }
 pub struct Surface {
     rule: Rule,
+    biome_rules: std::collections::HashMap<String, BiomeRule>,
+    fallback_needs_cold: bool,
+    fallback_needs_secondary: bool,
     modern: bool,
     uses_density: bool,
+    // Rules and their palette IDs are immutable for this world. Analyse their
+    // reachable writes once rather than walking the tree for every neighbour.
+    summaries: std::collections::HashMap<String, [bool; 6]>,
+    global_summary: [bool; 6],
+    depth_predicates: Vec<(i32, bool, i32)>,
     bands: [StateId; 192],
     band_offset: usize,
     depth: usize,
@@ -170,10 +302,16 @@ impl Surface {
                 _ => false,
             }
         }
-        Ok(Self {
+        let mut surface = Self {
             modern: doc["settings"].get("material_rule").is_some(),
             uses_density: uses_density(&rule),
+            fallback_needs_cold: rule.needs_cold(),
+            fallback_needs_secondary: rule.needs_secondary(),
+            biome_rules: std::collections::HashMap::new(),
             rule,
+            summaries: std::collections::HashMap::new(),
+            global_summary: [false; 6],
+            depth_predicates: Vec::new(),
             bands,
             band_offset,
             depth,
@@ -184,7 +322,35 @@ impl Surface {
             water: palette.named("minecraft:water")?,
             packed_ice: palette.named("minecraft:packed_ice")?,
             snow: palette.named("minecraft:snow_block")?,
-        })
+        };
+        surface.global_summary = surface.analyse_summaries(palette, None);
+        if let Some(biomes) = doc["biomes"].as_object() {
+            for name in biomes.keys() {
+                let summary = surface.analyse_summaries(palette, Some(name));
+                surface.summaries.insert(name.clone(), summary);
+                let rule = surface.rule.for_biome(name).unwrap_or_else(|| Rule::Sequence(Vec::new()));
+                surface.biome_rules.insert(name.clone(), BiomeRule {
+                    needs_cold: rule.needs_cold(), needs_secondary: rule.needs_secondary(), rule });
+            }
+        }
+        let mut predicates = Vec::new();
+        surface.collect_depth_predicates(&surface.rule, &mut predicates);
+        surface.depth_predicates = predicates;
+        Ok(surface)
+    }
+    fn biome_rule(&self, biome: &str) -> (&Rule, bool, bool) {
+        self.biome_rules.get(biome).map_or((&self.rule, self.fallback_needs_cold, self.fallback_needs_secondary),
+            |plan| (&plan.rule, plan.needs_cold, plan.needs_secondary))
+    }
+    #[cfg(test)]
+    fn replace_rule(&mut self, rule: Rule) {
+        self.fallback_needs_cold = rule.needs_cold();
+        self.fallback_needs_secondary = rule.needs_secondary();
+        self.rule = rule;
+        for (name, plan) in &mut self.biome_rules {
+            let rule = self.rule.for_biome(name).unwrap_or_else(|| Rule::Sequence(Vec::new()));
+            *plan = BiomeRule { needs_cold: rule.needs_cold(), needs_secondary: rule.needs_secondary(), rule };
+        }
     }
     pub fn depth(&self, graph: &Graph, x: i32, z: i32) -> i32 {
         (graph.noise(self.depth, x as f64, 0., z as f64) * 2.75
@@ -246,14 +412,45 @@ impl Surface {
         self.summary_safe_for_biome(palette,biome,true,None)
     }
     pub(crate) fn display_safe_at(&self, palette: &Palette, biome: &str, graph: &Graph, x: i32, z: i32) -> bool {
-        self.summary_safe_for_biome(palette, Some(biome), true, Some(self.depth(graph, x, z) <= 0))
+        self.summary_safe_at(palette, biome, true, graph, x, z)
     }
     pub(crate) fn sparse_safe_at(&self, palette: &Palette, biome: &str, graph: &Graph, x: i32, z: i32) -> bool {
         // Hole depends only on X/Z. Proving it false excludes air writes for
         // the entire neighbour column, including material depths not sampled.
-        self.summary_safe_for_biome(palette, Some(biome), false, Some(self.depth(graph, x, z) <= 0))
+        self.summary_safe_at(palette, biome, false, graph, x, z)
+    }
+    fn summary_safe_at(&self, palette: &Palette, biome: &str, dry: bool, graph: &Graph, x: i32, z: i32) -> bool {
+        let uncached;
+        let values = match self.summaries.get(biome) {
+            Some(values) => values,
+            None => {
+                uncached = self.analyse_summaries(palette, Some(biome));
+                &uncached
+            }
+        };
+        let base = usize::from(dry) * 3;
+        if values[base] == values[base + 1] && values[base] == values[base + 2] {
+            return values[base];
+        }
+        values[base + 1 + usize::from(self.depth(graph, x, z) <= 0)]
     }
     fn summary_safe_for_biome(&self, palette:&Palette,biome:Option<&str>,dry:bool,hole:Option<bool>)->bool {
+        let summary = match biome {
+            Some(name) => self.summaries.get(name),
+            None => Some(&self.global_summary),
+        };
+        match summary {
+            Some(values) => values[usize::from(dry)*3 + match hole {None=>0,Some(false)=>1,Some(true)=>2}],
+            // Keep the exact analysis for callers with a biome not in the
+            // world's document. Never infer safety from a missing entry.
+            None => self.analyse_summary(palette, biome, dry, hole),
+        }
+    }
+    fn analyse_summaries(&self, palette: &Palette, biome: Option<&str>) -> [bool; 6] {
+        std::array::from_fn(|i| self.analyse_summary(palette, biome, i>=3,
+            match i%3 {0=>None,1=>Some(false),_=>Some(true)}))
+    }
+    fn analyse_summary(&self, palette:&Palette,biome:Option<&str>,dry:bool,hole:Option<bool>)->bool {
         fn known(condition: &Condition, biome: Option<&str>, hole: Option<bool>) -> Option<bool> {
             match condition {
                 Condition::Biome(names) => biome.map(|b| names.iter().any(|n| n == b)),
@@ -323,6 +520,45 @@ impl Surface {
     /// With this many extra blocks, a truncated solid run produces exactly the
     /// same predicate results for every retained output material.
     pub fn exterior_padding(&self, graph: &Graph, x: i32, z: i32) -> Option<i32> {
+        let predicates = &self.depth_predicates;
+        if predicates.is_empty() { return Some(1); }
+        let depth = std::cell::LazyCell::new(|| self.depth(graph, x, z));
+        let secondary = std::cell::LazyCell::new(|| graph.noise(self.secondary, x as f64, 0., z as f64));
+        let mut maximum = 0;
+        for &(offset, add, range) in predicates {
+            let extra = if range == 0 {0} else {((*secondary+1.)/2.*range as f64) as i32};
+            let value = 1i32.checked_add(offset)?
+                .checked_add(if add {*depth} else {0})?.checked_add(extra)?;
+            maximum = maximum.max(value);
+        }
+        let padding = maximum.checked_add(1)?;
+        (padding<=64).then_some(padding)
+    }
+    fn collect_depth_predicates(&self, rule: &Rule, predicates: &mut Vec<(i32,bool,i32)>) {
+        fn collect(condition: &Condition, predicates: &mut Vec<(i32,bool,i32)>) {
+            match condition {
+                Condition::Stone(offset, add, range, true) => {
+                    let value=(*offset,*add,*range);
+                    if !predicates.contains(&value) {predicates.push(value);}
+                }
+                Condition::Not(inner) => collect(inner,predicates),
+                _ => {}
+            }
+        }
+        match rule {
+            Rule::Sequence(rules) => for rule in rules {self.collect_depth_predicates(rule,predicates);},
+            Rule::Condition(condition, rule) => {
+                collect(condition,predicates);self.collect_depth_predicates(rule,predicates);
+            }
+            Rule::Namespaced {base,sources} => {
+                self.collect_depth_predicates(base,predicates);
+                for (_,rule) in sources {self.collect_depth_predicates(rule,predicates);}
+            }
+            _ => {}
+        }
+    }
+    #[cfg(test)]
+    fn exterior_padding_recursive(&self, graph: &Graph, x: i32, z: i32) -> Option<i32> {
         fn condition(c: &Condition, depth: i32, secondary: f64) -> Option<i32> {
             match c {
                 Condition::Stone(offset, add, range, true) => {
@@ -384,7 +620,7 @@ impl Surface {
         }
         let top = world.height(x, z, false);
         let depth = self.depth(graph, x, z);
-        let secondary = graph.noise(self.secondary, x as f64, 0., z as f64);
+        let secondary = std::cell::LazyCell::new(|| graph.noise(self.secondary, x as f64, 0., z as f64));
         let min_surface = self.min_surface(job, x, z, depth);
         let north = world.height(x, (z - 1).max(z0), false);
         let south = world.height(x, (z + 1).min(z0 + 15), false);
@@ -422,19 +658,20 @@ impl Surface {
                 above += 1;
                 if self.modern || state == self.default {
                     let (biome_name, biome_data) = biome(p)?;
+                    let (rule, needs_cold, needs_secondary) = self.biome_rule(biome_name);
                     let context = Context {
                         p,
                         biome: biome_name,
-                        cold: colors.temperature_with_sea_level(biome_data, p, t.sea_level) < 0.15,
-                        steep,
+                        cold: needs_cold && colors.temperature_with_sea_level(biome_data, p, t.sea_level) < 0.15,
+                        steep: Steepness::Known(steep),
                         depth,
-                        secondary,
+                        secondary: if needs_secondary { *secondary } else { 0.0 },
                         above,
                         below: y - floor + 1,
                         water,
                         min_surface,
                     };
-                    if let Some(id) = self.rule(&self.rule, graph, &context, &mut Some(&mut job.scratch)) {
+                    if let Some(id) = self.rule(rule, graph, &context, &mut Some(&mut job.scratch)) {
                         world.set(p, id);
                     }
                 }
@@ -462,31 +699,52 @@ impl Surface {
     /// Neighbour steepness, pillars and iceberg geometry await exact refinement.
     pub fn preview_materials(&self, t: &Terrain, x: i32, z: i32, floor: i32,
         water: i32, name: &str, biome: &Biome, colors: &ClimateColors) -> [StateId; 3] {
-        self.summary_materials(t,x,z,floor,water,name,biome,colors,false)
+        self.summary_materials(t,x,z,floor,water,name,biome,colors,Steepness::Known(false),None)
     }
-    pub(crate) fn display_materials(&self,t:&Terrain,x:i32,z:i32,floor:i32,water:i32,name:&str,biome:&Biome,colors:&ClimateColors,steep:bool)->[StateId;3] {
-        self.summary_materials(t,x,z,floor,water,name,biome,colors,steep)
+    pub(crate) fn display_materials(&self,t:&Terrain,x:i32,z:i32,floor:i32,water:i32,name:&str,biome:&Biome,colors:&ClimateColors,steep:impl FnOnce()->bool,workspace:&mut Option<Scratch>)->[StateId;3] {
+        // Old cache markers can depend on traversal order. Preserve their
+        // original eager neighbour queries; modern pointwise graphs do not.
+        if !t.graph.is_modern() || t.graph.has_stateful_queries() {
+            return self.summary_materials(t,x,z,floor,water,name,biome,colors,
+                Steepness::Known(steep()),Some(workspace));
+        }
+        let value = std::cell::LazyCell::new(steep);
+        let query = || *value;
+        self.summary_materials(t,x,z,floor,water,name,biome,colors,
+            Steepness::Lazy(&query),Some(workspace))
     }
-    fn summary_materials(&self,t:&Terrain,x:i32,z:i32,floor:i32,water:i32,name:&str,biome:&Biome,colors:&ClimateColors,steep:bool)->[StateId;3] {
+    fn summary_materials(&self,t:&Terrain,x:i32,z:i32,floor:i32,water:i32,name:&str,biome:&Biome,colors:&ClimateColors,steep:Steepness<'_>,workspace:Option<&mut Option<Scratch>>)->[StateId;3] {
+        let (rule, needs_cold, needs_secondary) = self.biome_rule(name);
         let depth = self.depth(&t.graph, x, z);
-        let secondary = t.graph.noise(self.secondary, x as f64, 0., z as f64);
-        let mut owned_scratch = (self.modern || self.uses_density).then(|| t.graph.scratch(x & !3, z & !3, t.cell_width, t.cell_height)
-            .expect("validated terrain dimensions"));
-        if let Some(scratch) = owned_scratch.as_mut() { t.graph.initialize_column_caches(scratch); }
+        let secondary = if needs_secondary { t.graph.noise(self.secondary, x as f64, 0., z as f64) } else { 0.0 };
+        // Material rules use their own scalar/default-volume context. Reuse
+        // it only within a caller's chunk batch, never the terrain job's volume
+        // or a legacy graph whose Flat/Cell caches have traversal semantics.
+        let mut workspace = workspace.filter(|_| self.modern && !t.graph.has_stateful_queries());
+        let retained = workspace.as_mut().and_then(|slot| slot.take());
+        let fresh = retained.is_none();
+        let mut owned_scratch = retained.or_else(|| (self.modern || self.uses_density).then(||
+            t.graph.scratch(x & !3, z & !3, t.cell_width, t.cell_height)
+                .expect("validated terrain dimensions")));
+        if fresh {
+            if let Some(scratch) = owned_scratch.as_mut() { t.graph.initialize_column_caches(scratch); }
+        }
         let min_surface = if self.modern {
             let root = t.graph.root("chunk_surface_level").expect("26.3 material surface root");
             (t.graph.compute(root, [x, 0, z], Mode::Block, owned_scratch.as_mut().unwrap()).floor() as i32)
                 .wrapping_add(depth).wrapping_sub(8)
         } else { floor - depth - 8 };
         let mut scratch = owned_scratch.as_mut();
-        [1, 2, 7].map(|offset| {
+        let result = [1, 2, 7].map(|offset| {
             let p = [x, floor - offset, z];
-            let c = Context { p, biome: name, cold: colors.temperature_with_sea_level(biome, p, t.sea_level) < 0.15,
+            let c = Context { p, biome: name, cold: needs_cold && colors.temperature_with_sea_level(biome, p, t.sea_level) < 0.15,
                 steep, depth, secondary, above: offset,
                 below: (floor - offset - t.min_y + 1).max(1), water,
                 min_surface };
-            self.rule(&self.rule, &t.graph, &c, &mut scratch).unwrap_or(self.default)
-        })
+            self.rule(rule, &t.graph, &c, &mut scratch).unwrap_or(self.default)
+        });
+        if let Some(workspace) = workspace { *workspace = owned_scratch; }
+        result
     }
 
     fn rule(&self, rule: &Rule, graph: &Graph, c: &Context<'_>, scratch: &mut Option<&mut Scratch>) -> Option<StateId> {
@@ -627,7 +885,7 @@ impl Condition {
                     || c.p[1] + if *stone { c.above } else { 0 } >= c.water + offset + c.depth * mul
             }
             Self::Cold => c.cold,
-            Self::Steep => c.steep,
+            Self::Steep => c.steep.get(),
             Self::Hole => c.depth <= 0,
             Self::Above => c.p[1] >= c.min_surface,
             Self::Not(test) => !test.matches(g, c),

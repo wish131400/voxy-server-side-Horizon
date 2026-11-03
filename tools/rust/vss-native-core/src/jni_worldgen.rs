@@ -806,6 +806,61 @@ pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend
     });
     match result { Ok(n) => n, Err(err) => { fail(&mut e, err); -1 } }
 }
+fn display_gpu_points(e: &mut JNIEnv, input: &JByteBuffer, count: jint) -> Result<Vec<(i32,i32)>> {
+    if !(0..=64).contains(&count) { return Err("display GPU count".into()); }
+    let n=count as usize;
+    let ptr=buffer(e,input,n*8,false)?;
+    let bytes=unsafe { std::slice::from_raw_parts(ptr,n*8) };
+    Ok(bytes.chunks_exact(8).map(|r| (i32::from_le_bytes(r[..4].try_into().unwrap()),i32::from_le_bytes(r[4..].try_into().unwrap()))).collect())
+}
+fn display_gpu_heights(e: &mut JNIEnv, input: &JByteBuffer, count: usize) -> Result<Vec<i32>> {
+    let ptr=buffer(e,input,count*4,false)?;
+    let bytes=unsafe { std::slice::from_raw_parts(ptr,count*4) };
+    Ok(bytes.chunks_exact(4).map(|r| i32::from_le_bytes(r.try_into().unwrap())).collect())
+}
+#[no_mangle]
+pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend_displayGpuMask(
+    mut e: JNIEnv, _c: JClass, id: jlong, input: JByteBuffer, count: jint,
+) -> jlong {
+    let result=guarded(|| {let points=display_gpu_points(&mut e,&input,count)?;world(id)?.display_gpu_mask(&points)});
+    match result {Ok(mask)=>mask as jlong,Err(err)=>{fail(&mut e,err);0}}
+}
+#[no_mangle]
+pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend_displayDensityFloors(
+    mut e: JNIEnv, _c: JClass, id: jlong, input: JByteBuffer, out: JByteBuffer, count: jint,
+) -> jint {
+    let result=guarded(|| {
+        let points=display_gpu_points(&mut e,&input,count)?;buffer(&mut e,&out,count as usize*4,true)?;
+        let values=world(id)?.display_density_floors(&points)?;
+        let bytes:Vec<_>=values.into_iter().flat_map(i32::to_le_bytes).collect();put(&mut e,&out,&bytes)?;Ok(count)
+    });
+    match result {Ok(n)=>n,Err(err)=>{fail(&mut e,err);-1}}
+}
+#[no_mangle]
+pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend_displayPointsGpu(
+    mut e: JNIEnv, _c: JClass, id: jlong, input: JByteBuffer, out: JByteBuffer, count: jint, heights: JByteBuffer,
+) -> jint {
+    let result=guarded(|| {
+        let points=display_gpu_points(&mut e,&input,count)?;let heights=display_gpu_heights(&mut e,&heights,count as usize)?;
+        buffer(&mut e,&out,count as usize*40,true)?;
+        let columns=world(id)?.display_points_gpu(&points,&heights)?;
+        let bytes:Vec<_>=columns.into_iter().flat_map(|c| c.values.into_iter().flat_map(i32::to_le_bytes)).collect();
+        put(&mut e,&out,&bytes)?;Ok(count)
+    });
+    match result {Ok(n)=>n,Err(err)=>{fail(&mut e,err);-1}}
+}
+#[no_mangle]
+pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend_displayGridGpu(
+    mut e: JNIEnv, _c: JClass, id: jlong, x: jint, z: jint, step: jint, missing: jlong, out: JByteBuffer, heights: JByteBuffer,
+) -> jint {
+    let result=guarded(|| {
+        let heights=display_gpu_heights(&mut e,&heights,64)?;buffer(&mut e,&out,64*40,true)?;
+        let columns=world(id)?.display_grid_gpu(x,z,step,missing as u64,&heights)?;
+        let bytes:Vec<_>=columns.into_iter().flat_map(|c| c.values.into_iter().flat_map(i32::to_le_bytes)).collect();
+        put(&mut e,&out,&bytes)?;Ok(64)
+    });
+    match result {Ok(n)=>n,Err(err)=>{fail(&mut e,err);-1}}
+}
 fn surface_points_jni(mut e: JNIEnv, id: jlong, input: JByteBuffer, out: JByteBuffer,
     count: jint, mode: u8) -> jint {
     let result = guarded(|| {
@@ -843,6 +898,39 @@ fn surface_points_jni(mut e: JNIEnv, id: jlong, input: JByteBuffer, out: JByteBu
             -1
         }
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend_vulkanProgram(
+    mut e: JNIEnv, _c: JClass, id: jlong,
+) -> jstring {
+    output(&mut e, guarded(|| world(id)?.terrain.graph.vulkan_program("final_density")))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend_previewPointsGpu(
+    mut e: JNIEnv, _c: JClass, id: jlong, input: JByteBuffer, out: JByteBuffer,
+    count: jint, heights: JByteBuffer,
+) -> jint {
+    let result = guarded(|| {
+        if !(0..=64).contains(&count) { return Err("GPU preview batch count".into()); }
+        let n = count as usize;
+        let ptr = buffer(&mut e, &input, n * 8, false)?;
+        let hptr = buffer(&mut e, &heights, n * 4, false)?;
+        buffer(&mut e, &out, n * 40, true)?;
+        let positions = unsafe { std::slice::from_raw_parts(ptr, n * 8) };
+        let values = unsafe { std::slice::from_raw_parts(hptr, n * 4) };
+        let points: Vec<_> = positions.chunks_exact(8).map(|r|
+            (i32::from_le_bytes(r[..4].try_into().unwrap()),i32::from_le_bytes(r[4..].try_into().unwrap()))).collect();
+        let heights: Vec<_> = values.chunks_exact(4).map(|r| i32::from_le_bytes(r.try_into().unwrap())).collect();
+        let w = world(id)?;
+        let columns = w.preview_points_with_heights(&points, Some(&heights))?;
+        let mut bytes = Vec::with_capacity(n * 40);
+        for column in columns { for value in column.values { bytes.extend(value.to_le_bytes()); } }
+        put(&mut e, &out, &bytes)?;
+        Ok(count)
+    });
+    match result { Ok(n) => n, Err(err) => { fail(&mut e, err); -1 } }
 }
 #[no_mangle]
 pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend_decorationPoints(
@@ -1086,6 +1174,23 @@ pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend
     match result { Ok(n) => n, Err(err) => { fail(&mut e, err); -1 } }
 }
 
+/// Conservative biome union for vertical columns; -1 means unknown.
+#[no_mangle]
+pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend_possibleBiomes(
+    mut e: JNIEnv, _c: JClass, id: jlong, min_x: jint, min_z: jint,
+    max_x: jint, max_z: jint, out: JByteBuffer,
+) -> jint {
+    let result = guarded(|| {
+        let w = world(id)?;
+        let Some(indices) = w.possible_biomes(min_x,min_z,max_x,max_z)? else { return Ok(-1); };
+        let mut bytes=Vec::with_capacity(indices.len()*4);
+        for &index in &indices { bytes.extend(index.to_le_bytes()); }
+        put(&mut e,&out,&bytes)?;
+        Ok(indices.len() as jint)
+    });
+    match result { Ok(n) => n, Err(err) => { fail(&mut e,err); -1 } }
+}
+
 /// Session-owned immutable palette. Worlds retain an Arc snapshot after this handle is closed.
 #[no_mangle]
 pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend_openPalette(
@@ -1121,4 +1226,53 @@ pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend
         description["biome_names"] = json!(w.biome_names());
         Ok(description)
     }))
+}
+
+// Read-only copies of already computed Raw climate inputs; a miss never starts generation.
+#[no_mangle]
+pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend_horizontalLookup(
+    mut e: JNIEnv, _c: JClass, id: jlong, input: JByteBuffer, out: JByteBuffer, count: jint,
+) -> jint {
+    let result = guarded(|| {
+        if !(0..=16).contains(&count) { return Err("horizontal batch count".into()); }
+        let w = world(id)?; w.check_active()?;
+        let p = buffer(&mut e, &input, count as usize * 8, false)?;
+        buffer(&mut e, &out, count as usize * 56, true)?;
+        let bytes = unsafe { std::slice::from_raw_parts(p, count as usize * 8) };
+        let points: Vec<_> = bytes.chunks_exact(8).map(|r| (i32::from_le_bytes(r[0..4].try_into().unwrap()),
+            i32::from_le_bytes(r[4..8].try_into().unwrap()))).collect();
+        put(&mut e, &out, &w.terrain.graph.horizontal_lookup(&points))?;
+        Ok(count)
+    });
+    match result { Ok(n) => n, Err(err) => { fail(&mut e,err); -1 } }
+}
+#[no_mangle]
+pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend_horizontalDescriptor(
+    mut e: JNIEnv, _c: JClass, id: jlong,
+) -> jstring {
+    let result = guarded(|| { let w = world(id)?; w.check_active()?; Ok(w.terrain.graph.horizontal_descriptor()) });
+    output(&mut e,result)
+}
+#[no_mangle]
+pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend_horizontalStats(
+    mut e: JNIEnv, _c: JClass, id: jlong,
+) -> jstring {
+    let result = guarded(|| Ok(world(id)?.terrain.graph.horizontal_stats())); output(&mut e,result)
+}
+
+/// Production placement keeps the same transaction/random stream and skips JSON serialization.
+#[no_mangle]
+pub extern "system" fn Java_dev_xantha_vss_client_prediction_RustWorldgenBackend_placedFeatureStatus(
+    mut e: JNIEnv, _c: JClass, id: jlong, name: JString,
+    chunk_x: jint, chunk_z: jint, index: jint, step: jint,
+) -> jint {
+    let result = guarded(|| {
+        let name = text(&mut e, name, 32768)?;
+        let v = volume(id)?;
+        let mut v = v.lock().map_err(|_| "volume lock")?;
+        let owner = v.owner.clone();
+        let (placed, _) = owner.placed(&mut v.volume, &name, chunk_x, chunk_z, index, step)?;
+        Ok(i32::from(placed))
+    });
+    match result { Ok(status) => status, Err(err) => { fail(&mut e, err); -1 } }
 }

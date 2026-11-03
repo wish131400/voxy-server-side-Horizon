@@ -3,6 +3,8 @@ plugins {
     id 'maven-publish'
 }
 
+apply from: 'gradle/minecraft-targets.gradle'
+
 version = "${vss_version}-fabric-${minecraft_version}"
 group = mod_group_id
 base { archivesName = 'vss' }
@@ -26,8 +28,8 @@ loom {
 dependencies {
     minecraft "com.mojang:minecraft:${minecraft_version}"
     mappings loom.officialMojangMappings()
-    modImplementation "net.fabricmc:fabric-loader:${loader_version}"
-    modImplementation "net.fabricmc.fabric-api:fabric-api:${fabric_version}"
+    modImplementation "net.fabricmc:fabric-loader:${fabricCompileLoader}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${fabricCompileApi}"
     modCompileOnly 'maven.modrinth:modmenu:17.0.0'
 
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
@@ -49,10 +51,10 @@ tasks.withType(JavaCompile).configureEach {
 
 tasks.named('processResources', ProcessResources).configure {
     inputs.properties(version: project.version, minecraft_version: minecraft_version,
-            loader_version: loader_version, fabric_version: fabric_version, java_version: java_version)
+            loader_min_version: fabricLoaderMinimum, fabric_min_version: fabricApiMinimum, java_version: java_version)
     filesMatching('fabric.mod.json') {
         expand(version: project.version, minecraft_version: minecraft_version,
-                loader_version: loader_version, fabric_version: fabric_version, java_version: java_version)
+                loader_min_version: fabricLoaderMinimum, fabric_min_version: fabricApiMinimum, java_version: java_version)
     }
 }
 

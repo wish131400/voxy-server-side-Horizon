@@ -15,7 +15,11 @@ class PredictionCaptureRefreshTest {
         assertFalse(refresh.defer(key, 120_000_001L), "refresh after 100 ms quiet");
         for (long t = 40_000_001L; t < 500_000_001L; t += 20_000_000L) refresh.changed(key, t);
         assertFalse(refresh.defer(key, 500_000_001L), "continuous traffic has a 500 ms maximum delay");
-        refresh.started(key);
+        refresh.attempted(key, 500_000_001L);
+        refresh.changed(key, 510_000_001L);
+        assertTrue(refresh.defer(key, 510_000_002L), "one overdue attempt must not disable coalescing for later captures");
+        assertFalse(refresh.defer(key, 1_000_000_001L), "continued traffic still gets another bounded attempt");
+        refresh.completed(key);
         refresh.changed(key, 510_000_001L);
         assertFalse(refresh.defer(key, 510_000_002L), "a new burst starts independently");
         refresh.changed(key, 520_000_001L);
@@ -27,14 +31,14 @@ class PredictionCaptureRefreshTest {
         var refresh = new PredictionCaptureRefresh();
         var key = new PredictionTileKey(Level.OVERWORLD, 0, 0, 0);
         refresh.changed(key, 1);
-        refresh.started(key);
+        // Admission and cancelled execution leave the original input burst intact.
         refresh.changed(key, 20_000_001L);
         refresh.changed(key, 30_000_001L);
         assertTrue(refresh.defer(key, 50_000_001L));
         refresh.changed(key, 70_000_001L);
         assertTrue(refresh.defer(key, 150_000_001L));
         assertFalse(refresh.defer(key, 170_000_001L));
-        refresh.started(key);
+        refresh.completed(key);
         refresh.changed(key, 190_000_001L);
         assertFalse(refresh.defer(key, 190_000_001L), "single edits stay immediate");
     }

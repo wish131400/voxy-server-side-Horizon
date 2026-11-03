@@ -11,6 +11,37 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class SingleplayerGenerationConfigTest {
+    @Test void generationDefaultsFollowEnvironmentWithoutOverwritingSavedChoices() throws Exception {
+        var loader = org.mockito.Mockito.mock(net.fabricmc.loader.api.FabricLoader.class);
+        try (var fabric = org.mockito.Mockito.mockStatic(net.fabricmc.loader.api.FabricLoader.class)) {
+            fabric.when(net.fabricmc.loader.api.FabricLoader::getInstance).thenReturn(loader);
+            for (var environment : net.fabricmc.api.EnvType.values()) {
+                org.mockito.Mockito.when(loader.getEnvironmentType()).thenReturn(environment);
+                assertGenerationDefaults(environment == net.fabricmc.api.EnvType.SERVER);
+            }
+        }
+    }
+
+    private void assertGenerationDefaults(boolean expectedDefault) throws Exception {
+        var directory = java.nio.file.Files.createTempDirectory("vss-generation-toggle-");
+        var file = directory.resolve("vss-server-config.json");
+        var store = new JsonConfigStore(directory);
+        var config = store.load(VSSServerConfig.class, "vss-server-config.json");
+        assertEquals(expectedDefault, config.enableChunkGeneration);
+        assertTrue(config.enabled);
+        assertTrue(config.enablePredictionSync);
+        assertEquals(expectedDefault, com.google.gson.JsonParser.parseString(java.nio.file.Files.readString(file))
+                .getAsJsonObject().get("enableChunkGeneration").getAsBoolean());
+        for (String saved : new String[] {"{}", "{\"enableChunkGeneration\":true}",
+                "{\"enableChunkGeneration\":false}"}) {
+            java.nio.file.Files.writeString(file, saved);
+            boolean expected = saved.equals("{}") ? expectedDefault : saved.contains(":true");
+            assertEquals(expected, store.load(VSSServerConfig.class, "vss-server-config.json").enableChunkGeneration);
+            assertEquals(expected, com.google.gson.JsonParser.parseString(java.nio.file.Files.readString(file))
+                    .getAsJsonObject().get("enableChunkGeneration").getAsBoolean());
+        }
+    }
+
     @TempDir Path directory;
     @Test void defaultsSeparateIntegratedAndDedicatedGeneration() {
         var config=new VSSServerConfig();

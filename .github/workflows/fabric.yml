@@ -125,6 +125,10 @@ jobs:
       - name: Download pinned bytecode contract inputs
         id: mods
         run: python tools/verification/fetch_compat_mods.py --minecraft '${{ matrix.minecraft }}' --github-output
+      - name: Compile against minimum supported Fabric dependencies
+        run: >-
+          bash gradlew compileJava validateAccessWidener --console=plain
+          '-PmcTarget=${{ matrix.minecraft }}' '-PfabricCompatibilityBaseline=true'
       - name: Compile, run regressions and package the production mod
         env:
           VOXY_JAR: ${{ steps.mods.outputs.voxy_jar }}
@@ -145,7 +149,7 @@ jobs:
       - name: Verify packaged metadata and source snapshot
         run: >-
           python tools/verification/verify_release.py
-          'lib/vss-0.3.6-fabric-${{ matrix.minecraft }}.jar'
+          'lib/vss-0.3.7-fabric-${{ matrix.minecraft }}.jar'
           --platform fabric --source . --minecraft '${{ matrix.minecraft }}'
           --build-id 'ci-${{ github.sha }}'
       - uses: actions/upload-artifact@v4

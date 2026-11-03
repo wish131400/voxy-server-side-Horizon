@@ -1,0 +1,75 @@
+// Offline epoch fixtures need the same superclass extension rule as the
+// released Fabric mod. Apply only to a Test classpath, never production inputs.
+import java.util.zip.ZipFile
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+
+allprojects {
+    afterEvaluate {
+        tasks.withType(Test).configureEach {
+            doFirst {
+                def input = providers.gradleProperty('vssFreeTerraForgedJar')
+                if (!input.isPresent()) return
+                def target = 'net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.class'
+                def epoch = false
+                new ZipFile(file(input.get())).withCloseable { jar ->
+                    epoch = jar.getEntry('etcodehome/freeterraforged/world/worldgen/runtime/TerraForgedChunkGenerator.class') != null
+                    if (epoch) {
+                        def metadata = new groovy.json.JsonSlurper().parse(jar.getInputStream(jar.getEntry('fabric.mod.json')))
+                        def rules = jar.getInputStream(jar.getEntry(metadata.accessWidener)).getText('UTF-8')
+                        if (!rules.readLines().any { it.trim().split(/\s+/).toList() == ['extendable', 'class', 'net/minecraft/class_3754'] })
+                            throw new GradleException('Released generator is missing its expected superclass access rule')
+                    }
+                }
+                if (!epoch) return
+                def games = classpath.files.findAll { path ->
+                    path.isFile() && path.name.endsWith('.jar') && new ZipFile(path).withCloseable { it.getEntry(target) != null }
+                }
+                if (games.size() != 1) throw new GradleException('Expected one named game JAR for the released access rule')
+                def game = games.first()
+                def widened = layout.buildDirectory.file('worldgen-test-dependencies/freeterraforged/extendable-game.jar').get().asFile
+                def stamp = new File(widened.parentFile, 'input.txt')
+                def identity = game.absolutePath + ':' + game.length() + ':' + game.lastModified()
+                if (!widened.isFile() || !stamp.isFile() || stamp.text != identity) {
+                    widened.parentFile.mkdirs()
+                    new ZipFile(game).withCloseable { source ->
+                        new ZipOutputStream(new FileOutputStream(widened)).withCloseable { output ->
+                            source.entries().each { entry ->
+                                output.putNextEntry(new ZipEntry(entry.name))
+                                if (!entry.directory) {
+                                    byte[] data = source.getInputStream(entry).bytes
+                                    if (entry.name == target) {
+                                        // Locate access_flags after the constant pool and
+                                        // remove only ACC_FINAL, exactly as extendable does.
+                                        def bytes = new ByteArrayInputStream(data)
+                                        def inputStream = new DataInputStream(bytes)
+                                        if (inputStream.readInt() != 0xCAFEBABE as int)
+                                            throw new GradleException('Invalid game class')
+                                        inputStream.skipNBytes(4)
+                                        int count = inputStream.readUnsignedShort()
+                                        for (int i = 1; i < count; i++) {
+                                            switch (inputStream.readUnsignedByte()) {
+                                                case 1: inputStream.skipNBytes(inputStream.readUnsignedShort()); break
+                                                case [3, 4, 9, 10, 11, 12, 17, 18]: inputStream.skipNBytes(4); break
+                                                case [5, 6]: inputStream.skipNBytes(8); i++; break
+                                                case [7, 8, 16, 19, 20]: inputStream.skipNBytes(2); break
+                                                case 15: inputStream.skipNBytes(3); break
+                                                default: throw new GradleException('Invalid class constant')
+                                            }
+                                        }
+                                        int offset = data.length - bytes.available()
+                                        data[offset + 1] = (byte) (data[offset + 1] & ~0x10)
+                                    }
+                                    output.write(data)
+                                }
+                                output.closeEntry()
+                            }
+                        }
+                    }
+                    stamp.text = identity
+                }
+                classpath = files(classpath.files.collect { it == game ? widened : it })
+            }
+        }
+    }
+}

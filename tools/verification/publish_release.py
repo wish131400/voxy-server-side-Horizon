@@ -8,6 +8,7 @@ import tempfile
 import zipfile
 
 from verify_release import verify, source_files, source_digest
+from install_native_artifacts import native_source_files
 
 
 def publish(source, build_id, targets):
@@ -20,7 +21,9 @@ def publish(source, build_id, targets):
     artifacts = [verify(jar, "fabric", build_id, source, target) for jar, target in zip(jars, targets)]
     # Keep the established production digest, and archive the complete source
     # and regression fixtures so the release can be checked against the checkout.
-    snapshot_paths = set(source_files(source)) | {p for p in (source / "src").rglob("*") if p.is_file()}
+    snapshot_paths = set(source_files(source)) | set(native_source_files(source))
+    snapshot_paths |= {p for p in (source / "src").rglob("*") if p.is_file()}
+    snapshot_paths |= {p for p in (source / "tools/rust/vss-native-core/tests").rglob("*") if p.is_file()}
     snapshot = {p.relative_to(source).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in sorted(snapshot_paths)}
     manifest = {"version": version, "buildId": build_id, "minecraft": targets,
@@ -41,6 +44,22 @@ def publish(source, build_id, targets):
             output.write(staging / "source-snapshot.json", "source-snapshot.json")
             output.write(source / "LICENSE", "LICENSE")
             output.write(source / "README.md", "README.md")
+            output.write(source / "CHANGELOG.md", "CHANGELOG.md")
+            for name in (
+                "docs/history/performance/climate-sharing-implementation-20261102.md",
+                "docs/history/performance/climate-height-production-20261102.md",
+                "docs/history/performance/modern-generation-repair-20261102.md",
+                "docs/history/performance/decoration-pruning-20261102.md",
+                "docs/history/performance/cross-version-pruning-20261102.md",
+                "docs/history/performance/evaluation-pipeline-20261102.md",
+                "docs/history/rendering/real-authority-repair-20261102.md",
+                "docs/history/rendering/storage-helper-loading-20261102.md",
+                "docs/history/rendering/sodium-options-20261102.md",
+                "docs/compatibility/freeterraforged.md",
+            ):
+                report = source / name
+                if report.is_file():
+                    output.write(report, name)
         # List the selected targets in their requested order, followed by the
         # completed ZIP. Keep this table outside the ZIP to avoid self-reference.
         checksums = staging / "SHA256SUMS.txt"

@@ -21,13 +21,22 @@ public final class TerrainPredictionFixtures {
     public static void bootstrap() {
         net.minecraft.SharedConstants.tryDetectVersion();
         net.minecraft.server.Bootstrap.bootStrap();
+        // DimensionType now decodes infiniburn as a real block HolderSet.
+        // Standalone Bootstrap omits the resource/tag reload performed by a game.
+        VanillaBlockTagFixtures.bootstrap();
     }
     public static synchronized RegistryAccess access() {
         if (access == null) {
             var lookup = net.minecraft.data.registries.VanillaRegistries.createWorldLookup();
             sourceLookup = lookup;
             var values = new ArrayList<Registry<?>>();
-            lookup.listRegistries().forEach(registry -> values.add(copy(registry)));
+            // createWorldLookup includes static registries in 26.3. Reusing the
+            // actual registry preserves resource tags and holder ownership.
+            lookup.listRegistries().forEach(registry -> {
+                var builtIn = net.minecraft.core.registries.BuiltInRegistries.REGISTRY
+                        .getOptional(registry.key().identifier());
+                values.add(builtIn.isPresent() ? builtIn.get() : copy(registry));
+            });
             access = new RegistryAccess.ImmutableRegistryAccess(values);
         }
         return access;

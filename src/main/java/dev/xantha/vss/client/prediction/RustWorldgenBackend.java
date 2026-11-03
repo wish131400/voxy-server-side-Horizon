@@ -4,8 +4,9 @@ import java.nio.ByteBuffer;
 import java.nio.file.Path;
 
 /**
- * Independent ABI 6 for the source-built Rust backend. All numerical work runs
- * in Rust; Java supplies effective registries, colormaps and immutable inputs.
+ * Independent ABI 6 for the source-built Rust backend. Rust owns worldgen and
+ * seeded inputs; optional GPU preview heights rejoin its material/biome stage.
+ * Java supplies effective registries, colormaps and immutable inputs.
  *
  * <p>A surface region is before carvers/structures/decoration and
  * must not be published as a completed generated chunk. Query support before
@@ -40,6 +41,9 @@ public final class RustWorldgenBackend {
     /** Replaces both resource-pack colormaps atomically; terrain algorithms stay unchanged. */
     public static native void colormaps(long world,String document);
     public static native String describe(long handle);
+    public static native String horizontalDescriptor(long world);
+    public static native String horizontalStats(long world);
+    public static native int horizontalLookup(long world, ByteBuffer input, ByteBuffer output, int count);
     public static native String support(long world, String featureJson, int placedFeature);
     /** XYZ int32 input; one float64 density per point, at most 65,536 points. */
     public static native int density(long world, String routerNode, ByteBuffer xyz, ByteBuffer output, int count);
@@ -66,17 +70,43 @@ public final class RustWorldgenBackend {
     public static native String schedule(long world);
     /** Rust derives decoration/feature seeds, checks biome membership and applies modifiers lazily. */
     public static native String placedFeature(long result, String name, int chunkX, int chunkZ, int globalIndex, int step);
+    /** Same transaction without a diagnostic JSON result: zero/one is the original placement boolean. */
+    public static native int placedFeatureStatus(long result, String name, int chunkX, int chunkZ, int globalIndex, int step);
+    private static volatile boolean legacyFeatureStatus;
+    static void applyPlacedFeature(long result, String name, int chunkX, int chunkZ, int globalIndex, int step) {
+        if (!legacyFeatureStatus) {
+            try {
+                placedFeatureStatus(result, name, chunkX, chunkZ, globalIndex, step);
+                return;
+            } catch (UnsatisfiedLinkError olderLibrary) {
+                legacyFeatureStatus = true;
+            }
+        }
+        placedFeature(result, name, chunkX, chunkZ, globalIndex, step);
+    }
+
     /** 256 X,Z records of ten int32: floor, fluid top/kind, flags, three material states, grass/leaf/water RGB. */
     public static native int surfaceColumns(long world, int chunkX, int chunkZ, ByteBuffer output);
     /** Sparse XZ int32 input, at most 64 records, same ten-int32 output as surfaceColumns. */
     public static native int surfacePoints(long world, ByteBuffer xz, ByteBuffer output, int count);
     public static native int previewPoints(long world, ByteBuffer xz, ByteBuffer output, int count);
+    /** Optional ABI 6 extension: seeded float density program for Vulkan Compute. */
+    public static native String vulkanProgram(long world);
+    /** Preview-only GPU heights, one int32 per XZ. Exact APIs are unchanged. */
+    public static native int previewPointsGpu(long world, ByteBuffer xz, ByteBuffer output, int count, ByteBuffer heights);
     /** Display-only approximation, including visual vegetation; never seed exact caches. */
     public static native int displayPoints(long world, ByteBuffer xz, ByteBuffer output, int count);
     /** Additive ABI 6 entry: complete 8x8 shape plus missing bits (row-major).
      * Writes 64 ten-int records; callers consume only missing cells and keep known exact values.
      * Older external ABI 6 libraries may lack this entry; callers must use displayPoints then. */
     public static native int displayGrid(long world, int x, int z, int spacing, long missing, ByteBuffer output);
+    /** Additive ABI 6 display offload. Mask skips native cache hits/structure chunks. */
+    public static native long displayGpuMask(long world, ByteBuffer xz, int count);
+    /** Independent Cell-mode boundaries for device validation; bypasses display caches. */
+    public static native int displayDensityFloors(long world, ByteBuffer xz, ByteBuffer output, int count);
+    /** Cell-mode GPU boundaries; MIN_VALUE keeps the CPU route for that column. */
+    public static native int displayPointsGpu(long world, ByteBuffer xz, ByteBuffer output, int count, ByteBuffer heights);
+    public static native int displayGridGpu(long world, int x, int z, int spacing, long missing, ByteBuffer output, ByteBuffer heights);
     /** Existing prediction surface context, 5x5 chunks, assembled in Rust. */
     public static native long surfaceProxy(long world, int centerChunkX, int centerChunkZ);
     /** Separate display policy; exact surfaceProxy callers never see approximate records. */
@@ -98,4 +128,8 @@ public final class RustWorldgenBackend {
      * No BiomeManager zoom or height clamp; existing ten-int surface records are unchanged.
      * Older libraries may omit both the palette and this entry point. */
     public static native int biomeIndices(long world, ByteBuffer quartXyz, ByteBuffer output, int count);
+    /** Conservative whole-column biome union for an inclusive quart XZ rectangle.
+     * Writes native biome indices; -1 means unknown and keeps normal placement. */
+    public static native int possibleBiomes(long world, int minQuartX, int minQuartZ,
+                                          int maxQuartX, int maxQuartZ, ByteBuffer output);
 }

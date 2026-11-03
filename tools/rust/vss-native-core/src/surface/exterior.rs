@@ -39,7 +39,7 @@ impl Surface {
     ) -> Result<()> {
         let graph = &job.terrain.graph;
         let depth = self.depth(graph, x, z);
-        let secondary = graph.noise(self.secondary, x as f64, 0., z as f64);
+        let secondary = std::cell::LazyCell::new(|| graph.noise(self.secondary, x as f64, 0., z as f64));
         let min_surface = self.min_surface(job, x, z, depth);
         let [north, south, west, east] = neighbours;
         let steep = south >= north + 4 || west >= east + 4;
@@ -70,19 +70,20 @@ impl Surface {
                 if self.modern || state == self.default {
                     let p = [x, y, z];
                     let (name, data) = biome(p)?;
+                    let (rule, needs_cold, needs_secondary) = self.biome_rule(name);
                     let c = Context {
                         p,
                         biome: name,
-                        cold: colors.temperature_with_sea_level(data, p, job.terrain.sea_level) < 0.15,
-                        steep,
+                        cold: needs_cold && colors.temperature_with_sea_level(data, p, job.terrain.sea_level) < 0.15,
+                        steep: Steepness::Known(steep),
                         depth,
-                        secondary,
+                        secondary: if needs_secondary { *secondary } else { 0.0 },
                         above,
                         below: y - floor + 1,
                         water,
                         min_surface,
                     };
-                    if let Some(id) = self.rule(&self.rule, graph, &c, &mut Some(&mut job.scratch)) {
+                    if let Some(id) = self.rule(rule, graph, &c, &mut Some(&mut job.scratch)) {
                         column.blocks[(y - column.bottom) as usize] = id;
                     }
                 }

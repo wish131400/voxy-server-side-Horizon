@@ -264,6 +264,9 @@ class PredictionProgressiveLoadingTest {
                 return source.sample(x, z);
             }
             @Override ClientTerrainSampler decorationContext() { return source; }
+            @Override net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome> noiseBiome(int x, int y, int z) {
+                return source.noiseBiome(x, y, z);
+            }
             @Override public ClientColumnSample sampleForLod(int x, int z, int step) {
                 if (x > (surface ? 65536 : 1024) && blockOnce.compareAndSet(true, false)) {
                     entered.countDown();

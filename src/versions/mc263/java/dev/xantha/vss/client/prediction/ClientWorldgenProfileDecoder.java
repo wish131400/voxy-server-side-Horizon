@@ -140,7 +140,7 @@ final class ClientWorldgenProfileDecoder {
                         if (plan.kind() == dev.xantha.vss.common.worldgen.TerrainPredictionPlan.Kind.LOD_SOURCE) {
                             ClientTerrainSampler lod = PredictionLodBackends.open(new PredictionLodContext(
                                     profile, plan, generatorRoot, registries, clientRegistries));
-                            publish(profile, lod, generatorRoot, registryRoot, legacyIdentity, active, ready);
+                            publish(profile, lod, generatorRoot, registryRoot, registries.ops(), legacyIdentity, active, ready);
                             dimensionTiming.finish();
                             continue;
                         }
@@ -148,7 +148,7 @@ final class ClientWorldgenProfileDecoder {
                             if (!plan.backend().equals("vss:flat_layers") || plan.revision() != 1)
                                 throw new IllegalArgumentException("Unsupported flat terrain contract");
                             var flat = new PredictionFlatTerrainSampler(profile, generatorRoot, registries);
-                            publish(profile, flat, generatorRoot, registryRoot, legacyIdentity, active, ready);
+                            publish(profile, flat, generatorRoot, registryRoot, registries.ops(), legacyIdentity, active, ready);
                             dimensionTiming.finish();
                             continue;
                         }
@@ -156,7 +156,7 @@ final class ClientWorldgenProfileDecoder {
                     java.util.Optional<ClientTerrainSampler> custom = PredictionTerrainBackends.open(
                             profile, profile.seed(), clientRegistries, registries, shared);
                     if (custom.isPresent()) {
-                        publish(profile, custom.get(), generatorRoot, registryRoot, legacyIdentity, active, ready);
+                        publish(profile, custom.get(), generatorRoot, registryRoot, registries.ops(), legacyIdentity, active, ready);
                         dimensionTiming.finish();
                         continue;
                     }
@@ -176,7 +176,7 @@ final class ClientWorldgenProfileDecoder {
                         if (cacheReady != null) {
                             var cacheSampler = new PredictionCacheSampler(profile, biomeSource, registries.templates());
                             try {
-                                publish(profile, cacheSampler, generatorRoot, registryRoot, legacyIdentity, active, cacheReady);
+                                publish(profile, cacheSampler, generatorRoot, registryRoot, registries.ops(), legacyIdentity, active, cacheReady);
                             } catch (java.util.concurrent.CancellationException cancelled) { throw cancelled; }
                             catch (RuntimeException failure) {
                                 VSSLogger.warn("VSS early cache display unavailable for " + profile.dimension()
@@ -208,7 +208,7 @@ final class ClientWorldgenProfileDecoder {
                     ClientTerrainSampler betterEndSampler = javaSampler == null ? null
                             : BetterEndCompat.wrap(profile, javaSampler);
                     if (betterEndSampler != null) {
-                        publish(profile, betterEndSampler, generatorRoot, registryRoot, legacyIdentity, active, ready);
+                        publish(profile, betterEndSampler, generatorRoot, registryRoot, registries.ops(), legacyIdentity, active, ready);
                         dimensionTiming.finish();
                         continue;
                     }
@@ -225,13 +225,13 @@ final class ClientWorldgenProfileDecoder {
                         throw failure;
                     }
                     if (rustSampler != null) {
-                        publish(profile, rustSampler, generatorRoot, registryRoot, legacyIdentity, active, ready);
+                        publish(profile, rustSampler, generatorRoot, registryRoot, registries.ops(), legacyIdentity, active, ready);
                         dimensionTiming.mark("nativeAndPublish");
                         dimensionTiming.finish();
                         continue;
                     }
                     if (javaSampler != null) {
-                        publish(profile, javaSampler, generatorRoot, registryRoot, legacyIdentity, active, ready);
+                        publish(profile, javaSampler, generatorRoot, registryRoot, registries.ops(), legacyIdentity, active, ready);
                         dimensionTiming.finish();
                         if (dev.xantha.vss.config.VSSClientConfig.CONFIG.debugLogging) {
                             VSSLogger.debug("VSS prediction backend: dimension=" + profile.dimension()
@@ -266,12 +266,13 @@ final class ClientWorldgenProfileDecoder {
 
     private static void publish(DimensionProfile profile, ClientTerrainSampler sampler,
             JsonObject generatorRoot, JsonObject registryRoot,
+            com.mojang.serialization.DynamicOps<com.google.gson.JsonElement> ops,
             java.util.function.Supplier<String> legacyIdentity,
             java.util.function.BooleanSupplier active,
             java.util.function.BiConsumer<ResourceKey<Level>, ClientTerrainSampler> ready) {
         try {
             checkActive(active);
-            sampler.bindDimensionType(generatorRoot);
+            sampler.bindDimensionType(generatorRoot, ops);
             PredictionBackendSelection.bind(sampler, generatorRoot, registryRoot);
             VSSLogger.info("VSS terrain plan: dimension=" + profile.dimension() + ',' + sampler.predictionBackendDiagnostics());
             sampler.legacyCacheIdentity(legacyIdentity);
@@ -337,7 +338,7 @@ final class ClientWorldgenProfileDecoder {
                 profile, generator, randomState, heights, registries, clientRegistries) : new ClientTerrainSampler(
                 profile.seed(), profile, generator, randomState, heights, settings.seaLevel(),
                 registries, clientRegistries);
-        sampler.bindDimensionType(generatorRoot);
+        sampler.bindDimensionType(generatorRoot, registries.ops());
         // Epic Terrain uses height-dependent cache_2d nodes. Its surface needs
         // NoiseChunk's evaluation order, including when no native library loads.
         return registries.hasDensityNamespace("etn") ? new MinecraftColumnTerrainSampler(sampler) : sampler;

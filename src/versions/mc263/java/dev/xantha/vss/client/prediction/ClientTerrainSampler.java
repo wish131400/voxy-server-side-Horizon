@@ -64,6 +64,7 @@ public class ClientTerrainSampler implements AutoCloseable {
 
     private volatile Map<net.minecraft.resources.Identifier, Integer> captureBiomeNames;
     private volatile java.util.List<String> cachedBiomeNames;
+    private volatile Holder<Biome>[] cachedBiomeHolders;
     private volatile Map<String,Integer> persistedBiomeIndices;
 
     int captureBiomeIndex(Holder<Biome> biome, int fallback) {
@@ -265,6 +266,20 @@ public class ClientTerrainSampler implements AutoCloseable {
         biomeIndices.forEach((biome, index) -> names[index] = biome.unwrapKey()
                 .map(key -> key.identifier().toString()).orElse(""));
         return cachedBiomeNames = java.util.List.of(names);
+    }
+
+    /** Same snapshot holders and palette order as persisted/native biome identities. */
+    final Holder<Biome> cacheBiomeHolder(int index) {
+        var context = decorationContext();
+        if (context != this) return context.cacheBiomeHolder(index);
+        var holders = cachedBiomeHolders;
+        if (holders == null) {
+            @SuppressWarnings("unchecked")
+            Holder<Biome>[] prepared = (Holder<Biome>[]) new Holder<?>[biomeIndices.size()];
+            biomeIndices.forEach((holder, slot) -> prepared[slot] = holder);
+            cachedBiomeHolders = holders = prepared;
+        }
+        return index >= 0 && index < holders.length ? holders[index] : null;
     }
 
     final Map<String,Integer> cacheBiomeIndices() {
@@ -488,13 +503,16 @@ public class ClientTerrainSampler implements AutoCloseable {
     }
 
     String climateCompilerDiagnostics() {
-        return climateOptimization == null ? "state=unavailable" : climateOptimization.diagnostics();
+        return climateOptimization == null ? "state=unavailable" : climateOptimization.diagnostics() + "," + climateOptimization.horizontalDiagnostics();
     }
 
     void cancelDensityCompilation() {
         if (densityCompilation != null) densityCompilation.close();
         if (climateOptimization != null) climateOptimization.close();
     }
+
+    void bindHorizontalClimate(long world, com.google.gson.JsonObject document) { if (climateOptimization != null) climateOptimization.bindHorizontal(world, randomState, document, seed); }
+    void detachHorizontalClimate() { if (climateOptimization != null) climateOptimization.detachHorizontal(); }
 
     @Override public void close() { cancelDensityCompilation(); }
 
@@ -511,7 +529,9 @@ public class ClientTerrainSampler implements AutoCloseable {
         return generatorContext().getOrigin(randomStateContext());
     }
 
-    void bindDimensionType(com.google.gson.JsonObject generatorRoot) {
+    // Cache-only and external samplers need snapshot registry ops without a generation context.
+    void bindDimensionType(com.google.gson.JsonObject generatorRoot,
+            com.mojang.serialization.DynamicOps<com.google.gson.JsonElement> ops) {
         if (generatorRoot != null && generatorRoot.has("vss_structure_origin")) {
             var coordinates = generatorRoot.getAsJsonArray("vss_structure_origin");
             if (coordinates.size() != 2) throw new IllegalArgumentException("Invalid structure origin snapshot");
@@ -521,8 +541,7 @@ public class ClientTerrainSampler implements AutoCloseable {
         if (generatorRoot != null && generatorRoot.has("vss_dimension_type")) {
             ClientTerrainSampler context = decorationContext();
             context.decorationDimensionType = net.minecraft.world.level.dimension.DimensionType.DIRECT_CODEC
-                    .parse(context.decorationAccess().createSerializationContext(com.mojang.serialization.JsonOps.INSTANCE),
-                            generatorRoot.get("vss_dimension_type")).getOrThrow();
+                    .parse(ops, generatorRoot.get("vss_dimension_type")).getOrThrow();
         }
     }
 

@@ -1,0 +1,40 @@
+// Opt-in checks against a real Sodium release. Sodium remains optional in production.
+allprojects { afterEvaluate {
+    def p = project
+    def suite = p.sourceSets.create('sodiumOptions') {
+        java.srcDir p.file('tools/verification/sodium-options/java')
+        compileClasspath += p.sourceSets.main.output + p.sourceSets.test.output + p.sourceSets.test.compileClasspath
+        runtimeClasspath += p.sourceSets.main.output + p.sourceSets.test.runtimeClasspath
+    }
+    def dependency = suite.runtimeOnlyConfigurationName
+    if (p.minecraft_version.startsWith('1.')) {
+        dependency = 'modSodiumOptionsRuntimeOnly'
+        p.loom.addRemapConfiguration(dependency) {
+            sourceSet = suite
+            targetConfigurationName = suite.runtimeOnlyConfigurationName
+            onCompileClasspath = false
+            onRuntimeClasspath = true
+            applyDependencyTransforms = true
+        }
+    }
+    if (p.providers.gradleProperty('vssSodiumJar').isPresent()) {
+        p.dependencies.add(dependency, p.files(p.providers.gradleProperty('vssSodiumJar').map { p.file(it) }))
+    }
+    p.tasks.register('sodiumOptionsTest', Test) {
+        dependsOn p.tasks.named(suite.classesTaskName)
+        testClassesDirs = suite.output.classesDirs
+        classpath = suite.runtimeClasspath
+        useJUnitPlatform()
+        maxParallelForks = 1
+        forkEvery = 1
+        maxHeapSize = '2G'
+        doFirst {
+            if (!p.providers.gradleProperty('vssSodiumJar').isPresent()) {
+                throw new GradleException('Supply -PvssSodiumJar with the actual Sodium release JAR')
+            }
+            logger.lifecycle('Sodium runtime inputs: ' + classpath.files.findAll { it.name.contains('sodium') })
+            systemProperty 'vss.sodiumJar', p.file(p.providers.gradleProperty('vssSodiumJar').get()).absolutePath
+        }
+        testLogging { events 'failed', 'skipped'; exceptionFormat 'full' }
+    }
+} }

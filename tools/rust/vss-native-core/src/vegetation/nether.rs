@@ -194,8 +194,8 @@ impl NetherFeature {
                 Self::Spring(
                     state,
                     v["requires_block_below"].as_bool().unwrap_or(true),
-                    integer(v, "rock_count")?,
-                    integer(v, "hole_count")?,
+                    if v.get("rock_count").is_some() { integer(v, "rock_count")? } else { 4 },
+                    if v.get("hole_count").is_some() { integer(v, "hole_count")? } else { 1 },
                     Predicate::parse(&test, p, 0)?,
                 )
             }

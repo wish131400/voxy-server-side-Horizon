@@ -92,6 +92,28 @@ class PredictionCaptureInvalidationBatchTest {
         } finally { VSSClientConfig.CONFIG.predictionDistanceBlocks = distance; }
     }
 
+    @Test void ordinaryCaptureKeepsTheTerrainBorderWithoutInvalidatingThePlacementHalo() throws Exception {
+        try (var manager = manager(null)) {
+            var local = new PredictionTileManager.PredictionTileKey(Level.OVERWORLD, 0, 0, 0);
+            var neighbor = new PredictionTileManager.PredictionTileKey(Level.OVERWORLD, 1, 0, 0);
+            var coarse = new PredictionTileManager.PredictionTileKey(Level.OVERWORLD, 0, 0, 6);
+            Set<PredictionTileManager.PredictionTileKey> pending = field(manager, "pending");
+            Map<PredictionTileManager.PredictionTileKey, Long> epochs = field(manager, "captureEpochs");
+            pending.addAll(Set.of(local, neighbor, coarse));
+            assertFalse(PredictionTileManager.captureIntersectsGrid(coarse, manager.layout(), 1, 1));
+
+            manager.capturedTerrainChanged(1, 1);
+            assertEquals(1L, epochs.get(local));
+            assertEquals(1L, epochs.get(coarse), "area mip still depends on captures between grid nodes");
+            assertFalse(epochs.containsKey(neighbor), "ordinary ground capture does not change distant placement inputs");
+
+            manager.invalidate(1, 1);
+            assertEquals(1L, epochs.get(neighbor), "real edits keep their vegetation/building halo");
+            manager.capturedTerrainChanged(3, 1);
+            assertEquals(2L, epochs.get(neighbor), "terrain capture inside the neighboring preview border still invalidates it");
+        }
+    }
+
     @Test void diskBatchExpandsEveryDependencyOnceAndRejectsLaterLeasesAgain() throws Exception {
         var columns = new it.unimi.dsi.fastutil.longs.LongOpenHashSet(new long[]{
                 PositionUtil.packPosition(-1, -1), PositionUtil.packPosition(0, -1), PositionUtil.packPosition(-1, -1)});

@@ -91,7 +91,9 @@ dependencies.add(smokeRuntimeConfiguration, files(nestedSmokeLibraries))
 
 def smokeReport = providers.gradleProperty('vssSmokeReport')
         .map { file(it) }.orElse(layout.buildDirectory.file('client-smoke.json').map { it.asFile })
-def requiredMods = ['vss', 'voxy', 'sodium', 'fabric-api']
+def requiredMods = providers.gradleProperty('vssSmokeRequiredMods')
+        .map { it.split(',').collect { id -> id.trim() }.findAll { it } }
+        .getOrElse(['vss', 'voxy', 'sodium', 'fabric-api'])
 if (providers.gradleProperty('vssIrisJar').isPresent()) requiredMods.add('iris')
 
 loom {
@@ -107,6 +109,9 @@ loom {
                     .getOrElse('run/client-smoke-' + minecraft_version)
             vmArg '-Dvss.smoke.report=' + smokeReport.get().absolutePath
             vmArg '-Dvss.smoke.requiredMods=' + requiredMods.join(',')
+            if (providers.gradleProperty('vssSmokeSodiumOptions').isPresent()) {
+                vmArg '-Dvss.smoke.sodiumOptions=true'
+            }
             ideConfigGenerated false
         }
     }
@@ -118,7 +123,9 @@ tasks.named('runClientSmoke').configure {
     dependsOn tasks.named(smokeSources.classesTaskName)
     timeout = Duration.ofSeconds(180)
     doFirst {
-        ['vssVoxyJar', 'vssSodiumJar'].each { propertyName ->
+        def requiredJars = ['vssSodiumJar']
+        if (requiredMods.contains('voxy')) requiredJars.add('vssVoxyJar')
+        requiredJars.each { propertyName ->
             if (!providers.gradleProperty(propertyName).isPresent()) {
                 throw new GradleException('Client smoke requires -P' + propertyName + '=<matching release JAR>')
             }

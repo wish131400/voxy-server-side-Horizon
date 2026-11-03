@@ -19,7 +19,14 @@ final class PredictionCaptureRefresh {
         return burst != null && burst.repeated() && now - burst.latest() < QUIET_NANOS
                 && now - burst.first() < MAX_NANOS;
     }
-    void started(PredictionTileKey key) { bursts.remove(key); }
+    void attempted(PredictionTileKey key, long now) {
+        Burst burst = bursts.get(key);
+        // The maximum delay grants one attempt, not an unlimited bypass for
+        // every subsequent capture if that attempt is superseded again.
+        if (burst != null && now - burst.first() >= MAX_NANOS)
+            bursts.put(key, new Burst(now, burst.latest(), burst.repeated()));
+    }
+    void completed(PredictionTileKey key) { bursts.remove(key); }
     void retain(Set<PredictionTileKey> keys) { bursts.keySet().retainAll(keys); }
     void clear() { bursts.clear(); }
 }
