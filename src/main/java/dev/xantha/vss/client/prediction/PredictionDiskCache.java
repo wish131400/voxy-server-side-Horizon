@@ -414,7 +414,8 @@ final class PredictionDiskCache implements AutoCloseable {
 
     TerrainData readTerrainData(Lease lease, int count) {
         TerrainData data = read(lease, (input, version) -> decodeTerrain(input, version, count));
-        if (data != null && Arrays.stream(data.samples()).anyMatch(ClientColumnSample::cityGround)) {
+        if (data != null && Arrays.stream(data.samples()).anyMatch(sample ->
+                sample.cityGround() || PredictionCaptureGround.obsolete(sample))) {
             // Only contaminated terrain is rebuilt; captures and decoration
             // records stay intact. Do not let its old fine grid block repair.
             synchronized (shared) { terrainWriteColumns.remove(lease.key); }

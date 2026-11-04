@@ -145,7 +145,7 @@ class PredictionInitializationTest {
                 "vss-test:lazy-session", "test", 2L);
         var payload = new dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload(3, 42, 1, List.of(a, b));
         try (var session = new ClientWorldgenProfileDecoder.Session(payload, net.minecraft.core.RegistryAccess.EMPTY,
-                new com.google.gson.JsonObject(), null, null, () -> { throw new AssertionError("No legacy cache lookup requested"); })) {
+                new com.google.gson.JsonObject(), emptyRegistries(), null, () -> { throw new AssertionError("No legacy cache lookup requested"); })) {
             assertTrue(opened.isEmpty());
             var published = new java.util.ArrayList<net.minecraft.resources.ResourceKey<Level>>();
             session.decode(Level.OVERWORLD, () -> true, (key, sampler) -> published.add(key));
@@ -181,7 +181,7 @@ class PredictionInitializationTest {
                 "vss-test:content-session", "test", 2);
         var payload = new dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload(3, 42, 1, List.of(invalid, valid));
         try (var session = new ClientWorldgenProfileDecoder.Session(payload, net.minecraft.core.RegistryAccess.EMPTY,
-                new com.google.gson.JsonObject(), null, null, () -> { throw new AssertionError("No legacy cache lookup requested"); })) {
+                new com.google.gson.JsonObject(), emptyRegistries(), null, () -> { throw new AssertionError("No legacy cache lookup requested"); })) {
             assertDoesNotThrow(() -> session.decode(Level.OVERWORLD, () -> true,
                     (key, sampler) -> fail("malformed generator must not publish")));
             var published = new java.util.ArrayList<ClientTerrainSampler>();
@@ -211,6 +211,13 @@ class PredictionInitializationTest {
             assertArrayEquals(firstContext.sampleChunk(7, -3), secondContext.sampleChunk(7, -3));
             assertEquals(999, second.profile().fingerprint());
         }
+    }
+
+    private static ClientWorldgenRegistries emptyRegistries() {
+        var root = new com.google.gson.JsonObject();
+        root.add("noises", new com.google.gson.JsonObject());
+        root.add("density_functions", new com.google.gson.JsonObject());
+        return ClientWorldgenRegistries.decode(root, net.minecraft.core.RegistryAccess.EMPTY, List.of());
     }
 
     private static DimensionProfile profile(String dimension) {

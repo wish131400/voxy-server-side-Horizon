@@ -21,7 +21,27 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 class PredictionSurfaceStructuresTest {
-    @BeforeAll static void bootstrap() { ClientTerrainSamplerTest.bootstrapMinecraft(); }
+    private static org.mockito.MockedStatic<net.fabricmc.loader.api.FabricLoader> loader;
+    @org.junit.jupiter.api.io.TempDir static java.nio.file.Path gameDirectory;
+    @BeforeAll static void bootstrap() {
+        var runtime = org.mockito.Mockito.mock(net.fabricmc.loader.api.FabricLoader.class);
+        org.mockito.Mockito.when(runtime.getGameDir()).thenReturn(gameDirectory);
+        loader = org.mockito.Mockito.mockStatic(net.fabricmc.loader.api.FabricLoader.class);
+        loader.when(net.fabricmc.loader.api.FabricLoader::getInstance).thenReturn(runtime);
+        ClientTerrainSamplerTest.bootstrapMinecraft();
+    }
+    @org.junit.jupiter.api.AfterAll static void closeLoader() { loader.close(); }
+
+    private static void bindBiomeFixture(JsonObject root) {
+        var lookup = dev.xantha.vss.testutil.TerrainPredictionFixtures.sourceLookup();
+        var biome = net.minecraft.world.level.biome.Biome.DIRECT_CODEC.encodeStart(
+                net.minecraft.resources.RegistryOps.create(com.mojang.serialization.JsonOps.INSTANCE, lookup),
+                lookup.lookupOrThrow(Registries.BIOME).getOrThrow(net.minecraft.world.level.biome.Biomes.PLAINS).value())
+                .getOrThrow(false, message -> { throw new IllegalStateException(message); }).getAsJsonObject();
+        biome.add("features", new com.google.gson.JsonArray());
+        root.getAsJsonObject("biomes").add("vss:plain", biome);
+    }
+
 
     @Test void vanillaDimensionStructuresUseTheirActualDecorationStages() {
         var registry = VanillaRegistries.createLookup().lookupOrThrow(Registries.STRUCTURE);
@@ -96,6 +116,7 @@ class PredictionSurfaceStructuresTest {
         // Use the actual dependency templates, including jigsaw connector NBT.
         // Both layouts are used by the supported Minecraft versions.
         loadPoolTemplates(pools, templates);
+        bindBiomeFixture(root);
         root.add("structure_templates", templates);
         var access = ClientWorldgenRegistries.decode(root, dev.xantha.vss.testutil.TerrainPredictionFixtures.access()).access();
         var context = sampler(access, templates);
@@ -143,8 +164,9 @@ class PredictionSurfaceStructuresTest {
             assertNotNull(input, "vanilla Minecraft dependency must supply the original village template");
             templates.addProperty(id, java.util.Base64.getEncoder().encodeToString(input.readAllBytes()));
         }
+        bindBiomeFixture(root);
         root.add("structure_templates", templates);
-        var registries = ClientWorldgenRegistries.decode(root, RegistryAccess.EMPTY);
+        var registries = ClientWorldgenRegistries.decode(root, dev.xantha.vss.testutil.TerrainPredictionFixtures.access());
         var access = registries.access();
         assertEquals(1, access.registryOrThrow(Registries.STRUCTURE).size());
         assertEquals(2, access.registryOrThrow(Registries.TEMPLATE_POOL).size());

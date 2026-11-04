@@ -24,12 +24,14 @@ public final class VulkanPredictionCompute implements AutoCloseable {
     // continue in Rust; render/main threads never submit work here.
     private static final Semaphore REQUEST_SLOTS = new Semaphore(8);
     // Leave other builders on Rust while a large display request is running.
-    // Two 256-column callers can already fill one GPU dispatch.
-    private static final Semaphore DISPLAY_SLOTS = new Semaphore(2);
+    // Four callers can populate both 512-column pipeline buffers, while other
+    // builders keep running Rust. The global request bound is unchanged.
+    private static final Semaphore DISPLAY_SLOTS = new Semaphore(4);
     private final ArrayDeque<Request> pending = new ArrayDeque<>();
     private boolean draining;
-    private final LongAdder submissions = new LongAdder(), queueNanos = new LongAdder();
+    private final LongAdder submissions = new LongAdder(), queueNanos = new LongAdder(), fenceWaitNanos = new LongAdder();
     private final LongAccumulator largestBatch = new LongAccumulator(Long::max, 0);
+    private final LongAccumulator largestInFlight = new LongAccumulator(Long::max, 0);
     private record Request(int[] xyz, int kind, CompletableFuture<int[]> completion, long queuedAt) {}
     private final long world;
     private final int bottom, top;
@@ -281,46 +283,83 @@ public final class VulkanPredictionCompute implements AutoCloseable {
         REQUEST_SLOTS.release();
         request.completion.complete(values);
     }
-    private void drain(VulkanDensityDevice active) {
+    private record Flight(java.util.List<Request> requests, VulkanDensityDevice.Submission submission, long started) { }
+
+    private java.util.List<Request> takeBatch(VulkanDensityDevice active) {
         var group = new ArrayList<Request>(8);
         int count = 0;
         synchronized (this) {
-            if (closed || device != active || !VSSClientConfig.CONFIG.predictionVulkanAcceleration) {
-                draining = false; cancelPending(); return;
-            }
+            if (closed || device != active || !VSSClientConfig.CONFIG.predictionVulkanAcceleration) return group;
             while (!pending.isEmpty() && (group.isEmpty() || pending.peekFirst().kind == group.getFirst().kind)
                     && count + pending.peekFirst().xyz.length / 3 <= VulkanDensityDevice.MAX_COLUMNS) {
                 var request = pending.removeFirst(); group.add(request); count += request.xyz.length / 3;
             }
         }
-        int[] joined = new int[count * 3]; int offset = 0;
-        for (var request : group) { System.arraycopy(request.xyz, 0, joined, offset, request.xyz.length); offset += request.xyz.length; }
-        int[] result = null;
+        return group;
+    }
+
+    private static void finishBatch(java.util.List<Request> group, int[] result) {
+        int offset = 0;
+        for (var request : group) {
+            int size = request.xyz.length / 3;
+            int[] values = result == null ? null : Arrays.copyOfRange(result, offset, offset + size);
+            if (values != null) for (int value : values) if (value == Integer.MIN_VALUE) { values = null; break; }
+            finish(request, values); offset += size;
+        }
+    }
+
+    private void drain(VulkanDensityDevice active) {
+        var flights = new ArrayDeque<Flight>(VulkanDensityDevice.PIPELINE_DEPTH);
+        java.util.List<Request> submitting = null;
         boolean dispose = false;
+        int completed = 0;
         try {
-            long start = System.nanoTime();
-            for (var request : group) queueNanos.add(start - request.queuedAt);
-            result = active.dispatch(joined, count, group.getFirst().kind, bottom, top);
-            nanos.add(System.nanoTime() - start); submissions.increment(); largestBatch.accumulate(count);
+            while (true) {
+                synchronized (this) {
+                    if (closed || device != active || !VSSClientConfig.CONFIG.predictionVulkanAcceleration) return;
+                }
+                // Fill independent buffers before waiting. A second dispatch can
+                // execute while the worker copies/completes the first result.
+                // Yield the shared worker after a bounded turn so another
+                // world's dispatch or deferred device cleanup can run too.
+                while (completed < 4 && active.hasFreeSlot()) {
+                    submitting = takeBatch(active);
+                    if (submitting.isEmpty()) { submitting = null; break; }
+                    int count = submitting.stream().mapToInt(r -> r.xyz.length / 3).sum();
+                    int[] joined = new int[count * 3]; int offset = 0;
+                    for (var request : submitting) {
+                        System.arraycopy(request.xyz, 0, joined, offset, request.xyz.length); offset += request.xyz.length;
+                    }
+                    long start = System.nanoTime();
+                    for (var request : submitting) queueNanos.add(start - request.queuedAt);
+                    var submission = active.submit(joined, count, submitting.getFirst().kind, bottom, top);
+                    flights.addLast(new Flight(submitting, submission, start)); submitting = null;
+                    submissions.increment(); largestBatch.accumulate(count); largestInFlight.accumulate(flights.size());
+                }
+                if (flights.isEmpty()) return;
+                var flight = flights.peekFirst();
+                long waitStart = System.nanoTime();
+                int[] result = active.await(flight.submission);
+                fenceWaitNanos.add(System.nanoTime() - waitStart);
+                nanos.add(System.nanoTime() - flight.started);
+                flights.removeFirst();
+                finishBatch(flight.requests, result);
+                completed++;
+            }
         } catch (RuntimeException | LinkageError failure) {
             reject(failure);
             synchronized (this) {
                 if (device == active) { device = null; dispose = true; }
             }
         } finally {
-            offset = 0;
-            for (var request : group) {
-                int size = request.xyz.length / 3;
-                int[] values = result == null ? null : Arrays.copyOfRange(result, offset, offset + size);
-                if (values != null) for (int value : values) if (value == Integer.MIN_VALUE) { values = null; break; }
-                finish(request, values); offset += size;
-            }
+            if (submitting != null) finishBatch(submitting, null);
+            for (var flight : flights) finishBatch(flight.requests, null);
             synchronized (this) {
                 draining = false;
-                if (device != active) cancelPending(); else scheduleDrain(active);
+                if (closed || device != active || !VSSClientConfig.CONFIG.predictionVulkanAcceleration) cancelPending();
+                else scheduleDrain(active);
             }
-            // Release callers before potentially slow driver reclamation.
-            // close() may already have queued reclamation on this same worker.
+            // Caller permits are released before potentially slow driver cleanup.
             if (dispose) active.close();
         }
     }
@@ -337,6 +376,8 @@ public final class VulkanPredictionCompute implements AutoCloseable {
                 java.util.Map.entry("minDisplaySpacing",displayPolicy.minimumGpuSpacing()),
                 java.util.Map.entry("displayRegionPolicy",displayPolicy.snapshot()),
                 java.util.Map.entry("submissions",submissions.sum()),java.util.Map.entry("largestBatch",largestBatch.get()),
+                java.util.Map.entry("pipelineDepth",VulkanDensityDevice.PIPELINE_DEPTH),
+                java.util.Map.entry("largestInFlight",largestInFlight.get()),java.util.Map.entry("fenceWaitNanos",fenceWaitNanos.sum()),
                 java.util.Map.entry("requests",batches.sum()),java.util.Map.entry("columns",columns.sum()),
                 java.util.Map.entry("displayColumns",displayColumns.sum()),java.util.Map.entry("cacheSkippedColumns",displaySkipped.sum()),
                 java.util.Map.entry("fallbackColumns",fallback.sum()),java.util.Map.entry("queueWaitNanos",queueNanos.sum()),
@@ -347,6 +388,7 @@ public final class VulkanPredictionCompute implements AutoCloseable {
             + ",minDisplaySpacing=" + displayPolicy.minimumGpuSpacing() + ",regionPolicy=" + displayPolicy.snapshot()
             + ",displayColumns=" + displayColumns.sum() + ",displaySkipped=" + displaySkipped.sum()
             + ",submissions=" + submissions.sum() + ",largestBatch=" + largestBatch.get()
+            + ",pipelineDepth=" + VulkanDensityDevice.PIPELINE_DEPTH + ",largestInFlight=" + largestInFlight.get()
             + ",queueWaitMs=" + queueNanos.sum() / 1_000_000.0 + ",batches=" + batches.sum() + ",columns=" + columns.sum() + ",fallbackColumns=" + fallback.sum() + ",computeMs=" + nanos.sum() / 1_000_000.0 + "}"; }
     @Override public synchronized void close() {
         if (closed) return;

@@ -59,8 +59,8 @@ class VulkanDisplayTest {
                             var lane=(Map<?,?>)((Map<?,?>)vulkan.get("displayRegionPolicy")).get(Integer.toString(step));
                             assertNotNull(lane,"the production sampler must enter complete-region admission");
                             assertTrue(((Number)lane.get("checks")).longValue()>0,"cold complete regions must finish admission: "+lane);
-                            boolean faster=((Number)lane.get("gpuNanosPerColumn")).doubleValue()<((Number)lane.get("cpuNanosPerColumn")).doubleValue()*0.8;
-                            if(lane.get("backend").equals("gpu"))assertTrue(faster,"a GPU selection needs recent full-region evidence: "+lane);
+                            boolean comparable=((Number)lane.get("gpuNanosPerColumn")).doubleValue()<=((Number)lane.get("cpuNanosPerColumn")).doubleValue()*1.25;
+                            if(lane.get("backend").equals("hybrid"))assertTrue(comparable,"shared work needs recent full-region evidence: "+lane);
                             else assertTrue(Set.of("cpu-region-faster","cpu-faster-recent-regions").contains(lane.get("reason").toString()),lane.toString());
                             assertTrue(((Number)vulkan.get("displayColumns")).longValue()>0,"GPU audition results must be consumed, even when CPU wins");
                         }

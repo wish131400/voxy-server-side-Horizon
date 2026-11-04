@@ -81,7 +81,7 @@ class PredictionTeleportSchedulingTest {
             residents(manager).put(near,tile(manager.layout(),near,64));
             set(manager,"surfaceDesired",Set.of(near));keys(manager,"desiredKeys").addAll(Set.of(near,middle));
             keys(manager,"voxyDetailTargets").add(middle);
-            ((ArrayDeque<PredictionTileKey>)get(manager,"visibleSurfaceWork")).add(near);
+            ((PredictionSurfaceQueue<PredictionTileKey>)get(manager,"visibleSurfaceWork")).add(near);
             ((ArrayDeque<PredictionTileKey>)get(manager,"voxyDetailWork")).add(middle);
             invoke(manager,"serviceGenerationTurn",0,0,Long.MAX_VALUE);
             assertTrue(keys(manager,"pending").contains(middle));
@@ -98,6 +98,40 @@ class PredictionTeleportSchedulingTest {
             assertFalse(residents(manager).containsKey(old));
             assertTrue(keys(manager,"fallbackKeys").isEmpty());assertTrue(keys(manager,"desiredKeys").isEmpty());
             assertEquals(0,manager.pendingCount());assertEquals(0,calls.get());
+        }
+    }
+
+    @Test void completedOldDemandCannotRepinTilesAfterRelocation() throws Exception {
+        try(var manager=manager(null,new AtomicInteger())) {
+            var old=key(-100000,0);var current=key(2,0);
+            var changes=new PredictionVoxyDetailQueue.Changes(List.of(
+                    new PredictionVoxySource.Detail(old.tileX(),old.tileZ(),old.lod()),
+                    new PredictionVoxySource.Detail(current.tileX(),current.tileZ(),current.lod())),List.of());
+            set(get(manager,"voxyDemand"),"pending",CompletableFuture.completedFuture(changes));
+            invoke(manager,"refreshVoxyDetails",true);
+            assertFalse(keys(manager,"voxyDetailTargets").contains(old));
+            assertFalse(keys(manager,"desiredKeys").contains(old));
+            assertTrue(keys(manager,"voxyDetailTargets").contains(current));
+        }
+    }
+
+    @Test void relocationRevokesOldNativePinsAndSurfaceHandoffsBeforeTheNewPlanArrives() throws Exception {
+        try(var manager=manager(null,new AtomicInteger())) {
+            set(manager,"unifiedVoxy",true);
+            var old=key(-100000,0);var overlap=key(2,0);
+            residents(manager).put(old,tile(manager.layout(),old,16));
+            residents(manager).put(overlap,tile(manager.layout(),overlap,16));
+            keys(manager,"voxyDetailTargets").addAll(Set.of(old,overlap));
+            keys(manager,"desiredKeys").addAll(Set.of(old,overlap));
+            ((ArrayDeque<PredictionTileKey>)get(manager,"voxyDetailWork")).addAll(List.of(old,overlap));
+            ((PredictionSurfaceQueue<PredictionTileKey>)get(manager,"visibleSurfaceWork")).add(old);
+            invoke(manager,"abandonOldViewWork");
+            assertEquals(Set.of(overlap),keys(manager,"voxyDetailTargets"));
+            assertEquals(Set.of(overlap),keys(manager,"desiredKeys"));
+            assertEquals(List.of(overlap),List.copyOf((ArrayDeque<PredictionTileKey>)get(manager,"voxyDetailWork")));
+            assertTrue(((PredictionSurfaceQueue<?>)get(manager,"visibleSurfaceWork")).isEmpty());
+            invoke(manager,"pruneReady",0,0);
+            assertFalse(residents(manager).containsKey(old));assertTrue(residents(manager).containsKey(overlap));
         }
     }
 
@@ -138,7 +172,7 @@ class PredictionTeleportSchedulingTest {
             invoke(manager,"enqueue",key,0,0,false);
             awaitTile(manager,key);
             assertTrue(calls.get()>0);assertTrue(cache.terrainProbePending(disk));
-            assertEquals(1,gate.release.getCount(),"New terrain must publish while the serial writer is still blocked");
+            assertEquals(1,gate.release.getCount(),"New terrain must publish while the independent header reader is still blocked");
         }
     }
 
@@ -164,13 +198,15 @@ class PredictionTeleportSchedulingTest {
             Map<PredictionTileKey,PredictionTile> residents,Set<PredictionTileKey> surfaces,Map<PredictionTileKey,Integer> targets) {
         return new PredictionSchedulePreparation.Input(layout,null,null,0,80,0,1000,-64,320,0,plan,
                 new RenderSnapshot(Level.OVERWORLD,layout,residents,Map.of()),Set.copyOf(plan),surfaces,Set.of(),
-                Set.of(),Set.of(),Set.of(),targets,targets,Map.of(),Map.of(),PredictionMediumCoverage.EMPTY,false,true,false,false,
+                Set.of(),java.util.Set.of(),Set.of(),Set.of(),targets,targets,Map.of(),Map.of(),PredictionMediumCoverage.EMPTY,false,true,false,false,
                 Map.of(),Set.of(),Set.of(),Collections.nCopies(layout.levelCount(),8),null,Map.of(),Map.of(),Map.of(),System.nanoTime(),false);
     }
     static final class Gate implements AutoCloseable {
         final CountDownLatch release=new CountDownLatch(1);final Future<?> task;
         Gate() throws Exception {
-            var field=PredictionDiskCache.class.getDeclaredField("COMMITS");field.setAccessible(true);
+            // Header probes have their own executor; blocking writes no longer
+            // guarantees that a probe remains pending during admission.
+            var field=PredictionDiskCache.class.getDeclaredField("PROBES");field.setAccessible(true);
             var executor=(ExecutorService)field.get(null);var entered=new CountDownLatch(1);
             task=executor.submit(()->{entered.countDown();try{release.await(15,TimeUnit.SECONDS);}catch(InterruptedException e){Thread.currentThread().interrupt();}});
             assertTrue(entered.await(5,TimeUnit.SECONDS));

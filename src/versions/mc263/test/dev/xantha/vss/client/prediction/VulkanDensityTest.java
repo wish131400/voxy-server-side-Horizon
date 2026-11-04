@@ -112,7 +112,8 @@ class VulkanDensityTest {
             int written;
             do {
                 written = compute.preview(xz, out, 64);
-                if (written == 64 || compute.diagnostics().contains("state=cpu-faster")) break;
+                if (written == 64 || compute.diagnostics().contains("state=cpu-faster")
+                        || !expectGpu && compute.diagnostics().contains("state=ready:")) break;
                 assertFalse(compute.diagnostics().contains("state=fallback:"), compute.diagnostics());
                 assertTrue(System.nanoTime() < deadline, compute.diagnostics());
                 Thread.sleep(10);

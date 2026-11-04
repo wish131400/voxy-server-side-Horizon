@@ -7,6 +7,14 @@ import org.junit.jupiter.api.Test;
 /** Cross-language regression: exact cache warmth must preserve display policy and records. */
 class RustDisplayGridReuseTest {
     @Test void partialExactCacheReusePreservesTheNativeGridRoute() throws Exception {
+        assertNativeGrid(false);
+    }
+
+    @Test void preliminaryOnlyVerticalCacheRetainsTheNativeDisplayGridRoute() throws Exception {
+        assertNativeGrid(true);
+    }
+
+    private void assertNativeGrid(boolean preliminaryOrder) throws Exception {
         ClientTerrainSamplerTest.bootstrapMinecraft();
         String library = System.getProperty("vss.testNativeLibrary");
         if (library != null) RustWorldgenBackend.load(java.nio.file.Path.of(library));
@@ -38,6 +46,13 @@ class RustDisplayGridReuseTest {
                     : "{\"type\":\"minecraft:y_clamped_gradient\",\"from_y\":64,\"to_y\":80,\"from_value\":1,\"to_value\":-1}");
             settings.getAsJsonObject("noise_router").add("final_density", flat);
             settings.getAsJsonObject("noise_router").add(modern ? "chunk_surface_level" : "initial_density_without_jaggedness", flat.deepCopy());
+            if (preliminaryOrder) {
+                var cache = new com.google.gson.JsonObject();
+                // 26.3 replaced the legacy marker codecs and renamed this router input.
+                cache.addProperty("type", modern ? "minecraft:cache" : "minecraft:cache_2d");
+                cache.add(modern ? "input" : "argument", flat.deepCopy());
+                settings.getAsJsonObject("noise_router").add(modern ? "chunk_surface_level" : "initial_density_without_jaggedness", cache);
+            }
             long world = RustWorldgenBackend.create(1, 0, document.toString());
             try (var sampler = new RustTerrainSampler(world,
                     profile, new ClientTerrainSampler(1, profile))) {

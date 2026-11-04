@@ -196,6 +196,8 @@ public class FeatureStampLevel implements WorldGenLevel {
     @Override public int getHeight() { return HEIGHT; }
     @Override public int getSeaLevel() { return SEA_LEVEL; }
     @Override public RandomSource getRandom() { return random; }
+    /** Optional dimension predicates can use identity without a live server. */
+    public net.minecraft.resources.ResourceLocation predictionDimension() { return null; }
     public long seed() { return seed; }
     @Override public long getSeed() { return seed; }
     @Override public boolean isClientSide() { return false; }

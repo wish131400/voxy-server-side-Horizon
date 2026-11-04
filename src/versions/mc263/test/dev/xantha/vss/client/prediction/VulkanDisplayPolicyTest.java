@@ -25,7 +25,7 @@ class VulkanDisplayPolicyTest {
         assertTrue(policy.begin(16,true).gpu());
         assertFalse(policy.begin(4,true).measured());
         assertEquals("cpu-region-faster",lane(policy,4).get("reason"));
-        assertEquals("gpu-region-faster",lane(policy,16).get("reason"));
+        assertEquals("cpu-gpu-shared-regions",lane(policy,16).get("reason"));
         assertEquals(768L,lane(policy,4).get("cpuColdColumns"));
         assertEquals(768L,lane(policy,4).get("gpuColdColumns"));
     }
@@ -53,7 +53,7 @@ class VulkanDisplayPolicyTest {
     @Test void recheckIsBoundedAndNeverDuplicatesACompletedRegion() {
         var policy=new VulkanDisplayPolicy();
         audition(policy,4,100_000,200_000);
-        for(int i=0;i<2047;i++) {
+        for(int i=0;i<VulkanDisplayPolicy.CPU_RECHECK_REGIONS-1;i++) {
             var normal=policy.begin(4,true);
             assertFalse(normal.measured());
             assertFalse(normal.gpu());
@@ -90,17 +90,35 @@ class VulkanDisplayPolicyTest {
         var policy=new VulkanDisplayPolicy();
         audition(policy,4,800_000,100_000);
         for(int sentinel=0;sentinel<2;sentinel++) {
-            for(int i=0;i<8;i++) {
+            int consumed = 0;
+            for(int request=0;request<64;request++) {
                 var region=policy.begin(4,true);
-                assertTrue(region.gpu());
-                policy.finish(region,100_000,256,true,true,true);
+                if (region.measured() && !region.gpu()) {
+                    assertEquals(8, consumed);
+                    policy.finish(region,50_000,256,false,false,true);
+                    break;
+                }
+                if (region.gpu()) consumed++;
+                policy.finish(region,region.gpu()?100_000:800_000,256,region.gpu(),region.gpu(),true);
             }
-            var cpu=policy.begin(4,true);
-            assertFalse(cpu.gpu());
-            assertTrue(cpu.measured());
-            policy.finish(cpu,50_000,256,false,false,true);
         }
         assertEquals(2L,lane(policy,4).get("cpuSentinels"));
         assertFalse(policy.begin(4,true).gpu(),"faster recent CPU regions must stop GPU use");
     }
+    @Test void comparableGpuSharesWorkWithoutDisplacingCheapAdaptiveCpuRegions() {
+        var policy=new VulkanDisplayPolicy();
+        audition(policy,16,1_000_000,920_000); // A real win previously rejected by the 20% margin.
+        int gpu=0,cpu=0;
+        for(int i=0;i<8;i++) {
+            var region=policy.begin(16,true);
+            if(region.gpu())gpu++;else cpu++;
+            policy.finish(region,region.gpu()?920_000:1_000_000,256,region.gpu(),region.gpu(),true);
+        }
+        assertEquals(2,gpu);assertEquals(6,cpu);
+        assertEquals(0.25,lane(policy,16).get("gpuRegionShare"));
+        audition(policy,1,100_000,1_100_000);
+        assertFalse(policy.begin(1,true).gpu());
+        assertEquals(16,policy.minimumGpuSpacing());
+    }
+
 }

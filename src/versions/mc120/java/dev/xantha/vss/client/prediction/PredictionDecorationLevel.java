@@ -157,6 +157,8 @@ final class PredictionDecorationLevel extends FeatureStampLevel {
             }
             return sample;
         }
+        if (displayTerrain && PredictionFarDecoration.approximating() && !(terrain instanceof RustTerrainSampler))
+            return PredictionFarDecoration.current().proxySample(x, z);
         if (displayTerrain && terrain instanceof RustTerrainSampler rust) {
             int slot = columnSlot(x, z);
             if (displaySamples == null) displaySamples = new ClientColumnSample[COLUMN_CACHE_SIZE];
@@ -181,6 +183,7 @@ final class PredictionDecorationLevel extends FeatureStampLevel {
     }
 
     private int[] nativeColumn(RustTerrainSampler rust, int x, int z) {
+        if (displayTerrain && PredictionFarDecoration.approximating()) return PredictionFarDecoration.current().proxyRecord(x,z);
         checkColumnBounds(x, z);
         // Callers check cancellation before any retained cache hit.
         int slot = columnSlot(x, z);
@@ -216,6 +219,7 @@ final class PredictionDecorationLevel extends FeatureStampLevel {
     }
 
     void useDisplayTerrain(boolean display) {
+        if (PredictionFarDecoration.approximating()) display = true;
         if (displayTerrain == display) return;
         displayTerrain = display;
         invalidateQueryEpoch();

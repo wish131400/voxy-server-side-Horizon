@@ -9,6 +9,9 @@ use crate::{
 };
 use serde_json::Value;
 mod exterior;
+mod modded;
+#[cfg(test)]
+mod modded_tests;
 mod material;
 #[cfg(test)]
 mod display_query_tests;
@@ -25,6 +28,8 @@ enum Rule {
     Sequence(Vec<Rule>),
     Condition(Condition, Box<Rule>),
     Bands,
+    Weighted { rules: Vec<Rule>, columns: Box<[usize; 256]> },
+    ModBands { states: Vec<StateId>, frequency: f32, noise_scale: i32, noise: usize },
     Ore(material::OreRule),
     /// TerraBlender `terrablender:merged`. `NamespacedSurfaceRuleSource`
     /// dispatches on the biome's namespace and falls back to `base` whenever
@@ -107,7 +112,7 @@ impl Rule {
     fn needs_cold(&self) -> bool {
         match self {
             Self::Condition(condition, rule) => condition.needs_cold() || rule.needs_cold(),
-            Self::Sequence(rules) => rules.iter().any(Self::needs_cold),
+            Self::Sequence(rules) | Self::Weighted { rules, .. } => rules.iter().any(Self::needs_cold),
             Self::Namespaced { base, sources } => base.needs_cold()
                 || sources.iter().any(|(_, rule)| rule.needs_cold()),
             _ => false,
@@ -116,7 +121,7 @@ impl Rule {
     fn needs_secondary(&self) -> bool {
         match self {
             Self::Condition(condition, rule) => condition.needs_secondary() || rule.needs_secondary(),
-            Self::Sequence(rules) => rules.iter().any(Self::needs_secondary),
+            Self::Sequence(rules) | Self::Weighted { rules, .. } => rules.iter().any(Self::needs_secondary),
             Self::Namespaced { base, sources } => base.needs_secondary()
                 || sources.iter().any(|(_, rule)| rule.needs_secondary()),
             _ => false,
@@ -135,6 +140,11 @@ impl Rule {
             },
             Self::Sequence(rules) => Some(Self::Sequence(rules.iter()
                 .filter_map(|rule| rule.for_biome(biome)).collect())),
+            Self::Weighted { rules, columns } => Some(Self::Weighted {
+                rules: rules.iter().map(|rule| rule.for_biome(biome)
+                    .unwrap_or_else(|| Self::Sequence(Vec::new()))).collect(),
+                columns: columns.clone(),
+            }),
             Self::Namespaced { base, sources } => {
                 let namespace = biome.split(':').next().unwrap_or("");
                 let mut rules = Vec::with_capacity(2);
@@ -204,6 +214,7 @@ pub struct Surface {
     // reachable writes once rather than walking the tree for every neighbour.
     summaries: std::collections::HashMap<String, [bool; 6]>,
     global_summary: [bool; 6],
+    conditional_display: bool,
     depth_predicates: Vec<(i32, bool, i32)>,
     bands: [StateId; 192],
     band_offset: usize,
@@ -296,7 +307,7 @@ impl Surface {
         fn uses_density(rule: &Rule) -> bool {
             match rule {
                 Rule::Ore(_) => true,
-                Rule::Sequence(rules) => rules.iter().any(uses_density),
+                Rule::Sequence(rules) | Rule::Weighted { rules, .. } => rules.iter().any(uses_density),
                 Rule::Condition(_, rule) => uses_density(rule),
                 Rule::Namespaced { base, sources } => uses_density(base) || sources.iter().any(|(_, r)| uses_density(r)),
                 _ => false,
@@ -311,6 +322,7 @@ impl Surface {
             rule,
             summaries: std::collections::HashMap::new(),
             global_summary: [false; 6],
+            conditional_display: false,
             depth_predicates: Vec::new(),
             bands,
             band_offset,
@@ -333,6 +345,8 @@ impl Surface {
                     needs_cold: rule.needs_cold(), needs_secondary: rule.needs_secondary(), rule });
             }
         }
+        surface.conditional_display = surface.summaries.values().any(|summary|
+            !summary[3] && (summary[4] || summary[5]));
         let mut predicates = Vec::new();
         surface.collect_depth_predicates(&surface.rule, &mut predicates);
         surface.depth_predicates = predicates;
@@ -462,6 +476,8 @@ impl Surface {
         fn safe(rule: &Rule, p: &Palette, biome: Option<&str>,dry:bool,hole:Option<bool>) -> bool {
             match rule {
                 Rule::Block(id) => !p.is_air(*id) && (!dry || !p.fluid(*id)),
+                Rule::Weighted { rules, .. } => rules.iter().all(|r| safe(r,p,biome,dry,hole)),
+                Rule::ModBands { states, .. } => states.iter().all(|id| !p.is_air(*id) && (!dry || !p.fluid(*id))),
                 Rule::Bands => true,
                 Rule::Ore(rule) => [rule.ore, rule.raw, rule.filler].iter()
                     .all(|&id| !p.is_air(id) && (!dry || !p.fluid(id))),
@@ -485,6 +501,17 @@ impl Surface {
         }
         safe(&self.rule, palette, biome,dry,hole)
     }
+    pub(crate) fn eroded_biome(name: &str) -> bool {
+        matches!(name, "minecraft:eroded_badlands" | "biomeswevegone:shattered_glacier" | "biomeswevegone:eroded_borealis")
+    }
+    pub(crate) fn geometry_biome(name: &str) -> bool {
+        Self::eroded_biome(name) || matches!(name,"minecraft:frozen_ocean"|"minecraft:deep_frozen_ocean")
+    }
+    pub(crate) fn conditional_display(&self) -> bool { self.conditional_display }
+    pub(crate) fn display_may_be_safe(&self, palette: &Palette, name: &str) -> bool {
+        self.summary_safe_for_biome(palette, Some(name), true, Some(false))
+            || self.summary_safe_for_biome(palette, Some(name), true, Some(true))
+    }
     pub fn geometry_column<'b>(
         &self,
         job: &mut Job<'_>,
@@ -497,7 +524,7 @@ impl Surface {
         let top = world.height(x, z, false);
         let t = job.terrain;
         let (name, b) = biome([x, if t.graph.legacy { 0 } else { top }, z])?;
-        if name == "minecraft:eroded_badlands" {
+        if Self::eroded_biome(name) {
             self.eroded(&t.graph, world, x, z, top);
         }
         if name == "minecraft:frozen_ocean" || name == "minecraft:deep_frozen_ocean" {
@@ -546,7 +573,7 @@ impl Surface {
             }
         }
         match rule {
-            Rule::Sequence(rules) => for rule in rules {self.collect_depth_predicates(rule,predicates);},
+            Rule::Sequence(rules) | Rule::Weighted { rules, .. } => for rule in rules {self.collect_depth_predicates(rule,predicates);},
             Rule::Condition(condition, rule) => {
                 collect(condition,predicates);self.collect_depth_predicates(rule,predicates);
             }
@@ -577,7 +604,7 @@ impl Surface {
         }
         fn rule(r: &Rule, depth: i32, secondary: f64) -> Option<i32> {
             match r {
-                Rule::Sequence(rs) => rs
+                Rule::Sequence(rs) | Rule::Weighted { rules: rs, .. } => rs
                     .iter()
                     .try_fold(0, |n, r| Some(n.max(rule(r, depth, secondary)?))),
                 Rule::Condition(c, r) => {
@@ -615,7 +642,7 @@ impl Surface {
         let graph = &t.graph;
         let original_top = world.height(x, z, false);
         let (name, b) = biome([x, if t.graph.legacy { 0 } else { original_top }, z])?;
-        if name == "minecraft:eroded_badlands" {
+        if Self::eroded_biome(name) {
             self.eroded(graph, world, x, z, original_top);
         }
         let top = world.height(x, z, false);
@@ -751,6 +778,13 @@ impl Surface {
         match rule {
             Rule::Block(id) => Some(*id),
             Rule::Bands => Some(self.band(graph, c.p)),
+            Rule::Weighted { rules, columns } => self.rule(&rules[columns[((c.p[0] & 15)*16+(c.p[2]&15)) as usize]], graph, c, scratch),
+            Rule::ModBands { states, frequency, noise_scale, noise } => {
+                let offset = graph.noise(*noise, (c.p[0] as f32 * frequency) as f64, 0.,
+                    (c.p[2] as f32 * frequency) as f64) * *noise_scale as f64;
+                let y = (c.p[1] as i64).wrapping_add((offset + 0.5).floor() as i64);
+                Some(states[y.rem_euclid((states.len()-1) as i64) as usize])
+            }
             Rule::Ore(rule) => rule.sample(graph, c.p, scratch.as_deref_mut()
                 .expect("material density scratch must be initialized")),
             Rule::Sequence(rules) => rules.iter().find_map(|r| self.rule(r, graph, c, scratch)),
@@ -943,6 +977,7 @@ fn parse_rule(
     if let Some(resolved) = material::reference(v, doc, "material_rules")? {
         return parse_rule(resolved, g, doc, p, min, height, depth + 1);
     }
+    if let Some(rule) = modded::parse(v, g, doc, p, min, height, depth)? { return Ok(rule); }
     // `minecraft_type` only accepts the `minecraft:` prefix, so mod codecs have
     // to be matched on the raw type string before it runs.
     if string(v, "type")? == "terrablender:merged" {

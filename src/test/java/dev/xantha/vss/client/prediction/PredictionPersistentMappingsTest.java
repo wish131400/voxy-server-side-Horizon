@@ -20,7 +20,7 @@ class PredictionPersistentMappingsTest {
     private static ClientColumnSample sample(int biome) {
         int stone = BuiltInRegistries.BLOCK.getId(Blocks.STONE), dirt = BuiltInRegistries.BLOCK.getId(Blocks.DIRT);
         return new ClientColumnSample(80, 63, biome, dirt, 0, 0, 0, 0, 0,
-                ClientColumnSample.FLAG_CAPTURED, 0, dirt, stone, 72, 40, 20, 8,
+                ClientColumnSample.FLAG_CAPTURED | ClientColumnSample.FLAG_CAPTURE_GROUND_V2, 0, dirt, stone, 72, 40, 20, 8,
                 new PredictionColumnVolume(new int[]{0, 50, stone, 0, 70, 80, dirt, 0}));
     }
 

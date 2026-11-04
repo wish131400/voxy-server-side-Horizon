@@ -70,7 +70,7 @@ class PredictionEditedTerrainTest {
         assertEquals(61, store.sample(0, 0, 8, sample(64)).surfaceY());
         var empty = new ClientColumnSample[256];
         Arrays.fill(empty, new ClientColumnSample(-64, -64, 0, ClientColumnSample.NO_BLOCK, 0, 0, 0, 0, 0,
-                ClientColumnSample.FLAG_CAPTURED | ClientColumnSample.FLAG_NO_SURFACE, 0,
+                ClientColumnSample.FLAG_CAPTURED | ClientColumnSample.FLAG_CAPTURE_GROUND_V2 | ClientColumnSample.FLAG_NO_SURFACE, 0,
                 ClientColumnSample.NO_BLOCK, ClientColumnSample.NO_BLOCK, ClientColumnSample.NO_SPAN,
                 ClientColumnSample.NO_SPAN, ClientColumnSample.NO_SPAN, ClientColumnSample.NO_SPAN));
         store.put(0, 0, empty);
@@ -243,7 +243,8 @@ class PredictionEditedTerrainTest {
 
     static ClientColumnSample sample(int y) {
         int gravel = BuiltInRegistries.BLOCK.getId(Blocks.GRAVEL);
-        return new ClientColumnSample(y, y, 0, gravel, 0, 0, 0, 0, 0, ClientColumnSample.FLAG_CAPTURED,
+        return new ClientColumnSample(y, y, 0, gravel, 0, 0, 0, 0, 0,
+                ClientColumnSample.FLAG_CAPTURED | ClientColumnSample.FLAG_CAPTURE_GROUND_V2,
                 0, gravel, gravel, ClientColumnSample.NO_SPAN, ClientColumnSample.NO_SPAN,
                 ClientColumnSample.NO_SPAN, ClientColumnSample.NO_SPAN);
     }

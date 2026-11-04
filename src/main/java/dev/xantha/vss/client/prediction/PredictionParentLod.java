@@ -131,7 +131,8 @@ final class PredictionParentLod {
         var s = selected;
         return new ClientColumnSample(s.surfaceY(), s.fluidY(), s.biomeIndex(), s.topBlockIndex(), s.structureIndex(),
                 s.treeKind(), s.treeDensity(), s.treeHeight(), s.fluid(),
-                (s.flags() & ~ClientColumnSample.FLAG_CAPTURED) | ClientColumnSample.FLAG_PARENT_LOD,
+                (s.flags() & ~ClientColumnSample.FLAG_CAPTURED) | ClientColumnSample.FLAG_PARENT_LOD
+                        | ClientColumnSample.FLAG_CAPTURE_GROUND_V2,
                 s.groundFeatureKind(), s.underBlockIndex(), s.deepBlockIndex(), s.surfaceBottom(),
                 s.lowerTop(), s.lowerBottom(), s.spanFloor(), s.volume());
     }

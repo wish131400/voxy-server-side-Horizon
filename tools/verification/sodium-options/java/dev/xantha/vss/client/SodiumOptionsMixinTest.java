@@ -43,5 +43,12 @@ class SodiumOptionsMixinTest {
             assertTrue(java.util.stream.StreamSupport.stream(constructor.instructions.spliterator(), false)
                     .anyMatch(i -> i instanceof MethodInsnNode call && call.name.equals(handler.name)));
         }
+        MethodNode overlap = node.methods.stream().filter(m -> m.name.contains("vss$avoidDonationOverlap"))
+                .findFirst().orElseThrow();
+        MethodNode rebuild = node.methods.stream().filter(m -> m.name.equals("rebuildGUI"))
+                .findFirst().orElseThrow();
+        assertTrue(java.util.stream.StreamSupport.stream(rebuild.instructions.spliterator(), false)
+                .anyMatch(i -> i instanceof MethodInsnNode call && call.name.equals(overlap.name)),
+                "Opening, resizing and switching pages must all recheck donation overlap");
     }
 }

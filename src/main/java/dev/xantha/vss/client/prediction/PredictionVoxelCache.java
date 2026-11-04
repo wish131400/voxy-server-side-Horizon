@@ -184,6 +184,8 @@ final class PredictionVoxelCache {
         int sampleVersion = in.readInt();
         if (sampleVersion != 2 && sampleVersion != 3 && sampleVersion != 6) throw new IOException("voxel sample version invalid");
         var samples = disk.decodeTerrain(in,sampleVersion,size).samples();
+        for (var sample : samples) if (PredictionCaptureGround.obsolete(sample))
+            throw new IOException("captured surface classification changed");
         var tile = new PredictionVoxySource.Tile(key,key.tileX()*span,key.tileZ()*span,span,axis,span/axis,
                 columns,boxes.build(),palette.bytes(columns.length),complete,cities);
         var data = new Data(tile,heights,ground,samples,bounds);

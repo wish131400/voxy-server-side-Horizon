@@ -89,6 +89,7 @@ public final class PredictionSampleStore implements AutoCloseable {
                         int[] biomePalette = biomes, blockPalette = blocks;
                         sample = remap(sample, id -> paletteId(biomePalette, id), id -> paletteId(blockPalette, id));
                     } else if (mappings != null) sample = remap(sample, mappings::legacyBiome, mappings::legacyBlock);
+                    if (PredictionCaptureGround.obsolete(sample)) { dirty = true; continue; }
                     entries.put(key, sample);
                 } catch (IOException unavailable) { dirty = true; }
             }

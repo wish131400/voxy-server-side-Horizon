@@ -17,17 +17,25 @@ JAR 内包含 Windows x64、Linux x64 / ARM64、macOS Intel / Apple Silicon 的 
 
 真实区块自动生成的每玩家并发分开设置：单人游戏（含开放局域网）使用 `singleplayerGenerationConcurrencyLimit`，默认 `2`；独立服务器使用 `generationConcurrencyLimitPerPlayer`，默认 `4`。已有服务器自定义值保留；旧配置缺少单人字段时使用新默认值。显式 `/vss chunky` 任务沿用自身额度，但也需要开启 `enableChunkGeneration`。
 
+下表距离统一使用设置页的区块单位。为兼容旧配置，`predictionDistanceBlocks` 与 `predictionExactDistanceBlocks` 的 JSON 键名保留，文件保存值为区块数乘以 16；设置页自动换算。
+
 | 设置 | 默认值 | 作用 |
 | --- | --- | --- |
 | `enableChunkGeneration`（服务端） | 单人/局域网 `false`；专用服务器 `true` | 允许生成真实区块 LOD；关闭后仍同步已有真实区块及其变更，预测 LOD 独立 |
 | `enablePrediction` | `true` | 预测总开关，功能标记为 Beta |
 | `enablePredictionLoading` | `true` | 是否继续加载新预测；关闭后已有数据仍可显示 |
-| `predictionDistanceBlocks` | `4096` | 预测距离，单位方块 |
+| `predictionDistanceBlocks` | `512` 区块 | 预测半径，上限 `2048` 区块 |
+| `predictionFarDecorations` | `true` | 全部维护版本：在精确区外使用模板装饰与共享粗网格环境查询 |
+| `predictionExactDistanceBlocks` | `64` 区块 | 精确装饰半径，外加 `16` 区块提前细化带；仅远区装饰开启时使用 |
 | `predictionSpyglassLoading` | `true` | 望远镜额外加载 |
 | `predictionVulkanAcceleration` | `false` | 仅 26.3：使用 Vulkan GPU 分担预览和正式细化的密度计算，需要支持 Vulkan 和双精度坐标运算的显卡与驱动 |
 | `rememberTerrain` | `true` | 保存并恢复本地预测结果 |
 
 预测使用同步的世界生成信息，由 Rust / Java 计算；真实数据优先，画面交给 Voxy 构网与绘制。Voxy 适配不可用时不能用旧独立渲染器补位。缺少必需生成快照或路由时，该维度的预测不能冒充已兼容。
+
+客户端与服务端的真实 LOD 半径上限统一为 2048 区块，预测半径同样最大 2048 区块。旧配置超过上限的值会在加载时自动收紧并保存；客户端 `lodDistanceChunks=0` 仍表示使用服务端上限。
+
+各版本的预测默认半径为 512 区块，远区模板装饰默认开启。精确装饰半径为 64 区块，外加 16 区块提前细化带；远处先显示模板植被，再补齐未替代的装饰和结构，靠近后转回精确计算。模板按种子和群系规则散布，位置和形态可能与精确结果不同。旧配置只迁移原默认值，已迁移后手动关闭或自定义的距离继续保留。
 
 26.3 可在 VSS 预测设置的“预测计算”中切换“Vulkan GPU 加速”。它可提升远景预览和细化加载速度，但会占用渲染算力，可能降低一定帧数，效果取决于显卡和场景。首次启用会在后台准备计算程序，准备期间继续使用 Rust；后续可复用本地着色器和驱动管线缓存。小批次、GPU 请求队列已满、CPU 更快或算法不支持时继续由 Rust 计算，不降低预测精度。关闭后新批次立即使用 Rust。
 

@@ -1,0 +1,29 @@
+// Execute the named Fabric FTF climate Mixin in an isolated test JVM.
+// -I tools/verification/freeterraforged.gradle ftfClimateMixinTest
+// -PvssFreeTerraForgedJar=<named Fabric JAR>
+allprojects {
+    afterEvaluate {
+        ['ftfClimateMixinTest','ftfDimensionMixinTest','ftfDimensionIntermediaryMixinTest'].each { testTask ->
+        tasks.register(testTask, Test) {
+            dependsOn tasks.named('testClasses')
+            testClassesDirs = sourceSets.test.output.classesDirs
+            classpath = sourceSets.test.runtimeClasspath
+            useJUnitPlatform()
+            systemProperty 'vss.ftfClimateMixin', 'true'
+            if (testTask == 'ftfDimensionIntermediaryMixinTest') systemProperty 'vss.ftfIntermediaryPredicate', 'true'
+            include testTask=='ftfClimateMixinTest' ? '**/FreeTerraForgedClimateMixinTest.class' : '**/FreeTerraForgedDimensionMixinTest.class'
+            doFirst {
+                def released = project.file(providers.gradleProperty('vssFreeTerraForgedJar').get())
+                if (!released.isFile()) throw new GradleException('Released FTF JAR not found: ' + released)
+                systemProperty 'vss.freeTerraForgedJar', released.absolutePath
+                if (providers.gradleProperty('vssFtfEvidenceDirectory').isPresent()) {
+                    systemProperty 'vss.ftfEvidenceDirectory', project.file(providers.gradleProperty('vssFtfEvidenceDirectory').get()).absolutePath
+                }
+            }
+            maxParallelForks = 1
+            maxHeapSize = '2G'
+            testLogging { events 'failed', 'skipped'; exceptionFormat 'full' }
+        }
+        }
+    }
+}

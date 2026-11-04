@@ -1,26 +1,21 @@
 {
   "schema": 1,
-  "commit": "c846071deef9cb0e35961c26a14e78fdf6d6709b",
+  "commit": "7685b690839a92024e0b474185c8c62d654a5c9b",
   "workingTreeModified": true,
   "buildKind": "local-cross",
-  "sourceSha256": "4e33d0e925317b49be1d644570e418dbf9489324bf20ad55a271c644d2638b5b",
+  "sourceSha256": "33b3619fb0d51892c973e98edbb870c5b00afcadf84d1e3cbcf5eae8b1845e55",
   "libraries": {
-    "windows-x86_64/vss_native_core.dll": "5aa02a1be1ff114115b1161db4b48fb85dc1d9eda0bea9173e05d0220590e55e",
-    "linux-x86_64/libvss_native_core.so": "2e3d8ecb66c69158a50b6dcbd885595636a528ee7418204a241f0b1dd6268595",
-    "linux-aarch64/libvss_native_core.so": "5f497b1df79ed623b6191e936747dca6b7b87176b4baafeae8c60ee39c5f8db8",
-    "macos-x86_64/libvss_native_core.dylib": "1dd804a8a50c7713c33b8e4c4ec6e6c2ccdcb437bf365a4d03650dc0ddc25226",
-    "macos-aarch64/libvss_native_core.dylib": "1d1610df4b6a18865c78adefc3460472b0b86d3dd494490414151b03915b37e4"
+    "windows-x86_64/vss_native_core.dll": "e7e8a7f00d50142437664814c88de3550b3084a95d13437bd2b4adb939a231a1",
+    "linux-x86_64/libvss_native_core.so": "83252bf90f50300ff894ec9df9946df3141e8a6f3b95fb9662c4d6afa8bca210",
+    "linux-aarch64/libvss_native_core.so": "f3e32a65df27cb107b0307fd5736d3b6e1c6c2744f69e74fa9fc046510216751",
+    "macos-x86_64/libvss_native_core.dylib": "5ff2f9976699f2ade3a6df93c7b86fbbdd98c8aaece540bffb84a619c6ba5ecf",
+    "macos-aarch64/libvss_native_core.dylib": "b3eacd83d65dc484e3f9f78dd76949656f63450a1804e8263fa5b412ced88b6e"
   },
   "validation": {
-    "buildId": "20261102-cross-version-pruning",
+    "buildId": "20261104-exterior-layout",
     "executedPlatform": "windows-x86_64",
-    "javaJniRegressions": 548,
-    "matrix": "See cross-version-pruning-20261102.md for executed Rust regressions, each target complete-path output parity and measured generation costs.",
-    "otherPlatforms": "Five platforms cross compiled and audited against exact JNI exports and embedded hashes; Linux/macOS and ARM execution not exercised.",
-    "gameplay": "No new live-client FPS, movement or teleport validation.",
-    "tools": {
-      "ziglang": "0.13.0",
-      "cargo-zigbuild": "0.23.4"
-    }
+    "regressionScope": "Java/Rust scalar and batch exterior parity; compact/full descriptions; different dimension/noise heights and minima; interior columns and production cliff enrichment",
+    "otherPlatforms": "Cross compiled; JNI exports, architectures, dependencies and package hashes audited. No Linux/macOS/ARM execution.",
+    "gameplay": "No new live game validation"
   }
 }

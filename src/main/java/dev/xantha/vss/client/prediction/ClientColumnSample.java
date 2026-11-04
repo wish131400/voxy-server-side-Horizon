@@ -58,6 +58,8 @@ public record ClientColumnSample(
     public static final int FLAG_CITY_GROUND = 1 << 20;
     /** Area-reduced real terrain; never promote this summary into an exact column. */
     public static final int FLAG_CAPTURE_MIP = 1 << 19;
+    /** Capture surface classification includes the grass/substrate split in 26.1. */
+    public static final int FLAG_CAPTURE_GROUND_V2 = 1 << 17;
     public static final int PREFILLED = 0xFF;
 
     public boolean hasFluid() {

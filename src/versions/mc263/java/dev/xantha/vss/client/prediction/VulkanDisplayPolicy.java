@@ -5,20 +5,22 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /** Selects backends from complete, consumed cold regions. GPU selection applies
- * only to this same request shape; smaller/warm requests always keep Rust. */
+ * only to this same request shape; smaller/warm requests always keep Rust.
+ * A bounded GPU share allows both processors to contribute. Per-request latency
+ * need not beat an idle CPU by 20% to add throughput under CPU saturation. */
 final class VulkanDisplayPolicy {
     private static final int SAMPLES = 3;
     static final int MIN_COLD_COLUMNS = 192;
     private static final int CPU_SENTINEL_REGIONS = 8;
-    private static final int CPU_RECHECK_REGIONS = 2048;
+    static final int CPU_RECHECK_REGIONS = 64;
     private final Lane[] lanes = new Lane[31];
 
     record Trial(int spacing, boolean gpu, boolean measured, boolean exclusive, Lane lane) {}
     private static final class Lane {
         final double[] cpu = new double[SAMPLES], gpu = new double[SAMPLES];
-        int cpuSamples, gpuSamples, cpuCursor, gpuCursor, regions, gpuSinceCpu;
+        int cpuSamples, gpuSamples, cpuCursor, gpuCursor, regions, gpuSinceCpu, turn, gpuQuota;
         long cpuColumns, gpuColumns, ignored, checks, gpuFallbacks, onlineFallbacks, cpuSentinels;
-        boolean useGpu, inFlight;
+        boolean inFlight;
         String reason = "collecting-cold-regions";
         double cpuCost, gpuCost;
     }
@@ -33,7 +35,9 @@ final class VulkanDisplayPolicy {
         if (lane == null) lanes[index] = lane = new Lane();
         if (!fullRegion) return new Trial(spacing,false,false,false,lane);
         boolean audition = lane.cpuSamples < SAMPLES || lane.gpuSamples < SAMPLES;
-        if (!audition && !lane.useGpu && ++lane.regions >= CPU_RECHECK_REGIONS) {
+        int recheck = lane.gpuCost > lane.cpuCost * 4 ? 512
+                : lane.gpuCost > lane.cpuCost * 2 ? 256 : CPU_RECHECK_REGIONS;
+        if (!audition && lane.gpuQuota == 0 && ++lane.regions >= recheck) {
             lane.cpuSamples = lane.gpuSamples = lane.cpuCursor = lane.gpuCursor = lane.regions = 0;
             lane.reason = "rechecking-cold-regions";
             audition = true;
@@ -43,13 +47,15 @@ final class VulkanDisplayPolicy {
             lane.inFlight = true;
             return new Trial(spacing,lane.cpuSamples > lane.gpuSamples,true,true,lane);
         }
-        if (!lane.useGpu) return new Trial(spacing,false,false,false,lane);
+        if (lane.gpuQuota == 0) return new Trial(spacing,false,false,false,lane);
         if (lane.gpuSinceCpu >= CPU_SENTINEL_REGIONS && !lane.inFlight) {
             lane.inFlight = true;
             return new Trial(spacing,false,true,true,lane);
         }
-        // Every consumed cold GPU region participates in the rolling check.
-        return new Trial(spacing,true,true,false,lane);
+        // Keep at least half of full regions on Rust. The GPU queue has its own
+        // bounded admission too, so a busy device never blocks every builder.
+        boolean gpu = (lane.turn++ & 7) < lane.gpuQuota;
+        return new Trial(spacing,gpu,gpu,false,lane);
     }
     synchronized void finish(Trial trial, long elapsed, int coldColumns,
                              boolean attemptedGpu, boolean gpuResult, boolean complete) {
@@ -81,17 +87,22 @@ final class VulkanDisplayPolicy {
         if (lane.cpuSamples == SAMPLES && lane.gpuSamples == SAMPLES) {
             lane.cpuCost = median(lane.cpu);
             lane.gpuCost = median(lane.gpu);
-            boolean faster = lane.gpuCost < lane.cpuCost * 0.8;
+            // Very cheap adaptive CPU regions should stay there. Comparable
+            // GPU regions can still add capacity beside several CPU builders.
+            int quota = lane.gpuCost <= lane.cpuCost * 0.9 ? 4
+                    : lane.gpuCost <= lane.cpuCost * 1.25 ? 2 : 0;
             if (audition) {
-                lane.useGpu = faster;
-                lane.reason = faster ? "gpu-region-faster" : "cpu-region-faster";
-                lane.gpuSinceCpu = 0;
+                lane.gpuQuota = quota;
+                lane.reason = quota > 0 ? "cpu-gpu-shared-regions" : "cpu-region-faster";
+                lane.gpuSinceCpu = lane.turn = 0;
                 lane.checks++;
-            } else if (lane.useGpu && !faster) {
-                lane.useGpu = false;
-                lane.reason = "cpu-faster-recent-regions";
-                lane.regions = 0;
-                lane.onlineFallbacks++;
+            } else if (lane.gpuQuota > 0) {
+                lane.gpuQuota = quota;
+                if (quota == 0) {
+                    lane.reason = "cpu-faster-recent-regions";
+                    lane.regions = 0;
+                    lane.onlineFallbacks++;
+                }
             }
         }
     }
@@ -102,7 +113,7 @@ final class VulkanDisplayPolicy {
     }
     synchronized int minimumGpuSpacing() {
         for (int index = 0; index < lanes.length; index++)
-            if (lanes[index] != null && lanes[index].useGpu) return 1 << index;
+            if (lanes[index] != null && lanes[index].gpuQuota > 0) return 1 << index;
         return Integer.MAX_VALUE;
     }
     synchronized Map<String,Object> snapshot() {
@@ -111,7 +122,8 @@ final class VulkanDisplayPolicy {
             Lane lane = lanes[index];
             if (lane == null) continue;
             result.put(Integer.toString(1 << index), Map.ofEntries(
-                    Map.entry("backend",lane.useGpu ? "gpu" : "cpu"),
+                    Map.entry("backend",lane.gpuQuota > 0 ? "hybrid" : "cpu"),
+                    Map.entry("gpuRegionShare",lane.gpuQuota / 8.0),
                     Map.entry("reason",lane.reason), Map.entry("cpuSamples",lane.cpuSamples),
                     Map.entry("gpuSamples",lane.gpuSamples), Map.entry("cpuColdColumns",lane.cpuColumns),
                     Map.entry("gpuColdColumns",lane.gpuColumns), Map.entry("cpuNanosPerColumn",lane.cpuCost),

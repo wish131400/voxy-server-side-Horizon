@@ -1,0 +1,24 @@
+allprojects { afterEvaluate {
+    tasks.register('captureGroundTest', Test) {
+        dependsOn tasks.named('testClasses')
+        testClassesDirs=sourceSets.test.output.classesDirs;classpath=sourceSets.test.runtimeClasspath
+        useJUnitPlatform()
+        ['PredictionCaptureGroundTest','ClientCaptureExtractorTest','PredictionSampleStoreTest',
+         'PredictionPersistentMappingsTest','PredictionEditedTerrainTest','PredictionParentLodTest',
+         'PredictionVoxelCacheTest','PredictionDiskCacheTest'].each {include "**/${it}.class"}
+        forkEvery=1;maxHeapSize='2G'
+        testLogging {events 'failed','skipped';exceptionFormat 'full'}
+    }
+    tasks.register('boundaryHandoffTest', Test) {
+        dependsOn tasks.named('testClasses')
+        testClassesDirs=sourceSets.test.output.classesDirs;classpath=sourceSets.test.runtimeClasspath
+        useJUnitPlatform()
+        ['PredictionFarDecorationTest','PredictionFarDecorationNativeTest','PredictionVoxySourceTest',
+         'PredictionVegetationHandoffTest'].each {include "**/${it}.class"}
+        if(providers.gradleProperty('vssTestNativeLibrary').isPresent())
+            systemProperty 'vss.testNativeLibrary',file(providers.gradleProperty('vssTestNativeLibrary').get()).absolutePath
+        jvmArgs '-XX:ActiveProcessorCount=8'
+        forkEvery=1;maxHeapSize='3G'
+        testLogging {events 'failed','skipped';exceptionFormat 'full'}
+    }
+} }

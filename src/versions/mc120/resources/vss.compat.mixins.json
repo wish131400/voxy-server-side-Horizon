@@ -23,6 +23,7 @@
     "minecraft.TrackedEntitySeenByAccessor"
   ],
   "client": [
+    "client.PredictionStructureTerrainMixin",
     "client.SodiumLegacyOptionsMixin",
     "voxy.VoxyServerLodClientMixin",
     "voxy.PredictionVoxyMeshSourceMixin",

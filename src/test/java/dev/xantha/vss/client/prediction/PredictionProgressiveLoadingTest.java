@@ -86,10 +86,10 @@ class PredictionProgressiveLoadingTest {
         }, false);
     }
 
-    @Test void cachedRestoreKeepsFourSlotsAndRefillsWithoutPlannerTicks() throws Exception {
+    @Test void cachedRestoreKeepsEightSlotsAndRefillsWithoutPlannerTicks() throws Exception {
         var config=VSSClientConfig.CONFIG;
         var gate=new CountDownLatch(1);
-        var entered=new CountDownLatch(2);
+        var entered=new CountDownLatch(4);
         ThreadPoolExecutor executor=null;
         try {
             var disk=new PredictionDiskCache(cacheDirectory,123);
@@ -111,7 +111,7 @@ class PredictionProgressiveLoadingTest {
             try (var manager=new PredictionTileManager(Level.OVERWORLD,sampler,budget,disk)) {
                 var field=PredictionTileManager.class.getDeclaredField("cacheExecutor"); field.setAccessible(true);
                 executor=(ThreadPoolExecutor)field.get(manager);
-                for (int i=0;i<2;i++) executor.execute(()->{
+                for (int i=0;i<4;i++) executor.execute(()->{
                     entered.countDown();
                     try { gate.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
                 });
@@ -123,10 +123,10 @@ class PredictionProgressiveLoadingTest {
                 var restore=PredictionTileManager.class.getDeclaredMethod("restoreCached",int.class,int.class);
                 restore.setAccessible(true);
                 long admissionDeadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);
-                while (manager.pendingCount()<4 && System.nanoTime()<admissionDeadline) {
+                while (manager.pendingCount()<8 && System.nanoTime()<admissionDeadline) {
                     restore.invoke(manager,0,0); Thread.sleep(1);
                 }
-                assertEquals(4,manager.pendingCount(),"restoration must stay within its bounded warm-cache window");
+                assertEquals(8,manager.pendingCount(),"restoration must stay within its bounded warm-cache window");
                 gate.countDown();
                 long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(10);
                 while ((manager.readyTiles().size()<8 || manager.pendingCount()>0) && System.nanoTime()<deadline) Thread.sleep(5);
@@ -264,11 +264,6 @@ class PredictionProgressiveLoadingTest {
                 return source.sample(x, z);
             }
             @Override ClientTerrainSampler decorationContext() { return source; }
-            // DecorationLevel queries the terrain wrapper for biome identities;
-            // delegating only decorationContext leaves BiomeFilter with null.
-            @Override net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome> noiseBiome(int x, int y, int z) {
-                return source.noiseBiome(x, y, z);
-            }
             @Override public ClientColumnSample sampleForLod(int x, int z, int step) {
                 if (x > (surface ? 65536 : 1024) && blockOnce.compareAndSet(true, false)) {
                     entered.countDown();

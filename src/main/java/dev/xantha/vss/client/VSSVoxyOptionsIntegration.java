@@ -20,6 +20,7 @@ import java.util.function.Function;
 import java.util.function.IntFunction;
 import java.util.function.Supplier;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.components.events.GuiEventListener;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
@@ -136,6 +137,37 @@ public final class VSSVoxyOptionsIntegration {
             }
         } catch (Throwable e) {
             VSSLogger.warn("Failed to add VSS options page to Sodium options screen", e);
+        }
+    }
+
+    /** Legacy Sodium anchors its donation buttons independently of the page tabs. */
+    public static void hideOverlappingDonationButtons(Object sodiumOptionsScreen) {
+        if (!(sodiumOptionsScreen instanceof Screen screen)) return;
+        try {
+            Class<?> type = Class.forName(OLD_GUI_PACKAGE + ".SodiumOptionsGUI");
+            Field donateField = type.getDeclaredField("donateButton");
+            Field dismissField = type.getDeclaredField("hideDonateButton");
+            donateField.setAccessible(true);
+            dismissField.setAccessible(true);
+            GuiEventListener donate = (GuiEventListener) donateField.get(screen);
+            GuiEventListener dismiss = (GuiEventListener) dismissField.get(screen);
+            var donateArea = donate.getRectangle();
+            var dismissArea = dismiss.getRectangle();
+            for (GuiEventListener child : screen.children()) {
+                if (child == donate || child == dismiss) continue;
+                var area = child.getRectangle();
+                if (area.top() < donateArea.bottom() && area.bottom() > donateArea.top()
+                        && area.right() + 6 > donateArea.left() && area.left() < dismissArea.right() + 6) {
+                    Method visibility = type.getDeclaredMethod("setDonationButtonVisibility", boolean.class);
+                    visibility.setAccessible(true);
+                    // Only this layout is crowded. Sodium's saved preference is untouched,
+                    // and rebuilding a wider screen can show the donation controls again.
+                    visibility.invoke(screen, false);
+                    return;
+                }
+            }
+        } catch (ReflectiveOperationException e) {
+            VSSLogger.warn("Failed to avoid overlapping Sodium donation buttons", e);
         }
     }
 
@@ -277,12 +309,12 @@ public final class VSSVoxyOptionsIntegration {
                     configBuilder,
                     "vss.voxy_options.group.prediction_limits",
                      sodium08IntOption(configBuilder, "prediction_distance_blocks", "vss.voxy_options.prediction_distance_blocks",
-                             "vss.voxy_options.prediction_distance_blocks.tooltip", "HIGH", 4_096,
-                             VSSClientConfig.MIN_PREDICTION_DISTANCE_BLOCKS,
-                             VSSClientConfig.MAX_PREDICTION_DISTANCE_BLOCKS, 1_024,
-                             value -> VSSClientConfig.CONFIG.predictionDistanceBlocks = value,
-                             () -> VSSClientConfig.CONFIG.predictionDistanceBlocks,
-                             VSSVoxyOptionsIntegration::formatBlocks, VSSVoxyOptionsIntegration::saveClientConfig)));
+                             "vss.voxy_options.prediction_distance_blocks.tooltip", "HIGH", new VSSClientConfig().getPredictionDistanceChunks(),
+                             VSSClientConfig.MIN_PREDICTION_DISTANCE_BLOCKS / 16,
+                             VSSClientConfig.MAX_LOD_DISTANCE_CHUNKS, 64,
+                             value -> VSSClientConfig.CONFIG.setPredictionDistanceChunks(value),
+                             () -> VSSClientConfig.CONFIG.getPredictionDistanceChunks(),
+                             VSSVoxyOptionsIntegration::formatChunks, VSSVoxyOptionsIntegration::saveClientConfig)));
 
             invokeByName(page, "addOptionGroup", sodium08Group(
                     configBuilder,
@@ -973,12 +1005,12 @@ public final class VSSVoxyOptionsIntegration {
                             "vss.voxy_options.prediction_distance_blocks",
                             "vss.voxy_options.prediction_distance_blocks.tooltip",
                             "HIGH",
-                            VSSClientConfig.MIN_PREDICTION_DISTANCE_BLOCKS,
-                            VSSClientConfig.MAX_PREDICTION_DISTANCE_BLOCKS,
-                            1_024,
-                            VSSVoxyOptionsIntegration::formatBlocks,
-                            (VSSClientConfig config, Integer value) -> config.predictionDistanceBlocks = value,
-                            config -> config.predictionDistanceBlocks)));
+                            VSSClientConfig.MIN_PREDICTION_DISTANCE_BLOCKS / 16,
+                            VSSClientConfig.MAX_LOD_DISTANCE_CHUNKS,
+                            64,
+                            VSSVoxyOptionsIntegration::formatChunks,
+                            (VSSClientConfig config, Integer value) -> config.setPredictionDistanceChunks(value),
+                            config -> config.getPredictionDistanceChunks())));
 
             Constructor<?> pageConstructor = Class.forName(OLD_OPTION_PAGE).getConstructor(Component.class, ImmutableList.class);
             return pageConstructor.newInstance(Component.translatable("vss.voxy_options.prediction_title"), ImmutableList.copyOf(groups));
@@ -1329,9 +1361,6 @@ public final class VSSVoxyOptionsIntegration {
         return Component.translatable("vss.voxy_options.chunks", value);
     }
 
-    private static Component formatBlocks(int value) {
-        return Component.translatable("vss.voxy_options.blocks", value);
-    }
 
     private static Component formatKbpsAuto(int value) {
         return value == 0

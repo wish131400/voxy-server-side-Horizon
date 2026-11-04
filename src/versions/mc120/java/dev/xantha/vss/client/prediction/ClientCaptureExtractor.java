@@ -61,7 +61,7 @@ final class ClientCaptureExtractor {
         int topY = Integer.MIN_VALUE;
         int fluidY = Integer.MIN_VALUE;
         int fluid = 0;
-        int flags = ClientColumnSample.FLAG_CAPTURED;
+        int flags = ClientColumnSample.FLAG_CAPTURED | ClientColumnSample.FLAG_CAPTURE_GROUND_V2;
         int topBlock = ClientColumnSample.NO_BLOCK;
         int underBlock = predicted.underBlockIndex();
         int deepBlock = predicted.deepBlockIndex();
@@ -182,7 +182,7 @@ final class ClientCaptureExtractor {
     static boolean isGround(BlockState state) {
         return state != null && !state.isAir()
                 && state.getFluidState().isEmpty()
-                && (state.is(BlockTags.DIRT) || state.is(BlockTags.SAND)
+                && (PredictionCaptureGround.includes(state) || state.is(BlockTags.DIRT) || state.is(BlockTags.SAND)
                 || state.is(BlockTags.TERRACOTTA) || state.is(BlockTags.BASE_STONE_OVERWORLD)
                 || state.is(BlockTags.BASE_STONE_NETHER) || state.is(BlockTags.NYLIUM)
                 || state.is(BlockTags.ICE)

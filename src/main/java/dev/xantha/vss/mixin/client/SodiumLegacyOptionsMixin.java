@@ -18,4 +18,9 @@ public abstract class SodiumLegacyOptionsMixin {
     private void vss$addOptions(CallbackInfo ci) {
         VSSVoxyOptionsIntegration.addPage(this);
     }
+
+    @Inject(method = "rebuildGUI", at = @At("RETURN"), remap = false)
+    private void vss$avoidDonationOverlap(CallbackInfo ci) {
+        VSSVoxyOptionsIntegration.hideOverlappingDonationButtons(this);
+    }
 }

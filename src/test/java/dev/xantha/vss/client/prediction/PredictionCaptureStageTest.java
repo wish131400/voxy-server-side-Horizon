@@ -136,9 +136,12 @@ class PredictionCaptureStageTest {
         field.setAccessible(true); return (T) field.get(owner);
     }
 
-    private static void awaitIdle(PredictionTileManager manager) throws InterruptedException {
+    private static void awaitIdle(PredictionTileManager manager) throws Exception {
+        var executor = PredictionCaptureStageTest.<ThreadPoolExecutor>field(manager, "executor");
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (manager.pendingCount() != 0 && System.nanoTime() < deadline) Thread.sleep(5);
+        while ((manager.pendingCount() != 0 || executor.getActiveCount() != 0
+                || !executor.getQueue().isEmpty()) && System.nanoTime() < deadline) Thread.sleep(5);
         assertEquals(0, manager.pendingCount(), manager.surfaceDiagnostics());
+        assertEquals(0, executor.getActiveCount(), "completion handoffs must also finish");
     }
 }

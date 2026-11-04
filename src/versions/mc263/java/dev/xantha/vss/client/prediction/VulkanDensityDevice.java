@@ -19,14 +19,13 @@ import static org.lwjgl.vulkan.VK10.*;
  * never borrows Minecraft/Voxy's graphics context or queue. */
 final class VulkanDensityDevice implements AutoCloseable {
     static final int MAX_COLUMNS = 512;
+    static final int PIPELINE_DEPTH = 2;
     private VkInstance instance;
     private VkDevice device;
     private VkQueue queue;
-    private VkCommandBuffer commands;
-    private long descriptorLayout, pipelineLayout, pipeline, descriptorPool, descriptorSet, commandPool, fence;
+    private long descriptorLayout, pipelineLayout, pipeline, descriptorPool, commandPool;
     private final List<Buffer> buffers = new ArrayList<>();
-    private Buffer input, output;
-    private boolean inFlight;
+    private final Submission[] slots = new Submission[PIPELINE_DEPTH];
     private String pipelineCacheIdentity;
     final String name;
 
@@ -79,8 +78,6 @@ final class VulkanDensityDevice implements AutoCloseable {
             vkGetDeviceQueue(device, family, 0, created);
             queue = new VkQueue(created.get(0), device);
 
-            input = buffer(physical, MAX_COLUMNS * 16);
-            output = buffer(physical, MAX_COLUMNS * 4);
             var data = program.getAsJsonArray("data");
             var constants = buffer(physical, Math.max(4, data.size() * 4));
             for (int i = 0; i < data.size(); i++) constants.mapped.putInt(i * 4, data.get(i).getAsInt());
@@ -98,29 +95,35 @@ final class VulkanDensityDevice implements AutoCloseable {
             pipelineLayout = handle.get(0);
             createPipeline(program.get("source").getAsString());
             var poolSize = VkDescriptorPoolSize.calloc(1, stack);
-            poolSize.get(0).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(3);
-            check(vkCreateDescriptorPool(device, VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(1).pPoolSizes(poolSize), null, handle), "descriptor pool");
+            poolSize.get(0).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(3 * PIPELINE_DEPTH);
+            check(vkCreateDescriptorPool(device, VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(PIPELINE_DEPTH).pPoolSizes(poolSize), null, handle), "descriptor pool");
             descriptorPool = handle.get(0);
-            check(vkAllocateDescriptorSets(device, VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
-                    .descriptorPool(descriptorPool).pSetLayouts(stack.longs(descriptorLayout)), handle), "descriptor set");
-            descriptorSet = handle.get(0);
-            var writes = VkWriteDescriptorSet.calloc(3, stack);
-            Buffer[] all = {input, output, constants};
-            for (int i = 0; i < 3; i++) {
-                var b = VkDescriptorBufferInfo.calloc(1, stack);
-                b.get(0).buffer(all[i].handle).offset(0).range(all[i].mapped.capacity());
-                writes.get(i).sType$Default().dstSet(descriptorSet).dstBinding(i)
-                        .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1).pBufferInfo(b);
-            }
-            vkUpdateDescriptorSets(device, writes, null);
             check(vkCreateCommandPool(device, VkCommandPoolCreateInfo.calloc(stack).sType$Default()
                     .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT).queueFamilyIndex(family), null, handle), "command pool");
             commandPool = handle.get(0);
-            check(vkAllocateCommandBuffers(device, VkCommandBufferAllocateInfo.calloc(stack).sType$Default()
-                    .commandPool(commandPool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1), created), "command buffer");
-            commands = new VkCommandBuffer(created.get(0), device);
-            check(vkCreateFence(device, VkFenceCreateInfo.calloc(stack).sType$Default(), null, handle), "fence");
-            fence = handle.get(0);
+            for (int slotIndex = 0; slotIndex < PIPELINE_DEPTH; slotIndex++) {
+                var slot = new Submission(this);
+                slots[slotIndex] = slot;
+                slot.input = buffer(physical, MAX_COLUMNS * 16);
+                slot.output = buffer(physical, MAX_COLUMNS * 4);
+                check(vkAllocateDescriptorSets(device, VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
+                        .descriptorPool(descriptorPool).pSetLayouts(stack.longs(descriptorLayout)), handle), "descriptor set");
+                slot.descriptorSet = handle.get(0);
+                var writes = VkWriteDescriptorSet.calloc(3, stack);
+                Buffer[] all = {slot.input, slot.output, constants};
+                for (int i = 0; i < 3; i++) {
+                    var b = VkDescriptorBufferInfo.calloc(1, stack);
+                    b.get(0).buffer(all[i].handle).offset(0).range(all[i].mapped.capacity());
+                    writes.get(i).sType$Default().dstSet(slot.descriptorSet).dstBinding(i)
+                            .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1).pBufferInfo(b);
+                }
+                vkUpdateDescriptorSets(device, writes, null);
+                check(vkAllocateCommandBuffers(device, VkCommandBufferAllocateInfo.calloc(stack).sType$Default()
+                        .commandPool(commandPool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1), created), "command buffer");
+                slot.commands = new VkCommandBuffer(created.get(0), device);
+                check(vkCreateFence(device, VkFenceCreateInfo.calloc(stack).sType$Default(), null, handle), "fence");
+                slot.fence = handle.get(0);
+            }
         } catch (RuntimeException | LinkageError failure) {
             close(); throw failure;
         }
@@ -271,17 +274,35 @@ final class VulkanDensityDevice implements AutoCloseable {
 
     /** 0: scalar density, 1: preview height, 2: chunk-volume display boundary. */
     int[] dispatch(int[] xyz, int count, int kind, int bottom, int top) {
-        if (count < 0 || count > MAX_COLUMNS || xyz.length != count * 3) throw new IllegalArgumentException("Vulkan batch");
-        if (count == 0) return new int[0];
-        if (inFlight) throw new IllegalStateException("Vulkan submission still active");
-        for (int i = 0; i < count; i++) for (int axis = 0; axis < 3; axis++) input.mapped.putInt(i * 16 + axis * 4, xyz[i * 3 + axis]);
+        if (count == 0 && xyz.length == 0) return new int[0];
+        return await(submit(xyz, count, kind, bottom, top));
+    }
+
+    boolean hasFreeSlot() {
+        for (var slot : slots) if (slot != null && !slot.inFlight) return true;
+        return false;
+    }
+
+    /** Queue access and command pools remain confined to one compute worker.
+     * Each pending submission owns separate mapped buffers and a fence. */
+    Submission submit(int[] xyz, int count, int kind, int bottom, int top) {
+        if (count <= 0 || count > MAX_COLUMNS || xyz.length != count * 3 || kind < 0 || kind > 2)
+            throw new IllegalArgumentException("Vulkan batch");
+        if (device == null) throw new IllegalStateException("Vulkan device closed");
+        Submission selected = null;
+        for (var slot : slots) if (!slot.inFlight) { selected = slot; break; }
+        if (selected == null) throw new IllegalStateException("Vulkan pipeline full");
+        var slot = selected;
+        for (int i = 0; i < count; i++) for (int axis = 0; axis < 3; axis++)
+            slot.input.mapped.putInt(i * 16 + axis * 4, xyz[i * 3 + axis]);
+        var commands = slot.commands;
         try (var stack = MemoryStack.stackPush()) {
-            check(vkResetFences(device, fence), "reset fence");
+            check(vkResetFences(device, slot.fence), "reset fence");
             check(vkResetCommandBuffer(commands, 0), "reset commands");
             check(vkBeginCommandBuffer(commands, VkCommandBufferBeginInfo.calloc(stack).sType$Default()
                     .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "begin commands");
             vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-            vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, stack.longs(descriptorSet), null);
+            vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, stack.longs(slot.descriptorSet), null);
             var params = stack.malloc(16).order(ByteOrder.nativeOrder());
             params.putInt(count).putInt(kind).putInt(bottom).putInt(top).flip();
             vkCmdPushConstants(commands, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, params);
@@ -290,21 +311,38 @@ final class VulkanDensityDevice implements AutoCloseable {
             barrier.get(0).sType$Default().srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT).dstAccessMask(VK_ACCESS_HOST_READ_BIT);
             vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, barrier, null, null);
             check(vkEndCommandBuffer(commands), "end commands");
-            check(vkQueueSubmit(queue, VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(commands)), fence), "submit");
-            inFlight = true;
-            check(vkWaitForFences(device, fence, true, 5_000_000_000L), "compute completion");
-            inFlight = false;
+            check(vkQueueSubmit(queue, VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(commands)), slot.fence), "submit");
+            slot.count = count;
+            slot.inFlight = true;
         }
-        int[] result = new int[count];
-        for (int i = 0; i < count; i++) result[i] = output.mapped.getInt(i * 4);
+        return slot;
+    }
+
+    int[] await(Submission slot) {
+        if (device == null || slot.owner != this || !slot.inFlight)
+            throw new IllegalStateException("Vulkan submission not active");
+        check(vkWaitForFences(device, slot.fence, true, 5_000_000_000L), "compute completion");
+        int[] result = new int[slot.count];
+        for (int i = 0; i < result.length; i++) result[i] = slot.output.mapped.getInt(i * 4);
+        slot.inFlight = false;
         return result;
+    }
+
+    static final class Submission {
+        private final VulkanDensityDevice owner;
+        private VkCommandBuffer commands;
+        private long descriptorSet, fence;
+        private Buffer input, output;
+        private int count;
+        private boolean inFlight;
+        private Submission(VulkanDensityDevice owner) { this.owner = owner; }
     }
 
     @Override public void close() {
         if (device != null) {
             // A failed/timed-out submission still owns its buffers until idle.
-            if (inFlight) vkDeviceWaitIdle(device);
-            if (fence != 0) vkDestroyFence(device, fence, null);
+            for (var slot : slots) if (slot != null && slot.inFlight) { vkDeviceWaitIdle(device); break; }
+            for (var slot : slots) if (slot != null && slot.fence != 0) vkDestroyFence(device, slot.fence, null);
             if (commandPool != 0) vkDestroyCommandPool(device, commandPool, null);
             if (pipeline != 0) vkDestroyPipeline(device, pipeline, null);
             if (pipelineLayout != 0) vkDestroyPipelineLayout(device, pipelineLayout, null);

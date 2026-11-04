@@ -38,7 +38,7 @@ final class PredictionCapturedTerrain {
         private static ClientColumnSample material(ClientColumnSample s, ClientColumnSample liquid) {
             return new ClientColumnSample(s.surfaceY(), Math.max(s.fluidY(), liquid.fluidY()), s.biomeIndex(), s.topBlockIndex(), 0, 0, 0, 0,
                     liquid.fluid(), (s.flags() & (ClientColumnSample.FLAG_SNOW | ClientColumnSample.FLAG_ICE
-                            | ClientColumnSample.FLAG_NO_SURFACE)) | ClientColumnSample.FLAG_CAPTURED
+                            | ClientColumnSample.FLAG_NO_SURFACE | ClientColumnSample.FLAG_CAPTURE_GROUND_V2)) | ClientColumnSample.FLAG_CAPTURED
                             | (liquid.flags() & ClientColumnSample.FLAG_ICE) | ClientColumnSample.FLAG_SURFACE_ONLY, 0, s.underBlockIndex(), s.deepBlockIndex(),
                     ClientColumnSample.NO_SPAN, ClientColumnSample.NO_SPAN, ClientColumnSample.NO_SPAN,
                     ClientColumnSample.NO_SPAN);
@@ -76,7 +76,8 @@ final class PredictionCapturedTerrain {
             boolean ground = solid + (fallback.hasSurface() ? missing : 0) != 0;
             var source = material.hasSurface() || missing == 0 ? material : fallback;
             int flags = ClientColumnSample.FLAG_CAPTURED | ClientColumnSample.FLAG_SURFACE_ONLY
-                    | ClientColumnSample.FLAG_CAPTURE_MIP | (ground ? 0 : ClientColumnSample.FLAG_NO_SURFACE);
+                    | ClientColumnSample.FLAG_CAPTURE_MIP | (ground ? 0 : ClientColumnSample.FLAG_NO_SURFACE)
+                    | (material.flags() & ClientColumnSample.FLAG_CAPTURE_GROUND_V2);
             if (water && source.ice()) flags |= ClientColumnSample.FLAG_ICE;
             return new ClientColumnSample(y, water ? Math.max(y, waterY) : y, source.biomeIndex(),
                     ground ? source.topBlockIndex() : ClientColumnSample.NO_BLOCK, 0, 0, 0, 0,
@@ -118,6 +119,8 @@ final class PredictionCapturedTerrain {
         static Node read(DataInputStream input, PredictionCacheMappings mappings) throws IOException {
             boolean leaf = input.readBoolean();
             ClientColumnSample[] columns = readSamples(input, mappings);
+            for (var column : columns) if (PredictionCaptureGround.obsolete(column))
+                throw new IOException("captured surface classification changed");
             if (leaf) {
                 if (columns.length != 256) throw new IOException("capture column count");
                 return new Node(columns, null);

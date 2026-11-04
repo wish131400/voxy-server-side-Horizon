@@ -149,6 +149,7 @@ def verify_version_paths(read_class, names, minecraft):
     calls("ClientWorldgenProfileDecoder", "publish", prefix + "ClientTerrainSampler", "bindDimensionType",
           "(Lcom/google/gson/JsonObject;Lcom/mojang/serialization/DynamicOps;)V")
     calls("PredictionTileManager", "publishTileLocked", prefix + "PredictionCaptureRefresh", "completed")
+    calls("PredictionTileManager", "queueSurfaceCompletion", prefix + "PredictionSurfaceQueue", "add")
     calls("PredictionVegetation", "generate", prefix + "PredictionBiomePruning", "job")
     calls("PredictionVegetation", "generate", prefix + "PredictionBiomePruning$Job", "excludes")
     calls("PredictionBiomePruning$Job", "excludes", prefix + "RustTerrainSampler", "possibleBiomes")
@@ -156,12 +157,19 @@ def verify_version_paths(read_class, names, minecraft):
     calls("RustVegetationStage", "place", prefix + "RustWorldgenBackend", "applyPlacedFeature")
     calls("RustWorldgenBackend", "applyPlacedFeature", prefix + "RustWorldgenBackend", "placedFeatureStatus")
     calls("RustWorldgenBackend", "applyPlacedFeature", prefix + "RustWorldgenBackend", "placedFeature")
+    calls("PredictionFarDecoration", "generate", prefix + "PredictionFarDecoration", "densityPlacements")
+    calls("PredictionFarDecoration", "parsePlaced", prefix + "PredictionFarPlacementCount", "sample")
+    read_class("PredictionFarPlacementCount")
+    calls("PredictionTileManager", None, prefix + "PredictionFarDecorations", "preview")
+    calls("PredictionTileManager", None, prefix + "PredictionFarDecorations", "build")
     if minecraft == "26.3":
         calls("RustTerrainSampler", "sampleGrid", prefix + "VulkanPredictionCompute", "preview")
         calls("VulkanPredictionCompute", "preview", prefix + "RustWorldgenBackend", "previewPointsGpu")
         calls("VulkanPredictionCompute", "prepare", "java/util/concurrent/ThreadPoolExecutor", "execute")
-        calls("VulkanPredictionCompute", "drain", prefix + "VulkanDensityDevice", "dispatch")
-        calls("VulkanDensityDevice", "dispatch", "org/lwjgl/vulkan/VK10", "vkCmdDispatch")
+        calls("VulkanPredictionCompute", "drain", prefix + "VulkanDensityDevice", "submit")
+        calls("VulkanPredictionCompute", "drain", prefix + "VulkanDensityDevice", "await")
+        calls("VulkanDensityDevice", "submit", "org/lwjgl/vulkan/VK10", "vkCmdDispatch")
+        calls("VulkanDensityDevice", "await", "org/lwjgl/vulkan/VK10", "vkWaitForFences")
         calls("RustTerrainSampler", "sampleDisplayRegion", prefix + "VulkanPredictionCompute", "displayRegionHeights")
         calls("RustTerrainSampler", "sampleDisplayRegion", prefix + "VulkanPredictionCompute", "beginDisplayRegion")
         calls("RustTerrainSampler", "sampleDisplayRegion", prefix + "VulkanPredictionCompute", "finishDisplayRegion")
@@ -319,6 +327,7 @@ def verify_worldgen_interface_paths(read_class, minecraft):
              "lod-provider-capture-palette-r2", "required-biome-routing-fallback-guard",
              "applied-density-graph-snapshot", "tectonic-applied-preset-snapshot"]
     if minecraft == "1.21.1":
+        read_class("mixin/client/FreeTerraForgedPredictionOreMixin", "FeatureStampLevel")
         runtime = "common/worldgen/FreeTerraForgedRuntime"
         cells = "client/prediction/FreeTerraForgedCells"
         read_class(runtime, "TerraForgedChunkGenerator", "biomeReplacementConfig", "contributionRevision", "initializeEpoch")
@@ -690,6 +699,13 @@ def verify(jar, platform, build_id, source, minecraft=None):
         check_class("client/prediction/PredictionVoxySource", "PredictionVoxyViewDemand", "observedView", "viewDemandBuilds",
                     "PredictionVoxyHorizon", "windowUpdates", "updateWindow")
         check_class("client/prediction/PredictionVoxyDetailQueue", "observe")
+        check_class("compat/VoxyRenderAccess", "invalidateUnwatched")
+        check_class("compat/VoxyPredictionBridge", "unwatchedNotifications")
+        check_class("compat/VoxyPredictionBridge$Context", "invalidateUnwatched")
+        check_class("compat/VoxyPendingSections", "urgentOrder")
+        check_class("client/prediction/PredictionTileManager", "activeFarCompletions")
+        check_class("client/prediction/PredictionFarDecorations", "previewBuilds", "previewNanos", "completionBuilds")
+        check_class("client/prediction/PredictionFarDecoration", "densityPlacements")
         check_class("client/prediction/PredictionWorkView", "hasProjection", "atan")
         check_class("client/prediction/PredictionRenderer", "projection", "scoping", "ageSeconds")
         check_class("compat/VoxySectionSignature", "asLongBuffer", "java/nio/LongBuffer", "SHA-256")
