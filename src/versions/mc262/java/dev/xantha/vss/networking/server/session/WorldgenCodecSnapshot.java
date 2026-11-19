@@ -174,7 +174,12 @@ final class WorldgenCodecSnapshot {
             root.addProperty("vss_original_stages", true);
             root.addProperty("vss_original_generator_class", generator.getClass().getName());
         }
-        root.add("biome_source", encodeBiomeSource(noise.getBiomeSource(), access, ops));
+        JsonObject encodedBiomeSource = encodeBiomeSource(noise.getBiomeSource(), access, ops).getAsJsonObject();
+        root.add("biome_source", encodedBiomeSource);
+        if (encodedBiomeSource.has("type") && encodedBiomeSource.get("type").getAsString().startsWith("wover:")) {
+            dependencies.require(Identifier.parse("wover:wover/worldgen/biome_data"));
+            root.addProperty("vss_java_biomes", true);
+        }
         dev.xantha.vss.common.worldgen.LithostitchedBiomeSnapshot.write(root, noise.getBiomeSource());
         var runtimeBiomes=dev.xantha.vss.common.worldgen.BiolithWorldgenContext.capture(noise.getBiomeSource(),ops);
         if(runtimeBiomes!=null) {
