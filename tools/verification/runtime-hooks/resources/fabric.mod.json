@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"vss_runtime_hooks_probe","version":"1","environment":"server","entrypoints":{"main":["dev.xantha.vss.client.prediction.RuntimeHooksProbe"]},"depends":{"fabric-lifecycle-events-v1":"*","vss":"*"}}

@@ -5,6 +5,12 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 class PredictionWorldgenCapabilitiesTest {
+    @Test void ultraTerraForgedUsesItsOriginalEvaluatorEvenWithVanillaLookingRouter() {
+        var generator = JsonParser.parseString("{\"settings\":{},\"biome_source\":{\"type\":\"minecraft:fixed\"},\"vss_freeterraforged_variant\":\"ultraterraforged\"}").getAsJsonObject();
+        assertTrue(PredictionWorldgenCapabilities.nativeTerrainRejection(generator, new com.google.gson.JsonObject())
+                .contains("UltraTerraForged"));
+        assertFalse(PredictionWorldgenCapabilities.nativeSafe(JsonParser.parseString("{\"type\":\"ultraterraforged:noise\"}")));
+    }
     @Test void sourceAndJavaOnlyPlansCannotAccidentallyUseTheRustGraph() {
         var root = JsonParser.parseString("{\"settings\":{},\"biome_source\":{\"type\":\"minecraft:fixed\"}}").getAsJsonObject();
         var plan = dev.xantha.vss.common.worldgen.TerrainPredictionPlan.noise("example:java_context", 1, false);
@@ -135,8 +141,8 @@ class PredictionWorldgenCapabilitiesTest {
                 {"type":"minecraft:sequence",
                  "sequence":[{"type":"example:unknown_rule"}]}
                 """));
-        assertTrue(PredictionWorldgenCapabilities.nativeTerrainRejection(generator, registries)
-                .contains("example:unknown_rule"));
+        assertNull(PredictionWorldgenCapabilities.nativeTerrainRejection(generator, registries));
+        assertTrue(PredictionExecutionPlan.resolve(generator, registries).javaSurface());
     }
 
     @Test void blueprintPayloadSectionIsNotReadAsCodecTypes() {

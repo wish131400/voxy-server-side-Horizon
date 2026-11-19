@@ -13,7 +13,9 @@ final class PredictionLocalTemplates {
     private PredictionLocalTemplates() { }
 
     static byte[] read(Identifier id, StructureTemplateDigest expected) {
-        Identifier resource = id.withPath("structure/" + id.getPath() + ".nbt");
+        Identifier ordinary = id.withPath("structure/" + id.getPath() + ".nbt");
+        Identifier resource = dev.xantha.vss.common.worldgen.WorldgenTemplateResources.original(id);
+        if (resource == null) resource = ordinary;
         try {
             var supplier = Minecraft.getInstance().getVanillaPackResources().fullResources().getResource(PackType.SERVER_DATA, resource);
             if (supplier != null) {
@@ -23,7 +25,7 @@ final class PredictionLocalTemplates {
         } catch (RuntimeException unavailable) { /* No client in isolated tests. */ }
         for (var mod : FabricLoader.getInstance().getAllMods()) {
             try {
-                var candidate = mod.findPath("data/" + id.getNamespace() + "/structure/" + id.getPath() + ".nbt");
+                var candidate = mod.findPath("data/" + resource.getNamespace() + "/" + resource.getPath());
                 if (candidate.isEmpty()) continue;
                 var path = candidate.get();
                 if (Files.isRegularFile(path) && Files.size(path) == expected.bytes())
@@ -33,7 +35,7 @@ final class PredictionLocalTemplates {
         // Vanilla and dev launches may expose SERVER_DATA through the classpath.
         try {
             var resources = PredictionLocalTemplates.class.getClassLoader().getResources(
-                    "data/" + id.getNamespace() + "/structure/" + id.getPath() + ".nbt");
+                    "data/" + resource.getNamespace() + "/" + resource.getPath());
             while (resources.hasMoreElements()) {
                 try (var input = resources.nextElement().openStream()) { return expected.read(input); }
                 catch (IOException mismatch) { /* Match bytes, never guess resource-pack precedence. */ }

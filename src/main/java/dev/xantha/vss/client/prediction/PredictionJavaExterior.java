@@ -67,19 +67,25 @@ final class PredictionJavaExterior {
                 check(valid);
                 int bx=cx*cellWidth,bz=cz*cellWidth;
                 var work=workspace(bx,bz);
+                if (bx <= x && x < bx + cellWidth && bz <= z && z < bz + cellWidth
+                        && (top <= work.firstY() || top > work.endY())) {
+                    if (cacheRejectedRoofs) rejectedRoofs.get().put(x,z,top);
+                    return null;
+                }
                 boolean started=false;
                 try {
                     work.reset(false);
                     started=true;
                     work.initializeForFirstCellX();
                     work.advanceCellX(0);
-                    for(int cy=Math.floorDiv(top-1,cellHeight);cy>=Math.floorDiv(bottom,cellHeight);cy--) {
+                    int firstY=Math.max(bottom,work.firstY()),endY=Math.min(top,work.endY());
+                    for(int cy=Math.floorDiv(endY-1,cellHeight);cy>=Math.floorDiv(firstY,cellHeight);cy--) {
                         check(valid);
-                        int low=Math.max(bottom,cy*cellHeight),high=Math.min(top,(cy+1)*cellHeight);
+                        int low=Math.max(firstY,cy*cellHeight),high=Math.min(endY,(cy+1)*cellHeight);
                         boolean needed=false;
                         for(int y=low;y<high;y++)if(!occupied[y-bottom]){needed=true;break;}
                         if(!needed)continue;
-                        work.selectCellYZ(cy-minCell,0);
+                        work.selectCellYZ(cy-Math.floorDiv(work.firstY(),cellHeight),0);
                         for(int y=high-1;y>=low;y--) {
                             if(occupied[y-bottom])continue;
                             work.updateForY(y,(double)Math.floorMod(y,cellHeight)/cellHeight);
@@ -131,7 +137,12 @@ final class PredictionJavaExterior {
     /** Replays the vanilla column iterator, including cells above the requested roof. */
     private void replay(Work work,int x,int z,Probe probe,BooleanSupplier valid) {
         int height=noise.getCellHeight(),width=noise.getCellWidth();
-        int minCell=Math.floorDiv(noise.minY(),height),count=noise.height()/height;
+        int minCell=Math.floorDiv(work.firstY(),height),count=(work.endY()-work.firstY())/height;
+        if (probe.anchor && (probe.top <= work.firstY() || probe.top > work.endY())) {
+            probe.badRoof=true;
+            return;
+        }
+        probe.y=work.endY()-1;
         double fx=(double)Math.floorMod(x,width)/width,fz=(double)Math.floorMod(z,width)/width;
         boolean started=false;
         try {
@@ -240,6 +251,8 @@ final class PredictionJavaExterior {
             }
         }
         BlockState state(){return getInterpolatedState();}
+        int firstY(){return cellNoiseMinY*cellHeight();}
+        int endY(){return (cellNoiseMinY+cellCountY)*cellHeight();}
 
         boolean reusable(){return ContextReset.AVAILABLE&&!unsupportedReset;}
 

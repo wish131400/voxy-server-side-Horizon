@@ -127,6 +127,8 @@ public final class TerraBlenderBackend implements PredictionTerrainBackend {
             } else {
                 terrain = "java (" + terrainRejection + ")";
             }
+            if (!(sampler instanceof RustTerrainSampler))
+                sampler=PredictionExecutionPlan.resolve(generatorRoot,worldgen.snapshotRoot()).javaSampler(sampler,generatorRoot);
             VSSLogger.info("VSS TerraBlender positional-region backend active for "
                     + profile.dimension() + ": regions=" + (routing instanceof RoutingSource regions ? regions.regionCount() : "end areas")
                     + ", terrain=" + terrain + ", base=" + base.getClass().getSimpleName());

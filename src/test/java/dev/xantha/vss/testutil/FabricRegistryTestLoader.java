@@ -18,17 +18,27 @@ import org.objectweb.asm.tree.InsnNode;
  * Runs a released Fabric mod's real codec registration in an isolated registry.
  * FabricRegistryBuilder normally installs registries through a game Mixin
  * accessor; that accessor is absent in ordinary JUnit. Only registry allocation
- * is replaced. The mod's bootstrap, entries, codecs and generation stay intact.
+ * is replaced. Explicit byte overrides let focused fixtures apply production
+ * Mixins or reproduce the access widener before defining a released class;
+ * bootstrap, entries, codecs and terrain/filtering algorithms stay intact.
  */
 public final class FabricRegistryTestLoader extends URLClassLoader {
+    private final java.util.Map<String, byte[]> transformed;
     private static final String DESCRIPTOR = "(Lnet/minecraft/resources/ResourceKey;)Lnet/minecraft/core/Registry;";
 
     public FabricRegistryTestLoader(URL release, ClassLoader parent) {
+        this(release, parent, java.util.Map.of());
+    }
+
+    public FabricRegistryTestLoader(URL release, ClassLoader parent, java.util.Map<String, byte[]> transformed) {
         super(new URL[]{release}, parent);
+        this.transformed = java.util.Map.copyOf(transformed);
     }
 
     @Override
     protected Class<?> findClass(String name) throws ClassNotFoundException {
+        byte[] replacement = transformed.get(name);
+        if (replacement != null) return defineClass(name, replacement, 0, replacement.length);
         if (!name.endsWith(".platform.fabric.RegistryUtilImpl")) return super.findClass(name);
         var resource = findResource(name.replace('.', '/') + ".class");
         if (resource == null) throw new ClassNotFoundException(name);

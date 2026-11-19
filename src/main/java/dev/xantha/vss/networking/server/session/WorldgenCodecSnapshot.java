@@ -158,8 +158,8 @@ final class WorldgenCodecSnapshot {
     private static Encoded encodeNoiseGenerator(ChunkGenerator generator, NoiseBasedChunkGenerator noise,
             RegistryAccess access, DensityFunctionReferences references, WorldgenRegistryDependencies dependencies,
             String terrablenderRegionType, java.util.Optional<dev.xantha.vss.api.worldgen.TerrainSnapshot> extension) {
-        boolean inheritedNoise = GeneratorTerrainCapabilities.inheritsImplementation(
-                generator.getClass(), NoiseBasedChunkGenerator.class);
+        var stages = dev.xantha.vss.common.worldgen.GeneratorStageCapabilities.inspect(generator.getClass());
+        boolean inheritedNoise = stages.isolated() && !stages.originalStages();
         RegistryOps<JsonElement> ops = dependencies.ops();
         JsonObject root = new JsonObject();
         NoiseGeneratorSettings settings = noise.generatorSettings().value();
@@ -168,11 +168,28 @@ final class WorldgenCodecSnapshot {
                 .encodeStart(ops, settings)
                 .getOrThrow().getAsJsonObject();
         root.add("settings", requiresAppliedDensityGraph() ? references.settings(encodedSettings) : encodedSettings);
-        if (!inheritedNoise) {
-            root.addProperty("vss_unsupported_reason", "Custom noise generator requires a registered backend: "
+        if (!stages.isolated()) {
+            root.addProperty("vss_unsupported_reason", "Generator requires an initialized world/region stage: "
                     + generator.getClass().getName());
+        } else if (!inheritedNoise) {
+            root.addProperty("vss_original_stages", true);
+            root.addProperty("vss_original_generator_class", generator.getClass().getName());
         }
-        root.add("biome_source", encodeBiomeSource(noise.getBiomeSource(), access, ops));
+        JsonObject encodedBiomeSource = encodeBiomeSource(noise.getBiomeSource(), access, ops).getAsJsonObject();
+        root.add("biome_source", encodedBiomeSource);
+        if (encodedBiomeSource.has("type") && encodedBiomeSource.get("type").getAsString().startsWith("wover:")) {
+            dependencies.require(Identifier.parse("wover:wover/worldgen/biome_data"));
+            root.addProperty("vss_java_biomes", true);
+        }
+        dev.xantha.vss.common.worldgen.LithostitchedBiomeSnapshot.write(root, noise.getBiomeSource());
+        var runtimeBiomes=dev.xantha.vss.common.worldgen.BiolithWorldgenContext.capture(noise.getBiomeSource(),ops);
+        if(runtimeBiomes!=null) {
+            root.add("vss_biolith",runtimeBiomes);
+            root.addProperty("vss_java_biomes",true);
+        }
+        if(dev.xantha.vss.common.worldgen.WorldgenRuntimeHooks.changed(net.minecraft.world.level.levelgen.SurfaceSystem.class))
+            root.addProperty("vss_surface_stage",true);
+
         // TerraBlender's positional region tree/surface-rule context is not
         // serialized by the vanilla codecs. A plain reconstructed generator
         // would draw the wrong biomes even with matching client mod jars.
@@ -215,7 +232,8 @@ final class WorldgenCodecSnapshot {
         }
         TerrainPredictionPlan plan = root.has("vss_unsupported_reason")
                 ? TerrainPredictionPlan.unavailable(root.get("vss_unsupported_reason").getAsString())
-                : TerrainPredictionPlan.noise("vss:noise_graph", 1, true);
+                : TerrainPredictionPlan.noise(root.has("vss_original_stages") ? "vss:original_stages" : "vss:noise_graph", 1,
+                        !root.has("vss_original_stages"));
         plan = applyExtension(root, plan, extension);
         root.add(TerrainPredictionPlan.FIELD, plan.encode());
         if (generator.getClass() != NoiseBasedChunkGenerator.class) snapshotActualGenerator(root, generator, access, dependencies);
@@ -308,10 +326,22 @@ final class WorldgenCodecSnapshot {
                         .encodeStart(dependencies.ops(), settings).getOrThrow());
                 encoded.getAsJsonObject().add("biome_source", encodeBiomeSource(noise.getBiomeSource(), access, dependencies.ops()));
             }
+            if (root.has("vss_original_stages")) {
+                var rebuilt = ChunkGenerator.CODEC.parse(dependencies.ops(), encoded).getOrThrow();
+                if (rebuilt == generator || rebuilt.getClass() != generator.getClass())
+                    throw new IllegalArgumentException("Generator codec cannot reconstruct " + generator.getClass().getName());
+                if ((Object) rebuilt instanceof AutoCloseable owner) try { owner.close(); }
+                catch (Exception failure) { throw new IllegalStateException("Generator validation cleanup failed",failure); }
+            }
             root.add("vss_generator", encoded);
         } catch (java.util.concurrent.CancellationException cancelled) {
             throw cancelled;
         } catch (RuntimeException | LinkageError failure) {
+            if (root.has("vss_original_stages")) {
+                String reason = "Generator codec cannot reconstruct " + generator.getClass().getName();
+                root.addProperty("vss_unsupported_reason", reason);
+                root.add(TerrainPredictionPlan.FIELD, TerrainPredictionPlan.unavailable(reason).encode());
+            }
             root.addProperty("vss_generator_error", failure.getClass().getSimpleName());
             VSSLogger.debug("VSS optional generator codec unavailable for " + generator.getClass().getName() + ": " + failure);
         }
@@ -333,7 +363,15 @@ final class WorldgenCodecSnapshot {
             // Cell markers do not serialize the preset/noise lookups made by RandomState.
             dependencies.require(Identifier.parse(variant.namespace + ":worldgen/preset"));
             dependencies.require(Identifier.parse(variant.namespace + ":worldgen/noise"));
+            for (String path : variant.additionalRuntimeRegistries()) {
+                var id = Identifier.parse(variant.namespace + ":" + path);
+                // Preserve empty runtime registries too: UTF may look them up with orThrow.
+                if (access.lookup(ResourceKey.createRegistryKey(id)).isPresent()) dependencies.require(id);
+            }
             root.addProperty("vss_freeterraforged", true);
+            root.addProperty("vss_freeterraforged_variant", variant.namespace);
+            net.fabricmc.loader.api.FabricLoader.getInstance().getModContainer(variant.namespace)
+                    .ifPresent(mod -> root.addProperty("vss_freeterraforged_release", mod.getMetadata().getVersion().getFriendlyString()));
             return;
         }
     }
@@ -387,19 +425,7 @@ final class WorldgenCodecSnapshot {
                                          RegistryOps<JsonElement> ops) {
         JsonObject encoded = BiomeSource.CODEC.encodeStart(ops, source)
                 .getOrThrow().getAsJsonObject();
-        if (encoded.has("preset")) {
-            Identifier presetId = Identifier.parse(encoded.get("preset").getAsString());
-            MultiNoiseBiomeSourceParameterList preset = access
-                    .lookupOrThrow(Registries.MULTI_NOISE_BIOME_SOURCE_PARAMETER_LIST)
-                    .getValue(presetId);
-            if (preset == null) {
-                throw new IllegalStateException("Unknown multi-noise preset " + presetId);
-            }
-            JsonObject resolved = MultiNoiseBiomeSource.DIRECT_CODEC.codec()
-                    .encodeStart(ops, preset.parameters()).getOrThrow().getAsJsonObject();
-            resolved.addProperty("type", "minecraft:multi_noise");
-            return resolved;
-        }
+        resolveMultiNoisePresets(encoded, access, ops);
         // Convert HolderSet encodings to stable biome ids. This keeps the
         // payload independent of client-side holder internals and mirrors the
         // handling used for inline multi-noise biome lists.
@@ -419,6 +445,30 @@ final class WorldgenCodecSnapshot {
             encoded.add("biomes", ids);
         }
         return encoded;
+    }
+
+    /** Mutates only the freshly encoded snapshot, preserving wrapper fields and routing. */
+    static void resolveMultiNoisePresets(JsonElement encoded, RegistryAccess access,
+                                         RegistryOps<JsonElement> ops) {
+        if (encoded.isJsonArray()) {
+            for (JsonElement child : encoded.getAsJsonArray()) resolveMultiNoisePresets(child, access, ops);
+        } else if (encoded.isJsonObject()) {
+            JsonObject object = encoded.getAsJsonObject();
+            // A mod's own `preset` field need not describe a vanilla biome source.
+            if (object.has("type") && object.get("type").isJsonPrimitive()
+                    && object.get("type").getAsString().equals("minecraft:multi_noise")
+                    && object.has("preset")) {
+                Identifier presetId = Identifier.parse(object.get("preset").getAsString());
+                MultiNoiseBiomeSourceParameterList preset = access
+                        .lookupOrThrow(Registries.MULTI_NOISE_BIOME_SOURCE_PARAMETER_LIST).getValue(presetId);
+                if (preset == null) throw new IllegalStateException("Unknown multi-noise preset " + presetId);
+                JsonObject resolved = MultiNoiseBiomeSource.DIRECT_CODEC.codec()
+                        .encodeStart(ops, preset.parameters()).getOrThrow().getAsJsonObject();
+                object.remove("preset");
+                object.add("biomes", resolved.get("biomes"));
+            }
+            for (var child : object.entrySet()) resolveMultiNoisePresets(child.getValue(), access, ops);
+        }
     }
 
     private static boolean containsInlineBiome(JsonArray biomes) {

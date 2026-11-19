@@ -10,15 +10,27 @@ final class FreeTerraForgedWater {
     private final Method scale, hydrology, river, lake, wetland;
     private final Field terrain, riverLevel, waterTable, continentScale, continentModifier;
     private final float ocean;
+    private final boolean directWaterLevel;
+    private final int seaY;
 
     FreeTerraForgedWater(Object context) throws ReflectiveOperationException {
         ClassLoader loader = context.getClass().getClassLoader();
-        String prefix = FreeTerraForgedVariant.fromClass(context.getClass()).worldgenClass("cell.");
+        var variant = FreeTerraForgedVariant.fromClass(context.getClass());
+        String prefix = variant.worldgenClass("cell.");
         levels = context.getClass().getField("levels").get(context);
         scale = levels.getClass().getMethod("scale", float.class);
         ocean = levels.getClass().getField("water").getFloat(levels);
         Class<?> cell = loader.loadClass(prefix + "Cell");
         terrain = cell.getField("terrain");
+        directWaterLevel = variant == FreeTerraForgedVariant.ULTRA;
+        seaY = directWaterLevel ? levels.getClass().getField("waterY").getInt(levels) : 0;
+        if (directWaterLevel) {
+            // UTF's RaisedWater fills the already filtered absolute water level.
+            riverLevel = cell.getField("waterLevel");
+            waterTable = continentScale = continentModifier = null;
+            river = lake = wetland = hydrology = null;
+            return;
+        }
         Field waterLevel;
         try {
             waterLevel = cell.getField("riverWaterLevel");
@@ -50,6 +62,12 @@ final class FreeTerraForgedWater {
 
     int surfaceY(Object cell) throws ReflectiveOperationException {
         if (riverLevel == null) return Integer.MIN_VALUE;
+        if (directWaterLevel) {
+            float value = riverLevel.getFloat(cell);
+            if (value <= 0.0f) return Integer.MIN_VALUE;
+            int blockY = (int) scale.invoke(levels, value);
+            return blockY > seaY ? blockY + 1 : Integer.MIN_VALUE;
+        }
         Object kind = terrain.get(cell);
         if (kind == null || riverLevel.getFloat(cell) <= 0
                 || !((boolean) river.invoke(kind) || (boolean) lake.invoke(kind) || (boolean) wetland.invoke(kind))) {

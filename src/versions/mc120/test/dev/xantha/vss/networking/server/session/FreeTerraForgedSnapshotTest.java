@@ -16,12 +16,32 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 class FreeTerraForgedSnapshotTest {
+    @Test void ultraRuntimeStructureRulesAreCopiedWithoutSerializedHolderReferences() {
+        for (boolean empty : new boolean[]{false, true}) {
+        var variant = FreeTerraForgedVariant.ULTRA;
+        var registries = new java.util.ArrayList<net.minecraft.core.Registry<?>>();
+        var codecs = new java.util.ArrayList<RegistryDataLoader.RegistryData<?>>();
+        for (String path : List.of("worldgen/preset", "worldgen/noise", "worldgen/structure_rule")) {
+            var key = ResourceKey.<String>createRegistryKey(ResourceLocation.tryParse(variant.namespace + ":" + path));
+            var registry = new MappedRegistry<String>(key, Lifecycle.stable());
+            if (!empty || !path.equals("worldgen/structure_rule")) registry.register(ResourceKey.create(key, ResourceLocation.tryParse(variant.namespace + ":preset")), path, Lifecycle.stable());
+            registries.add(registry.freeze());
+            codecs.add(new RegistryDataLoader.RegistryData<>(key, Codec.STRING));
+        }
+        var access = new RegistryAccess.ImmutableRegistryAccess(registries);
+        var dependencies = new WorldgenRegistryDependencies(access, codecs);
+        WorldgenCodecSnapshot.snapshotFreeTerraForged(new JsonObject(), access, dependencies, variant.namespace::equals);
+        assertTrue(dependencies.encode().has("ultraterraforged:worldgen/structure_rule"));
+        if (!empty) assertEquals("worldgen/structure_rule", dependencies.encode()
+                .getAsJsonObject("ultraterraforged:worldgen/structure_rule").get("ultraterraforged:preset").getAsString());
+        }
+    }
     @BeforeAll static void bootstrap() {
         net.minecraft.SharedConstants.tryDetectVersion();
         net.minecraft.server.Bootstrap.bootStrap();
     }
 
-    @Test void bothNamespacesCarryTheirOwnRuntimeRegistries() {
+    @Test void allVariantsCarryTheirOwnRuntimeRegistries() {
         for (var variant : FreeTerraForgedVariant.values()) {
             var presetKey = ResourceKey.<String>createRegistryKey(ResourceLocation.parse(variant.namespace + ":worldgen/preset"));
             var noiseKey = ResourceKey.<String>createRegistryKey(ResourceLocation.parse(variant.namespace + ":worldgen/noise"));
@@ -41,6 +61,7 @@ class FreeTerraForgedSnapshotTest {
             var root = new JsonObject();
             WorldgenCodecSnapshot.snapshotFreeTerraForged(root, access, dependencies, variant.namespace::equals);
             assertTrue(root.get("vss_freeterraforged").getAsBoolean());
+            assertEquals(variant.namespace, root.get("vss_freeterraforged_variant").getAsString());
             var encoded = dependencies.encode();
             assertEquals(2, encoded.size());
             assertEquals("active", encoded.getAsJsonObject(presetKey.location().toString())

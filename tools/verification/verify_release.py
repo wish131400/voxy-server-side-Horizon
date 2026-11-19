@@ -9,6 +9,10 @@ import json
 import re
 from pathlib import Path
 import zipfile
+from core_affinity import verify_core_affinity
+from high_world_columns import verify_high_world_columns
+from session_block_mappings import verify_session_block_mappings
+from runtime_worldgen import verify_runtime_worldgen
 from install_native_artifacts import native_source_digest, LIBRARIES
 from mixin_annotation_baseline import scalar_redirect_at
 
@@ -148,6 +152,10 @@ def verify_version_paths(read_class, names, minecraft):
     calls("PredictionTreeModels", "place", prefix + "PredictionPlacementExecutor", "visit")
     calls("ClientWorldgenProfileDecoder", "publish", prefix + "ClientTerrainSampler", "bindDimensionType",
           "(Lcom/google/gson/JsonObject;Lcom/mojang/serialization/DynamicOps;)V")
+    calls("ClientWorldgenProfileDecoder$Session", "decode", prefix + "PredictionExecutionPlan", "javaSampler")
+    calls("TerraBlenderBackend", "open", prefix + "PredictionExecutionPlan", "javaSampler")
+    calls("PredictionExecutionPlan", "javaSampler", prefix + "ClientTerrainSampler", "stagedSurface")
+    calls("PredictionExecutionPlan", "javaSampler", prefix + "PredictionSurfaceTerrainSampler", "<init>")
     calls("PredictionTileManager", "publishTileLocked", prefix + "PredictionCaptureRefresh", "completed")
     calls("PredictionTileManager", "queueSurfaceCompletion", prefix + "PredictionSurfaceQueue", "add")
     calls("PredictionVegetation", "generate", prefix + "PredictionBiomePruning", "job")
@@ -157,11 +165,21 @@ def verify_version_paths(read_class, names, minecraft):
     calls("RustVegetationStage", "place", prefix + "RustWorldgenBackend", "applyPlacedFeature")
     calls("RustWorldgenBackend", "applyPlacedFeature", prefix + "RustWorldgenBackend", "placedFeatureStatus")
     calls("RustWorldgenBackend", "applyPlacedFeature", prefix + "RustWorldgenBackend", "placedFeature")
-    calls("PredictionFarDecoration", "generate", prefix + "PredictionFarDecoration", "densityPlacements")
-    calls("PredictionFarDecoration", "parsePlaced", prefix + "PredictionFarPlacementCount", "sample")
+    calls("PredictionFarDecoration", "generate", prefix + "PredictionSharedCache", "get")
+    calls("PredictionFarDecoration", "selectPage", prefix + "PredictionFarDecoration", "densityPlacements")
+    calls("PredictionFarDecoration", "parsePlacedNew", prefix + "PredictionFarPlacementCount", "sample")
     read_class("PredictionFarPlacementCount")
     calls("PredictionTileManager", None, prefix + "PredictionFarDecorations", "preview")
     calls("PredictionTileManager", None, prefix + "PredictionFarDecorations", "build")
+    calls("PredictionTileManager", "tickWork", prefix + "PredictionTileManager", "refreshDecorations")
+    calls("PredictionTileManager", "publishTile", prefix + "PredictionDecorationRange", "display")
+    calls("PredictionTileManager", "queueDecorationUpdate", prefix + "PredictionRetirementQueue", "submit")
+    calls("PredictionTileManager", "publishTileLocked", prefix + "PredictionDecorationRange", "current")
+    calls("PredictionTileManager", "publishTileLocked", prefix + "PredictionDecorationRange", "covers")
+    calls("PredictionVegetation", "generationSources", prefix + "PredictionDecorationRange", "placementChunk")
+    calls("PredictionVegetation", "restoreForRendering", prefix + "PredictionDecorationRange", "placementChunk")
+    calls("PredictionFarDecoration", "generate", prefix + "PredictionDecorationRange", "placementPoint")
+    calls("PredictionFarDecorations", "build", prefix + "PredictionDecorationRange", "partial")
     if minecraft == "26.3":
         calls("RustTerrainSampler", "sampleGrid", prefix + "VulkanPredictionCompute", "preview")
         calls("VulkanPredictionCompute", "preview", prefix + "RustWorldgenBackend", "previewPointsGpu")
@@ -326,6 +344,55 @@ def verify_worldgen_interface_paths(read_class, minecraft):
     fixes = ["worldgen-registry-tag-snapshot-binding", "terrablender-end-routing-snapshot-replay",
              "lod-provider-capture-palette-r2", "required-biome-routing-fallback-guard",
              "applied-density-graph-snapshot", "tectonic-applied-preset-snapshot"]
+    variant = "common/worldgen/FreeTerraForgedVariant"
+    field_reader = "client/prediction/FreeTerraForgedFieldReader"
+    compat = "client/prediction/FreeTerraForgedCompat"
+    read_class(variant, "ULTRA", "ultraterraforged", "singleArgumentCellFields", "usesNativeTileFilters")
+    read_class(field_reader, "read", "readFinite", "dropArguments")
+    read_class(snapshot, "vss_freeterraforged_variant", "vss_freeterraforged_release")
+    read_class(decoder, "vss_freeterraforged_variant")
+    read_class("client/prediction/FreeTerraForgedWater", "waterLevel", "waterY", "ULTRA")
+    read_class("client/prediction/PredictionWorldgenCapabilities", "ultraterraforged")
+    calls("client/prediction/FreeTerraForgedDensity", "map", prefix + field_reader, "<init>")
+    calls(field_reader, "<init>", prefix + variant, "singleArgumentCellFields")
+    calls(field_reader, "<init>", "java/lang/invoke/MethodHandles", "dropArguments")
+    calls("client/prediction/FreeTerraForgedNativeFilters", "register", prefix + variant, "usesNativeTileFilters")
+    calls(compat + "$Api", "<init>", prefix + variant, "discoversContextFromMarkers")
+    read_class(variant, "additionalRuntimeRegistries", "worldgen/structure_rule")
+    calls(snapshot, "snapshotFreeTerraForged", prefix + variant, "additionalRuntimeRegistries")
+    tasks = "client/prediction/FreeTerraForgedPredictionTasks"
+    read_class(tasks, "OWNED", "WeakHashMap", "ownGenerator")
+    calls(compat + "$Api", "initialize", prefix + tasks, "own")
+    calls(tasks, "run", "java/util/concurrent/CompletableFuture", "runAsync")
+    calls("mixin/client/UltraTerraForgedPredictionTasksMixin", "vss$predictionBatch", prefix + tasks, "run")
+    read_class(tasks, "REGISTERING", "COMPUTE_ENTRY", "ownCache", "register")
+    calls(tasks, "own", prefix + tasks, "ownCache")
+    calls(tasks, "computeEntry", prefix + tasks, "register")
+    calls("mixin/client/UltraTerraForgedPredictionTileCacheMixin", "vss$registerBeforePredictionBatches", prefix + tasks, "computeEntry")
+    rules = "client/prediction/FreeTerraForgedSurfaceRules"
+    read_class(rules, "ACTIVE", "apply", "reset", "pointRules")
+    read_class("client/prediction/FreeTerraForgedTerrainSampler", "FreeTerraForgedSurfaceRules", "preview", "ULTRA")
+    calls("client/prediction/FreeTerraForgedTerrainSampler", "<init>", prefix + rules, "<init>")
+    calls(rules, "nearGround", prefix + "mixin/client/SurfaceRulesContextAccessor", "vss$blockY")
+    calls("mixin/client/UltraTerraForgedPredictionNearGroundMixin", "vss$previewGround", prefix + rules, "nearGround")
+    calls("mixin/client/UltraTerraForgedPredictionCellConditionMixin", "vss$previewCell", prefix + rules, "test")
+    if minecraft == "26.3":
+        calls("mixin/client/UltraTerraForgedPredictionNearGroundMixin", "vss$context", prefix + rules, "pointCondition")
+        calls("mixin/client/UltraTerraForgedPredictionCellConditionMixin", "vss$context", prefix + rules, "pointCondition")
+    else:
+        for condition in ("UltraTerraForgedPredictionNearGroundMixin", "UltraTerraForgedPredictionCellConditionMixin"):
+            calls("mixin/client/" + condition, "vss$previewChunk", prefix + rules, "pointRules")
+            read_class("mixin/client/" + condition, "compute", "method_39074")
+    fixes.append("ultraterraforged-nonloading-preview-surface-rules")
+    read_class("client/prediction/ClientSurfaceResolver", "java/util/LinkedHashMap", "request", "remove")
+    calls("client/prediction/ClientTerrainSampler", "terrainRequest", prefix + "client/prediction/ClientSurfaceResolver", "request")
+    read_class("client/prediction/PredictionBackendSelection", "terrain-surface-context-r2:")
+    calls("client/prediction/ClientCaptureExtractor", "extractAll", prefix + "client/prediction/ClientTerrainSampler", "terrainRequest")
+    calls("client/prediction/RustReferenceCapture", "capture", prefix + "client/prediction/ClientTerrainSampler", "terrainRequest")
+    fixes.extend(["ultraterraforged-filtered-cells-and-independent-cache-lifetime",
+                  "chunk-bound-surface-contexts", "prediction-task-surface-release",
+                  "owned-ultraterraforged-inline-batches", "ultraterraforged-unlocked-batch-execution", "ultraterraforged-runtime-structure-rules",
+                  "terrain-surface-context-cache-r2"])
     if minecraft == "1.21.1":
         read_class("mixin/client/FreeTerraForgedPredictionOreMixin", "FeatureStampLevel")
         runtime = "common/worldgen/FreeTerraForgedRuntime"
@@ -338,7 +405,7 @@ def verify_worldgen_interface_paths(read_class, minecraft):
         calls(compat, "copyClimateContext", prefix + compat, "copySpawnSearch")
         calls(compat, "copySpawnSearch", "java/lang/reflect/Constructor", "newInstance")
         calls(compat, "copySpawnSearch", "java/lang/reflect/Field", "get")
-        read_class("client/prediction/FreeTerraForgedDensity", "readFinite")
+        read_class("client/prediction/FreeTerraForgedDensity", "FreeTerraForgedFieldReader")
         read_class("client/prediction/FreeTerraForgedTerrainSampler", "runtimeOwner")
         read_class(snapshot, "vss_freeterraforged_release", "freeterraforged:worldgen/biome_modifier", "freeterraforged:worldgen/structure_rule")
         calls(snapshot, "encodeNoiseGenerator", prefix + runtime, "snapshot")
@@ -383,6 +450,10 @@ def verify(jar, platform, build_id, source, minecraft=None):
             raise ValueError(message)
 
     with zipfile.ZipFile(jar) as archive:
+        verify_runtime_worldgen(archive, class_references)
+        verify_core_affinity(archive, class_references)
+        verify_high_world_columns(archive)
+        verify_session_block_mappings(archive, class_references)
         require(archive.testzip() is None, "Corrupt JAR")
         names = set(archive.namelist())
         require(not any(n.endswith(".class") and "/me/cortex/voxy/" in "/" + n for n in names),
@@ -416,7 +487,7 @@ def verify(jar, platform, build_id, source, minecraft=None):
                     "Wrong Fabric runtime minimum: " + dependency)
         require(manifest.get("VSS-Minecraft") == minecraft, "Wrong Minecraft build identity")
         target_index = ["1.21.11", "26.1", "26.1.1", "26.1.2", "26.2", "26.3", "1.21.1", "1.20.1"].index(minecraft)
-        require(manifest.get("VSS-Protocol") == str(54 + target_index), "Wrong target protocol")
+        require(manifest.get("VSS-Protocol") == str(63 + target_index), "Wrong target protocol")
         require(manifest.get("VSS-Column-Schema") == str(6 + target_index), "Wrong target column schema")
         require(not any(n in names for n in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml")), "Old loader metadata packaged")
         for entries in metadata["entrypoints"].values():
@@ -442,6 +513,25 @@ def verify(jar, platform, build_id, source, minecraft=None):
         check_class("config/VSSServerConfig", "singleplayerGenerationConcurrencyLimit", "effectiveGenerationConcurrencyLimitPerPlayer")
         check_class("networking/server/generation/ChunkGenerationService", "effectiveGenerationConcurrencyLimitPerPlayer")
         check_class("networking/server/session/PlayerSessionManager", "effectiveGenerationConcurrencyLimitPerPlayer")
+        check_class("config/VSSClientConfig", "predictionWorkerThreads", "custom")
+        check_class("client/prediction/PredictionPerformanceProfile", "CUSTOM", "maximumWorkers", "customWorkers", "workers")
+        check_class("client/prediction/PredictionCpuBudget", "workers")
+        check_class("client/prediction/PredictionMemoryBudget", "buildLimit", "workers")
+        check_class("client/prediction/PredictionTileManager", "refreshWorkerAllocation", "setCorePoolSize", "setMaximumPoolSize")
+        check_class("client/prediction/PredictionTileManager", "nearbyDetailWaiting", "nearbyDetail")
+        check_class("client/prediction/ClientTerrainSampler", "sampleDisplay")
+        check_class("client/prediction/FreeTerraForgedTerrainSampler", "sampleDisplay", "samplePreview")
+        check_class("client/prediction/PredictionFarGround", "points", "sampleDisplay", "sampleDisplayPoints")
+        check_class("client/prediction/PredictionFarDecoration", "PredictionFarGround", "sample")
+        if minecraft != "26.3":
+            check_class("client/prediction/PredictionJavaExterior$Work", "firstY", "endY")
+        if minecraft == "1.21.1":
+            check_class("client/prediction/FreeTerraForgedExterior$Work", "firstY", "endY")
+        check_class("client/VSSPredictionThreadOptions", "registerPair", "registerSodium08", "changed")
+        check_class("client/VSSPredictionThreadOptions$Pair", "WeakReference")
+        check_class("client/VSSVoxyOptionsIntegration", "prediction_worker_threads", "registerPair", "threads_of_max", "tier_threads")
+        check_class("mixin/client/LegacyPredictionThreadOptionsMixin", "setValue(Ljava/lang/Object;)V", "changed")
+        check_class("mixin/client/SodiumPredictionThreadOptionsMixin", "modifyValue(Ljava/lang/Object;)V", "loadValueInitial()V", "registerSodium08", "changed")
         check_class("config/VSSClientConfig", "predictionVulkanAcceleration")
         check_class("client/VSSVoxyOptionsIntegration", "prediction_vulkan")
         check_class("client/VSSVoxyOptionsIntegration", "me.jellysquid.mods.sodium.client.gui",
@@ -584,6 +674,11 @@ def verify(jar, platform, build_id, source, minecraft=None):
                 "Capacity mixins absent from runtime configuration")
         check_class("client/prediction/PredictionVoxySource", "lightingBuilds")
         check_class("client/prediction/PredictionTileManager", "invalidatedSurfaces")
+        check_class("config/VSSClientConfig", "predictionDecorations", "predictionDecorationDistanceChunks")
+        check_class("client/VSSVoxyOptionsIntegration", "prediction_decorations", "prediction_decoration_distance",
+                    "formatDecorationDistance")
+        check_class("client/prediction/PredictionDecorationRange", "placementChunk", "placementPoint", "display", "covers", "current")
+        check_class("client/prediction/PredictionTileManager", "decorationAllowed", "partialSurfaceRanges", "queueDecorationUpdate")
         check_class("client/prediction/PredictionTileManager", "runningVoxyDetails")
         check_class("client/prediction/PredictionCaptureHandoff", "await", "committed", "blocked", "reindex", "retired")
         check_class("client/prediction/PredictionTileManager", "awaitExactColumns", "requiresExactCapture", "retryCapture", "captureHandoff", "retireExactColumns")
@@ -595,7 +690,7 @@ def verify(jar, platform, build_id, source, minecraft=None):
         check_class("client/prediction/PredictionVoxySource", "vegetationVisible")
         check_class("client/prediction/PredictionTileManager", "surfaceFallbackReady")
         check_class("client/prediction/PredictionVoxyBoxes", "changedBounds")
-        check_class("client/prediction/PredictionDiskCache", "voxelWrites", "unchangedVoxelWrites", "contentIdentity")
+        check_class("client/prediction/PredictionDiskCache", "voxelWrites", "unchangedVoxelWrites", "cacheContentIdentity")
         check_class("client/prediction/PredictionVoxelCache", "FEATURE_PAGE_SIZE", "contentIdentity", "voxel feature page invalid")
         check_class("compat/VoxySectionSignature", "SHA-256", "faces")
         check_class("compat/VoxyPredictionBridge$Delivered", "changes")
@@ -732,7 +827,7 @@ def verify(jar, platform, build_id, source, minecraft=None):
                 "Stale CPU sampler class packaged")
         priority = check_class("networking/client/PredictionGenerationPriority", "shared-", "detail-ready")
         require(b"exclusive" not in priority and b"STALL" not in priority, "Exclusive prediction generation gate packaged")
-        requests = check_class("networking/client/LodRequestManager", "reserveLocalGeneration")
+        requests = check_class("networking/client/LodRequestManager", "reserveLocalGeneration", "probeReadOnlyQueued")
         require(b"localGenerationLimit" not in requests, "Non-atomic generation admission still packaged")
 
         fluid = check_class("compat/VoxyFluidSurface", "top", "pack", "transitions", "meshTransitions")
@@ -775,6 +870,16 @@ def verify(jar, platform, build_id, source, minecraft=None):
                     path = config["package"].replace(".", "/") + "/" + cls.replace(".", "/") + ".class"
                     require(path in names, "Missing configured mixin: " + path)
                     enabled.add(path)
+        for hook in ("LegacyPredictionThreadOptionsMixin", "SodiumPredictionThreadOptionsMixin"):
+            require("dev/xantha/vss/mixin/client/" + hook + ".class" in enabled,
+                    "Pending prediction thread control hook is not configured: " + hook)
+        require("dev/xantha/vss/mixin/client/UltraTerraForgedPredictionTileCacheMixin.class" in enabled,
+                "UTF unlocked tile-cache registration redirect is not configured")
+        require("dev/xantha/vss/mixin/client/UltraTerraForgedPredictionTasksMixin.class" in enabled,
+                "Owned UTF batch redirect is not configured")
+        for condition in ("SurfaceRulesContextAccessor", "UltraTerraForgedPredictionNearGroundMixin", "UltraTerraForgedPredictionCellConditionMixin"):
+            require("dev/xantha/vss/mixin/client/" + condition + ".class" in enabled,
+                    "UTF preview surface hook is not configured: " + condition)
         require("dev/xantha/vss/mixin/voxy/PredictionVoxyTraversalShaderMixin.class" in enabled,
                 "Model inset shader mixin is not configured")
         for mixin in ("NormalRenderPipelineDepthMaskMixin", "PredictionFogShaderMixin"):
@@ -862,7 +967,9 @@ def verify(jar, platform, build_id, source, minecraft=None):
                                    "modern-passthrough-graph-compilation", "modern-constant-direct-evaluation",
                                    "modern-chunk-material-workspace", "modern-lazy-display-steepness",
                                    "modern-final-density-search-grid", "cpu-display-region-allocation-bypass"] if minecraft == "26.3" else []),
-                                "asynchronous-native-demand-handoff", "bulk-exact-section-signatures", "bounded-middle-cover", "first-terrain-priority", "bounded-cache-probe-wait", "offscreen-retirement-without-generation"]}
+                                "asynchronous-native-demand-handoff", "bulk-exact-section-signatures", "bounded-middle-cover", "first-terrain-priority", "bounded-cache-probe-wait", "offscreen-retirement-without-generation",
+                                "runtime-surface-basic-coverage", "pending-surface-refinement-demand",
+                                "raw-native-surface-input", "chunk-grouped-hook-refinement"]}
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@
   "refmap": "vss.refmap.json",
   "compatibilityLevel": "JAVA_21",
   "mixins": [
+    "worldgen.LithostitchedBiomeInjectorMixin",
     "ftbchunks.FTBChunksExpectedImplMixin",
     "ftbchunks.FTBChunksModernForceLoadMixin",
     "minecraft.FTBChunksForceLoadNoBlockingMixin",
@@ -21,8 +22,11 @@
     "minecraft.TrackedEntitySeenByAccessor"
   ],
   "client": [
+    "client.WorldWeaverPredictionRegistryMixin",
     "client.PredictionStructureTerrainMixin",
     "client.SodiumLegacyOptionsMixin",
+    "client.LegacyPredictionThreadOptionsMixin",
+    "client.SodiumPredictionThreadOptionsMixin",
     "voxy.PredictionVoxyMeshSourceMixin",
     "voxy.PredictionVoxyNeighborSourceMixin",
     "voxy.PredictionVoxyWorldEventMixin",
@@ -39,6 +43,11 @@
     "client.PredictionFrameMixin",
     "client.PredictionFogCaptureMixin",
     "client.FreeTerraForgedPredictionFiltersMixin",
+    "client.UltraTerraForgedPredictionTasksMixin",
+    "client.UltraTerraForgedPredictionTileCacheMixin",
+    "client.SurfaceRulesContextAccessor",
+    "client.UltraTerraForgedPredictionNearGroundMixin",
+    "client.UltraTerraForgedPredictionCellConditionMixin",
     "client.ByePregenPredictionPredicateMixin",
     "client.NbtTreePredictionTemplatesMixin",
     "client.ClientPacketListenerServerIdentityMixin",

@@ -54,6 +54,10 @@ public final class PredictionTileManager implements AutoCloseable {
     private volatile ClientTerrainSampler sampler;
     private volatile boolean generationReady;
     private volatile PredictionVegetation vegetation;
+    private volatile PredictionDecorationRange decorationRange = PredictionDecorationRange.at(0, 0);
+    private final PredictionRetirementQueue<PredictionTileKey> decorationUpdates = new PredictionRetirementQueue<>();
+    // Only boundary surfaces need a placement window; an absent entry means unrestricted cached coverage.
+    private final Map<PredictionTileKey, PredictionDecorationRange> partialSurfaceRanges = new java.util.HashMap<>();
     private volatile PredictionFarDecorations farDecorations;
     private final LostCityHints cityHints;
     private int surfaceSettings;
@@ -220,7 +224,7 @@ public final class PredictionTileManager implements AutoCloseable {
                     cameraBlockX,cameraBlockY,cameraBlockZ,schedulingPixels,sampler.profile().minY(),
                     sampler.profile().minY()+sampler.profile().height()+64,surfaceRadius,meshRevision.get(),navigationGeneration,
                     inputSnapshots.set(voxyDetailTargets),surfaceDesired,inputSnapshots.set(surfaceReady),inputSnapshots.set(dirtyTiles),
-                    renderSnapshot(),viewBands));
+                    renderSnapshot(),viewBands,farDecorationRadius()));
         }
     }
 
@@ -274,11 +278,22 @@ public final class PredictionTileManager implements AutoCloseable {
         return PredictionFarPolicy.outside(cameraBlockX,cameraBlockZ,key.tileX()*span,key.tileZ()*span,span,
                 VSSClientConfig.CONFIG.predictionExactDistanceBlocks);
     }
+    private int farDecorationRadius() {
+        return VSSClientConfig.CONFIG.predictionFarDecorations && PredictionFarDecorations.supported(sampler)
+                && layout.maxDistanceBlocks()>VSSClientConfig.CONFIG.predictionExactDistanceBlocks
+                ? VSSClientConfig.CONFIG.predictionExactDistanceBlocks : 0;
+    }
+    private boolean farTemplatePreview(PredictionTileKey key) {
+        var tile=ready.get(key);
+        return tile!=null && PredictionFarPolicy.preview(tile.data().voxyTile,cameraBlockX,cameraBlockZ,farDecorationRadius());
+    }
     private boolean needsExactSurface(PredictionTileKey key) {
+        if (!decorationAllowed(key)) return false;
         var tile=ready.get(key);
         return tile!=null && tile.data().voxyTile!=null && tile.data().voxyTile.approximateDecorations() && !farRegion(key);
     }
     private boolean needsFarSurface(PredictionTileKey key) {
+        if (!decorationAllowed(key)) return false;
         var tile=ready.get(key);
         return tile!=null && tile.data().voxyTile!=null
                 && (!tile.data().voxyTile.surfaceComplete() || tile.data().voxyTile.needsDecorationRefinement())
@@ -315,7 +330,7 @@ public final class PredictionTileManager implements AutoCloseable {
     }
 
     private boolean visibleSurface(PredictionTileKey key) {
-        return unifiedVoxy && viewWork(key,true) && (surfaceDesired.contains(key) || voxyDetailSurface(key) || needsExactSurface(key) || needsFarSurface(key));
+        return decorationAllowed(key) && unifiedVoxy && viewWork(key,true) && (surfaceDesired.contains(key) || voxyDetailSurface(key) || needsExactSurface(key) || needsFarSurface(key));
     }
 
     private Admission serviceVoxyDetails(int cx, int cz, long until) {
@@ -325,15 +340,25 @@ public final class PredictionTileManager implements AutoCloseable {
                 var key=fairGenerationAdmission ? voxyDetailWork.removeLast() : voxyDetailWork.removeFirst();
                 if (!voxyDetail(key)) continue;
                 if (pending.contains(key)) { deferred.add(key); continue; }
-                boolean surface=!terrainBuildNeeded(key) && surfaceBuildReady(key);
+                boolean surface=surfaceBuildReady(key) && (!terrainBuildNeeded(key) || farTemplatePreview(key));
                 if (!surface && !terrainBuildNeeded(key)) continue;
                 var admission=enqueue(key,cx,cz,surface);
                 if (admission == Admission.QUEUED) return admission;
+                if (admission == Admission.CPU_BUSY) {
+                    if (fairGenerationAdmission) voxyDetailWork.addLast(key);
+                    else voxyDetailWork.addFirst(key);
+                    return admission;
+                }
                 deferred.add(key);
-                if (admission == Admission.CPU_BUSY) return admission;
             }
             return Admission.DEFERRED;
-        } finally { restoreDeferred(voxyDetailWork,deferred,fairGenerationAdmission); }
+        } finally {
+            // Move locally blocked work past the scan window. Only global CPU refusal keeps its turn.
+            for (var key : deferred) {
+                if (fairGenerationAdmission) voxyDetailWork.addFirst(key);
+                else voxyDetailWork.addLast(key);
+            }
+        }
     }
 
     private static <T> void restoreDeferred(ArrayDeque<T> queue,List<T> deferred,boolean fromTail) {
@@ -695,7 +720,6 @@ public final class PredictionTileManager implements AutoCloseable {
         this.generationReady = !(sampler instanceof PredictionCacheSampler);
         this.diskCache = diskCache;
         this.cityHints = new LostCityHints(dimension, sampler.profile().fingerprint());
-        this.vegetation = new PredictionVegetation(sampler, diskCache, true);
         this.surfaceSettings = surfaceSettings();
         this.surfaceContextSettings = surfaceSettings;
         this.memoryBudget = memoryBudget;
@@ -708,19 +732,19 @@ public final class PredictionTileManager implements AutoCloseable {
         // The shared budget also limits simultaneous builders across dimensions.
         int workers = Math.min(memoryBudget.buildLimit(),
                 PredictionMemoryBudget.workerCount(Runtime.getRuntime().availableProcessors()));
-        this.executor = new ThreadPoolExecutor(workers, workers, 0L, TimeUnit.MILLISECONDS,
+        this.executor = new PredictionWorkerPool(workers, workers, 0L, TimeUnit.MILLISECONDS,
                 new PriorityBlockingQueue<>(), runnable -> {
-            Thread thread = new Thread(runnable, "vss-prediction-" + dimension.identifier().getPath());
+            Thread thread = PredictionCoreAffinity.newWorker(runnable, "vss-prediction-" + dimension.identifier().getPath());
             thread.setDaemon(true);
             thread.setPriority(Thread.NORM_PRIORITY - 1);
             return thread;
         });
         // Cache recovery has its own bounded lane. Small CPUs retain two workers;
         // machines with at least eight logical processors can decode four tiles.
-        int cacheWorkers = Runtime.getRuntime().availableProcessors() >= 8 ? 4 : 2;
-        this.cacheExecutor = new ThreadPoolExecutor(cacheWorkers, cacheWorkers, 15L, TimeUnit.SECONDS,
+        int cacheWorkers = PredictionCoreAffinity.capWorkers(Runtime.getRuntime().availableProcessors() >= 8 ? 4 : 2);
+        this.cacheExecutor = new PredictionWorkerPool(cacheWorkers, cacheWorkers, 15L, TimeUnit.SECONDS,
                 new java.util.concurrent.ArrayBlockingQueue<>(CACHE_RESTORE_IN_FLIGHT), runnable -> {
-            Thread thread = new Thread(runnable, "vss-cache-restore-" + dimension.identifier().getPath());
+            Thread thread = PredictionCoreAffinity.newWorker(runnable, "vss-cache-restore-" + dimension.identifier().getPath());
             thread.setDaemon(true);
             thread.setPriority(Thread.NORM_PRIORITY - 1);
             return thread;
@@ -863,6 +887,29 @@ public final class PredictionTileManager implements AutoCloseable {
                 Runtime.getRuntime().availableProcessors(), VSSClientConfig.CONFIG.predictionRefinementWorkers));
     }
 
+    private boolean nearbyDetail(PredictionTileKey key) {
+        return PredictionWorkOrder.distanceSquared(key,layout,cameraBlockX,cameraBlockZ)
+                <= (double)PredictionWorkOrder.SCOPED_RADIUS_BLOCKS*PredictionWorkOrder.SCOPED_RADIUS_BLOCKS;
+    }
+
+    /** Reserve the next ordinary turn for useful nearby work, without cancelling running jobs. */
+    private boolean nearbyDetailWaiting() {
+        int checked=0;
+        for(var key:voxyDetailWork) {
+            if(checked++==64)break;
+            if(nearbyDetail(key) && !pending.contains(key) && voxyDetail(key) && retryReady(key)
+                    && terrainBuildNeeded(key))return true;
+        }
+        checked=0;
+        for(var request:preparedWork) {
+            if(checked++==64)break;
+            var key=request.key();
+            if(nearbyDetail(key) && !pending.contains(key) && desiredKeys.contains(key) && retryReady(key)
+                    && (request.surface()?surfaceBuildReady(key):terrainBuildNeeded(key)))return true;
+        }
+        return false;
+    }
+
     private boolean ordinaryRefinement(PredictionTileKey key) {
         return !requiredCoverage(key, false) && (!mediumCoverageWork(key) || backgroundWork(key))
                 && !PredictionWorkOrder.scoped(key, layout, buildFocus) && !dirtyTiles.contains(key);
@@ -900,6 +947,21 @@ public final class PredictionTileManager implements AutoCloseable {
         finally { PredictionRenderTimings.end(PredictionRenderTimings.Stage.CLIENT_SCHEDULE, timingStart); }
     }
 
+    void refreshWorkerAllocation() {
+        int workers = Math.min(memoryBudget.buildLimit(),
+                PredictionMemoryBudget.workerCount(Runtime.getRuntime().availableProcessors()));
+        resizeWorkerPool(executor, workers);
+        resizeWorkerPool(cacheExecutor, PredictionCoreAffinity.capWorkers(
+                Runtime.getRuntime().availableProcessors() >= 8 ? 4 : 2));
+    }
+
+    private static void resizeWorkerPool(ThreadPoolExecutor pool, int workers) {
+        if (pool.getCorePoolSize() == workers) return;
+        if (workers > pool.getMaximumPoolSize()) pool.setMaximumPoolSize(workers);
+        pool.setCorePoolSize(workers);
+        if (workers < pool.getMaximumPoolSize()) pool.setMaximumPoolSize(workers);
+    }
+
     // Lane deques, their ordering inputs and admission counters share this monitor
     // with worker completion. Keep each tick's layout/priority update atomic;
     // terrain sampling and cache IO run outside this scheduling transaction.
@@ -909,9 +971,12 @@ public final class PredictionTileManager implements AutoCloseable {
             tick(cameraX, cameraY, cameraZ, pixelsPerBlock, null, vanillaRadius);
             return;
         }
-        if (closed || paused) {
+        if (closed) return;
+        refreshDecorations(cameraX, cameraZ);
+        if (paused) {
             return;
         }
+        refreshWorkerAllocation();
         schedulingPixels = pixelsPerBlock;
         VssLodLayout nextLayout = createLayout();
         boolean changed = !nextLayout.equals(layout) || surfaceSettings() != surfaceSettings
@@ -1024,7 +1089,7 @@ public final class PredictionTileManager implements AutoCloseable {
         planning.plan.request(new PredictionPlanPreparation.Input(dimension, layout, workView, buildFocus,
                 cameraBlockX, cameraBlockY, cameraBlockZ, schedulingPixels, vanillaRadius,
                 768, sampler.profile().minY(),
-                sampler.profile().minY() + sampler.profile().height(), vegetation.available(), List.copyOf(axes),
+                sampler.profile().minY() + sampler.profile().height(), decorationsAvailable(), List.copyOf(axes),
                 surfaceSettings, meshRevision.get(), ClientPredictionState.exactCoverageRemovalRevision(), residents,
                 inputSnapshots.map(relief), inputSnapshots.set(editedCells), false, candidates, voxyOwnedTiles, uploaded,
                 voxyRadius, mediumCoverageLevelBias,
@@ -1351,7 +1416,8 @@ public final class PredictionTileManager implements AutoCloseable {
         int screen = workView != null && viewBand(key) <= PredictionWorkView.BUFFER && !mediumCoverageWork(key)
                 ? screenWorkPriority(key, surface) : 0;
         return viewPriorityOffset(key, surface) + (surface && farCompletion(key) ? 50_000 : 0)
-                + PredictionWorkOrder.coveragePriority(distance, axis, surface, screen);
+                + PredictionWorkOrder.coveragePriority(distance, axis, surface, screen, voxyDetail(key)
+                    && PredictionWorkOrder.nearbyVisibleDetail(key,layout,distance,viewBand(key)));
     }
 
     private int viewPriorityOffset(PredictionTileKey key, boolean surface) {
@@ -1446,14 +1512,16 @@ public final class PredictionTileManager implements AutoCloseable {
     }
 
     private boolean voxyDetailSurface(PredictionTileKey key) {
-        return voxyDetail(key) && PredictionWorkOrder.surfaceEligible(key, layout, workView, buildFocus,
+        return decorationAllowed(key) && voxyDetail(key) && PredictionWorkOrder.surfaceEligible(key, layout, workView, buildFocus,
                 cameraBlockX, cameraBlockY, cameraBlockZ, surfaceRadius, schedulingPixels,
                 sampler.profile().minY(), sampler.profile().minY() + sampler.profile().height() + 64);
     }
 
     private boolean surfaceBuildReady(PredictionTileKey key) {
+        if (!decorationAllowed(key)) return false;
         PredictionTile tile = ready.get(key);
-        boolean terrainReady = tile != null && tile.data().voxyTile != null;
+        boolean terrainReady = tile != null && tile.data().voxyTile != null
+                && (!PredictionSurfaceRefinement.pending(tile) || farTemplatePreview(key));
         return (surfaceDesired.contains(key) || voxyDetailSurface(key) || needsExactSurface(key) || needsFarSurface(key)) && terrainReady
                 && !dirtyTiles.contains(key) && !surfaceReady.contains(key);
     }
@@ -1492,14 +1560,19 @@ public final class PredictionTileManager implements AutoCloseable {
                 tile.data().voxyTile = canonical;
                 if (sameTerrain) tile.data().terrainRevision = observed.terrainRevision();
                 if (sameTerrain && canonical == observed.data().voxyTile
+                        && java.util.Arrays.equals(tile.data().surfaceRefinement,observed.data().surfaceRefinement)
                         && tile.depthBound().equals(observed.depthBound()))
                     tile.data().cacheContentIdentity = observed.data().cacheContentIdentity;
                 if (!publishTileLocked(tile,reservation,revision,captureEpoch,surface,refreshAncestors,stored,error)) return false;
                 break;
             }
         }
-        var canonical=voxySource.put(tile.data().voxyTile, () -> !closed && ready.get(tile.key()) == tile);
-        if(canonical!=null) synchronized(this) {
+        var raw = tile.data().voxyTile;
+        var window = decorationRange;
+        var projected = window.display(raw);
+        var canonical=voxySource.put(projected, () -> !closed && ready.get(tile.key()) == tile && decorationRange == window);
+        if (canonical == null && !closed && ready.get(tile.key()) == tile) queueDecorationUpdate(tile);
+        if(canonical!=null && projected == raw) synchronized(this) {
             if(!closed && ready.get(tile.key())==tile) {
                 tile.data().voxyTile=canonical;
                 reservation.accountResident(tile.retainedHeapBytes());
@@ -1524,12 +1597,16 @@ public final class PredictionTileManager implements AutoCloseable {
         }
         if (captureEpoch != captureEpochs.getOrDefault(tile.key(), 0L)) captureCancelledBuilds.incrementAndGet();
         if (closed || captureHandoff.blocked(tile.key()) || revision != meshRevision.get()
+                || surface && !decorationAllowed(tile.key())
                 || captureEpoch != captureEpochs.getOrDefault(tile.key(), 0L)
                 || !effectivelyDesired(tile.key())
                 || !reservation.retain(tile.retainedHeapBytes())) {
             return false;
         }
         // A terrain refresh may retain old templates while exact placement is pending.
+        var placementRange = PredictionDecorationRange.current();
+        if (surface && placementRange != null && !placementRange.covers(decorationRange)
+                && !placementRange.contains(tile.baseBlockX(), tile.baseBlockZ(), tile.spanBlocks())) return false;
         // Only a newly generated far surface is invalid after entering the exact band.
         if(surface && tile.data().voxyTile.approximateDecorations() && !farRegion(tile.key()))return false;
         PredictionTile current = ready.get(tile.key());
@@ -1542,11 +1619,18 @@ public final class PredictionTileManager implements AutoCloseable {
                         tile.key(), layout.cellAxis(tile.key().lod()));
         // A late disk/build completion cannot undo already published detail.
         if (current != null && current.spacingBlocks() < tile.spacingBlocks()) return false;
+        if (current != null && current.cellAxis() >= tile.cellAxis() && !dirtyTiles.contains(tile.key())
+                && !PredictionSurfaceRefinement.pending(current) && PredictionSurfaceRefinement.pending(tile)) return false;
         if (current != null && !surface && surfaceReady.contains(tile.key()) && !dirtyTiles.contains(tile.key())
                 && current.spacingBlocks() == tile.spacingBlocks()) return false;
         PredictionMemoryBudget.Reservation previous = residentMemory.put(tile.key(), reservation);
         if (previous != null) previous.close();
         ready.put(tile.key(), tile);
+        if (surface && tile.data().voxyTile.surfaceComplete()) {
+            var range = placementRange == null ? decorationRange : placementRange;
+            if (range.contains(tile.baseBlockX(), tile.baseBlockZ(), tile.spanBlocks())) partialSurfaceRanges.remove(tile.key());
+            else partialSurfaceRanges.put(tile.key(), range);
+        } else if (!tile.data().voxyTile.surfaceComplete()) partialSurfaceRanges.remove(tile.key());
         // The source completes a full native request after this commit. Keep
         // that completed demand resident while its asynchronous delta returns.
         if (unifiedVoxy && runningVoxyDetails.contains(tile.key())
@@ -1623,6 +1707,9 @@ public final class PredictionTileManager implements AutoCloseable {
 
     private void persistVoxels(PredictionTile tile, long revision, long captureEpoch,
                                             int settings, byte[] identity) {
+        var window = decorationRange;
+        if (tile.data().voxyTile.surfaceComplete()
+                && !window.contains(tile.baseBlockX(), tile.baseBlockZ(), tile.spanBlocks())) return;
         if(tile.data().voxyTile.approximateDecorations())return;
         PredictionDiskCache.Lease lease;
         synchronized(this) {
@@ -1641,6 +1728,7 @@ public final class PredictionTileManager implements AutoCloseable {
     }
 
     private void releaseTileResources(PredictionTileKey key) {
+        partialSurfaceRanges.remove(key);
         surfaceCacheAttempts.remove(key);
         invalidatedSurfaces.remove(key);
         idleResidents.remove(key);
@@ -1725,7 +1813,8 @@ public final class PredictionTileManager implements AutoCloseable {
 
     private PredictionVegetation vegetationForBuild(int settings) {
         synchronized (surfaceContextLock) {
-        if (surfaceContextSettings != settings) {
+        if (!VSSClientConfig.CONFIG.predictionDecorations) throw new PredictionDemandChanged();
+        if (vegetation == null || surfaceContextSettings != settings) {
             vegetation = new PredictionVegetation(sampler, diskCache, true);
             farDecorations = null;
             surfaceContextSettings = settings;
@@ -1734,7 +1823,59 @@ public final class PredictionTileManager implements AutoCloseable {
         }
     }
 
-    void tickCityHints(int chunkX, int chunkZ) { cityHints.tick(chunkX, chunkZ); }
+    private boolean decorationsAvailable() {
+        var current = vegetation;
+        return VSSClientConfig.CONFIG.predictionDecorations && (current == null || current.available());
+    }
+
+    private boolean decorationAllowed(PredictionTileKey key) {
+        if (!VSSClientConfig.CONFIG.predictionDecorations || key.lod() < 0 || key.lod() >= layout.levelCount()) return false;
+        int span = layout.tileBlocks(key.lod());
+        return decorationRange.allows(key.tileX() * span, key.tileZ() * span, span);
+    }
+
+    /** Visibility changes reuse resident terrain and cached placement; no terrain invalidation is needed. */
+    private void refreshDecorations(double x, double z) {
+        var next = PredictionDecorationRange.at(x, z);
+        var previous = decorationRange;
+        if (next.equals(previous)) return;
+        decorationRange = next;
+        boolean settingsChanged = next.enabled() != previous.enabled() || next.radius() != previous.radius();
+        if (settingsChanged) { planning.invalidate(); selectionTicks = 0; scheduleAgain = true; }
+        for (var tile : ready.values()) {
+            var raw = tile.data().voxyTile;
+            if (raw == null) continue;
+            var coverage = partialSurfaceRanges.get(tile.key());
+            if (coverage != null && next.allows(raw.baseX(), raw.baseZ(), raw.span()) && !coverage.covers(next)
+                    && !coverage.contains(raw.baseX(), raw.baseZ(), raw.span()))
+                surfaceReady.remove(tile.key());
+            if (settingsChanged || !previous.contains(raw.baseX(), raw.baseZ(), raw.span())
+                    || !next.contains(raw.baseX(), raw.baseZ(), raw.span()))
+                queueDecorationUpdate(tile);
+        }
+        for (var pool : List.of(executor, cacheExecutor))
+            for (var runnable : pool.getQueue().toArray(Runnable[]::new))
+                if (runnable instanceof PredictionTask task && task.surface && task.key != null
+                        && !decorationAllowed(task.key) && pool.getQueue().remove(task)) {
+                    task.releaseAdmission(); pending.remove(task.key);
+                }
+        visibleSurfaceWork.removeIf(key -> !decorationAllowed(key));
+        cleanupPending();
+    }
+
+    private void queueDecorationUpdate(PredictionTile tile) {
+        decorationUpdates.submit(tile.key(), () -> {
+            if (closed || ready.get(tile.key()) != tile) return;
+            var window = decorationRange;
+            var projected = window.display(tile.data().voxyTile);
+            if (voxySource.put(projected, () -> !closed && ready.get(tile.key()) == tile && decorationRange == window) == null
+                    && !closed && ready.get(tile.key()) == tile) queueDecorationUpdate(tile);
+        });
+    }
+
+    void tickCityHints(int chunkX, int chunkZ) {
+        if (VSSClientConfig.CONFIG.predictionDecorations) cityHints.tick(chunkX, chunkZ);
+    }
 
     synchronized void acceptCityHints(dev.xantha.vss.networking.payloads.LostCityHintsS2CPayload response) {
         boolean known = cityHints.regionKnown(response.regionX(), response.regionZ());
@@ -2046,7 +2187,7 @@ public final class PredictionTileManager implements AutoCloseable {
                 + ",ignoredCaptureInvalidations=" + ignoredCaptureInvalidations.get()
                 + ",contentionDeferrals=" + contentionDeferrals.get()
                 + ",deferred=" + deferredUntil.size()
-                + ",active=" + activeSurfaceBuilds.get() + "," + vegetation.diagnostics()
+                + ",active=" + activeSurfaceBuilds.get() + "," + (vegetation == null ? "vegetation=uninitialized" : vegetation.diagnostics())
                 + "," + (farDecorations==null ? "farDecoration=uninitialized" : farDecorations.diagnostics())
                 + ",detailActive=" + activeDetailBuilds.get() + ",previewWorkPending=" + previewWorkPending
                 + ",surfacePreviewWorkPending=" + surfacePreviewWorkPending
@@ -2328,7 +2469,8 @@ public final class PredictionTileManager implements AutoCloseable {
             else diskCache.invalidateCaptures(columns);
         }
         if (worldEdit) for (long column : columns) {
-            vegetation.invalidate((int) (column >> 32), (int) column);
+            var currentVegetation = vegetation;
+            if (currentVegetation != null) currentVegetation.invalidate((int) (column >> 32), (int) column);
             if(farDecorations!=null)farDecorations.invalidate((int)(column>>32),(int)column);
         }
         // Include neighboring columns used by seam walls. Retain old meshes
@@ -2432,6 +2574,7 @@ public final class PredictionTileManager implements AutoCloseable {
     /** Current view demand is independent of content validity and cached detail.
      * Only an optional upgrade with existing coverage may be stopped. */
     private boolean buildDemandCurrent(PredictionTileKey key, int axis, boolean surface, boolean cacheOnly) {
+        if (surface && !decorationAllowed(key)) return false;
         if (cacheOnly || workView == null) return true;
         PredictionTile resident = ready.get(key);
         if (resident == null || requiredCoverage(key, surface)) return true;
@@ -2676,7 +2819,8 @@ public final class PredictionTileManager implements AutoCloseable {
 
     private boolean terrainBuildNeeded(PredictionTileKey key) {
         PredictionTile tile = ready.get(key);
-        return tile == null || dirtyTiles.contains(key) || tile.cellAxis() < targetCellAxis(key);
+        return tile == null || dirtyTiles.contains(key) || tile.cellAxis() < targetCellAxis(key)
+                || PredictionSurfaceRefinement.pending(tile);
     }
 
     private boolean retryReady(PredictionTileKey key) {
@@ -2700,8 +2844,9 @@ public final class PredictionTileManager implements AutoCloseable {
         }
     }
 
-    private BuildSlots tryReserveBuildSlots(boolean surface,boolean farCompletion) {
+    private BuildSlots tryReserveBuildSlots(PredictionTileKey key,boolean surface,boolean farCompletion) {
         int detailLimit = PredictionWorkOrder.detailBuildLimit(executor.getCorePoolSize(), previewWorkPending, buildFocus != null);
+        if(!nearbyDetail(key) && nearbyDetailWaiting())detailLimit=Math.max(1,detailLimit-1);
         if (activeDetailBuilds.get() >= detailLimit) { admissionReasons[ADMIT_NO_DETAIL_SLOT].increment(); return null; }
         int surfaceLimit = PredictionWorkOrder.surfaceBuildLimit(executor.getCorePoolSize(), refinementLimit());
         if (surface && activeSurfaceBuilds.get() >= surfaceLimit) { admissionReasons[ADMIT_NO_SURFACE_SLOT].increment(); return null; }
@@ -2740,6 +2885,9 @@ public final class PredictionTileManager implements AutoCloseable {
         var result = new java.util.LinkedHashMap<String,Object>();
         result.put("publishedTiles",publishedTileCount.sum());
         result.put("voxyRendering", unifiedVoxy);
+        var decorationWindow = decorationRange;
+        result.put("decorations", java.util.Map.of("enabled", VSSClientConfig.CONFIG.predictionDecorations,
+                "radiusChunks", decorationWindow.radius() / 16, "pendingDisplayUpdates", decorationUpdates.size()));
         result.put("detailDriver", unifiedVoxy ? "voxy" : "vss");
         result.put("voxyOverlayBytes", voxySource.bytes());
         result.put("voxyDetailTargets", voxyDetailTargets.size());
@@ -2755,6 +2903,7 @@ public final class PredictionTileManager implements AutoCloseable {
         result.put("admission",admission);
         result.put("voxyOverlay", dev.xantha.vss.compat.VoxyPredictionBridge.diagnostics());
         result.put("voxySource", voxySource.diagnostics());
+        result.put("coreAffinity", PredictionCoreAffinity.diagnostics());
         result.put("generationActive",executor.getActiveCount()); result.put("cacheActive",cacheExecutor.getActiveCount());
         result.put("generationQueued",executor.getQueue().size()); result.put("cachePending",cachePending.size());
         result.put("cacheWorkerLimit",cacheExecutor.getCorePoolSize());
@@ -2962,6 +3111,7 @@ public final class PredictionTileManager implements AutoCloseable {
     private synchronized Admission enqueue(PredictionTileKey key, int centerChunkX, int centerChunkZ,
                                       boolean surface, boolean cacheOnly) {
         if (closed || paused) return Admission.DEFERRED;
+        if (surface && !decorationAllowed(key)) return Admission.DEFERRED;
         if (reclaimAdmissionTarget != null && !key.equals(reclaimAdmissionTarget)) return Admission.DEFERRED;
         if (!generationReady) {
             if (surface) return Admission.DEFERRED;
@@ -3010,8 +3160,10 @@ public final class PredictionTileManager implements AutoCloseable {
         boolean visibleCompletion = !cacheOnly && surface && visibleSurface(key);
         boolean ordinary = !cacheOnly && !visibleCompletion && ordinaryRefinement(key);
         PredictionTile current = ready.get(key);
-        long ordinaryPending = refinementPending.stream().filter(k -> !idlePending.contains(k)).count();
-        if (ordinary && ordinaryPending >= refinementLimit()) return Admission.DEFERRED;
+        long ordinaryPending = ordinary ? refinementPending.stream().filter(k -> !idlePending.contains(k)).count() : 0;
+        int ordinaryLimit = refinementLimit();
+        if(ordinary && !nearbyDetail(key) && nearbyDetailWaiting())ordinaryLimit=Math.max(1,ordinaryLimit-1);
+        if (ordinary && ordinaryPending >= ordinaryLimit) return Admission.DEFERRED;
         if (ordinary && movementUpgrade(key, surface)
                 && refinementPending.stream().filter(k -> !idlePending.contains(k) && movementUpgrade(k, false)).count()
                     >= PredictionMotionPace.upgradeBuildLimit(executor.getCorePoolSize())) return Admission.DEFERRED;
@@ -3047,7 +3199,7 @@ public final class PredictionTileManager implements AutoCloseable {
         boolean needsDetail = !cacheOnly && (surface || !surface && voxyDetail(key) || current != null
                 && Math.max(current.cellAxis(), Math.min(targetCellAxis(key), current.cellAxis() * 2))
                     > PredictionWorkOrder.PREVIEW_CELL_AXIS);
-        BuildSlots buildSlots = needsDetail ? tryReserveBuildSlots(surface,surface && farCompletion(key)) : null;
+        BuildSlots buildSlots = needsDetail ? tryReserveBuildSlots(key,surface,surface && farCompletion(key)) : null;
         if (needsDetail && buildSlots == null) {
             detailEvent(key,"detail-slot");
             if (cpuReservation != null) cpuReservation.close();
@@ -3088,6 +3240,7 @@ public final class PredictionTileManager implements AutoCloseable {
             PredictionCpuBudget.Lease cpuLease = null;
             PredictionDiskCache.Lease diskLease = null;
             ClientTerrainSampler.SamplingScope terrainRequest = null;
+            PredictionDecorationRange.Scope decorationRequest = null;
             var buildOutcome = PredictionMemoryBudget.BuildOutcome.CANCELLED;
             boolean continueSurface = false;
             boolean buildAdmitted = false;
@@ -3154,7 +3307,8 @@ public final class PredictionTileManager implements AutoCloseable {
                     // that may have elapsed while this worker was waiting.
                     return;
                 }
-                if (surface && !cacheOnly) vegetationForBuild(buildSurfaceSettings);
+                decorationRequest = decorationRange.enter();
+                if (surface && !cacheOnly && !useFarSurface(key)) vegetationForBuild(buildSurfaceSettings);
                 if (surface && !cacheOnly && !useFarSurface(key)) {
                     int span = tileLayout.tileBlocks(key.lod());
                     vegetationForBuild(buildSurfaceSettings).deferIfRenderingBusy(key.tileX() * span,
@@ -3232,6 +3386,7 @@ public final class PredictionTileManager implements AutoCloseable {
                     var mesh = PredictionVoxelData.forVoxy(surfaceVoxels);
                     mesh.terrainRevision = previousTerrain.terrainRevision();
                     mesh.parentLod = previousTerrain.data().parentLod;
+                    mesh.surfaceRefinement = previousTerrain.data().surfaceRefinement;
                     mesh.retainedSampleObjects = previousTerrain.data().retainedSampleObjects;
                     mesh.retainedVolumeBytes = previousTerrain.data().retainedVolumeBytes;
                     var completed = new PredictionTile(key, previousTerrain.heights(), previousTerrain.groundHeights(),
@@ -3283,15 +3438,17 @@ public final class PredictionTileManager implements AutoCloseable {
                 final int activeAxis = cellAxis;
                 requireBuildCurrent(key, captureEpoch, revision, activeAxis, surface, cacheOnly);
                 boolean preview = cellAxis < tileLayout.cellAxis(key.lod());
+                boolean basicSurface = !diskHit && derivedParent == null && PredictionSurfaceRefinement.basicPass(sampler.stagedSurface(),
+                        resident == null ? null : resident.samples(), cellAxis, targetCellAxis(key));
                 int gridSize = cellAxis + VssLodLayout.SAMPLE_MARGIN * 2;
                 int stepBlocks = tileLayout.tileBlocks(key.lod()) / cellAxis;
                 int baseBlockX = key.tileX() * (key.lod() < tileLayout.levelCount()
                         ? tileLayout.tileBlocks(key.lod()) : PredictionTileManager.TILE_CHUNKS << key.lod());
                 int baseBlockZ = key.tileZ() * tileLayout.tileBlocks(key.lod());
-                if (stepBlocks <= 16)
+                if (stepBlocks <= 16 && decorationAllowed(key))
                     cityHints.observeArea(baseBlockX - 16, baseBlockZ - 16,
                         tileLayout.tileBlocks(key.lod()) + 32);
-                LostCityHints.Snapshot citySnapshot = stepBlocks <= 16
+                LostCityHints.Snapshot citySnapshot = stepBlocks <= 16 && decorationAllowed(key)
                         ? cityHints.cacheSnapshot(baseBlockX, baseBlockZ, tileLayout.tileBlocks(key.lod()))
                         : new LostCityHints.Snapshot(null, true);
                 dev.xantha.vss.common.worldgen.LostCityPreview.Tile cityBuildings = citySnapshot.buildings();
@@ -3313,13 +3470,13 @@ public final class PredictionTileManager implements AutoCloseable {
                             capturedOverrides[z * gridSize + x] = captured;
                         }
                         ClientColumnSample retained = captured != null ? null
-                                : retainedSample(reusable, x, z, stepBlocks, preview && !surface, !preview && !surface);
+                                : retainedSample(reusable, x, z, stepBlocks, (preview || sampler.stagedSurface()) && !surface, !preview && !surface && !sampler.stagedSurface());
                         if (captureChanged) retained = sampler.retainAfterCapture(retained);
                         if (captured != null || retained != null) reusedPointBuilds.increment();
                         samples[z * gridSize + x] = captured != null ? captured : retained;
                     }
                     batch = sampleGridFast(baseBlockX, baseBlockZ, stepBlocks, gridSize, samples,
-                            preview && !surface, !preview && !surface,
+                            preview && !surface, !preview && !surface, basicSurface,
                             () -> buildCurrent(key, captureEpoch, revision, activeAxis, surface, cacheOnly));
                 }
                 requireBuildCurrent(key, captureEpoch, revision, activeAxis, surface, cacheOnly);
@@ -3339,7 +3496,7 @@ public final class PredictionTileManager implements AutoCloseable {
                         int sampleIndex = dz * gridSize + dx;
                         // Captures are protected by captureEpoch; predicted columns can improve concurrently.
                         ClientColumnSample sample = derivedParent != null ? batch[sampleIndex]
-                                : sampler.interiorTerrain() ? null
+                                : sampler.stagedSurface() ? batch[sampleIndex] : sampler.interiorTerrain() ? null
                                 : !diskHit && capturedOverrides != null && capturedOverrides[sampleIndex] != null
                                         ? capturedOverrides[sampleIndex] : cachedGridSample(blockX, blockZ, stepBlocks);
                         if (sample == null && previousTerrain != null && dx >= 1 && dz >= 1) {
@@ -3363,11 +3520,12 @@ public final class PredictionTileManager implements AutoCloseable {
                 requireBuildCurrent(key, captureEpoch, revision, activeAxis, surface, cacheOnly);
                 colorNanos.add(System.nanoTime() - colorStartedNanos);
                 long exteriorStartedNanos = System.nanoTime();
-                int exteriorUpdates = derivedParent != null ? 0 : PredictionExteriorColumns.enrich(samples, gridSize, stepBlocks,
+                int exteriorUpdates = derivedParent != null || basicSurface || PredictionSurfaceRefinement.pending(samples) ? 0 : PredictionExteriorColumns.enrich(samples, gridSize, stepBlocks,
                         baseBlockX, baseBlockZ, sampler, () -> buildCurrent(key, captureEpoch, revision, activeAxis, surface, cacheOnly));
                 // Complete floating columns can correct a preview's top as well as its underside.
                 if (exteriorUpdates != 0)
                     for (int i = 0; i < samples.length; i++) heights[i] = samples[i].surfaceY();
+                if(basicSurface)for(int i=0;i<samples.length;i++)samples[i]=PredictionSurfaceRefinement.basic(samples[i]);
                 int biomeUpdates = sampler.resolveBiomeIndices(samples, gridSize, baseBlockX, baseBlockZ, stepBlocks);
                 exteriorNanos.add(System.nanoTime() - exteriorStartedNanos);
                 requireBuildCurrent(key, captureEpoch, revision, activeAxis, surface, cacheOnly);
@@ -3388,15 +3546,19 @@ public final class PredictionTileManager implements AutoCloseable {
                 long surfaceStarted = System.nanoTime();
                 samplingNanos.add(surfaceStarted - buildStartedNanos);
                 requireBuildCurrent(key, captureEpoch, revision, activeAxis, surface, cacheOnly);
-                PredictionVegetation.Tile plants = vegetation.cachedDisplayForRendering(baseBlockX, baseBlockZ,
-                        tileLayout.tileBlocks(key.lod()), stepBlocks, editedCells::contains);
+                var cachedVegetation = vegetation;
+                PredictionVegetation.Tile plants = cachedVegetation != null && decorationAllowed(key)
+                        ? cachedVegetation.cachedDisplayForRendering(baseBlockX, baseBlockZ,
+                            tileLayout.tileBlocks(key.lod()), stepBlocks, editedCells::contains)
+                        : PredictionVegetation.Tile.EMPTY;
                 if (captureEpoch != captureEpochs.getOrDefault(key, 0L)) { captureEarlyExits.increment(); return; }
                 requireBuildCurrent(key, captureEpoch, revision, activeAxis, surface, cacheOnly);
                 long meshStarted = System.nanoTime();
                 decorationNanos.add(meshStarted - surfaceStarted);
                 requireBuildCurrent(key, captureEpoch, revision, activeAxis, surface, cacheOnly);
                 PredictionVoxySource.Tile voxels = PredictionVoxySource.build(key, samples,
-                        gridSize, stepBlocks, sampler, plants, cityBuildings, surface);
+                        gridSize, stepBlocks, sampler, plants, cityBuildings, surface,
+                        resident==null?null:resident.data().voxyTile,resident==null?null:resident.samples());
                 if (voxels != null && !surface && resident != null && retainSurface)
                     voxels = voxels.retainFeatures(resident.data().voxyTile);
                 PredictionVoxelData mesh = PredictionVoxelData.forVoxy(voxels);
@@ -3412,8 +3574,10 @@ public final class PredictionTileManager implements AutoCloseable {
                 int[] meshGroundHeights = meshHeights;
                 // Retain sampling provenance and immutable voxel columns for Voxy workers.
                 mesh.parentLod = derivedParent == null ? null : derivedParent.proof();
-                mesh.retainedSampleObjects = PredictionSampleCompaction.compact(meshSamples);
-                mesh.retainedVolumeBytes = PredictionSampleCompaction.volumeBytes(meshSamples);
+                if(sampler.stagedSurface() && PredictionSurfaceRefinement.pending(samples))mesh.surfaceRefinement=samples;
+                var retainedSamples=mesh.surfaceRefinement==null?new ClientColumnSample[0]:samples;
+                mesh.retainedSampleObjects = PredictionSampleCompaction.compact(meshSamples,retainedSamples);
+                mesh.retainedVolumeBytes = PredictionSampleCompaction.volumeBytes(meshSamples,retainedSamples);
                 requireBuildCurrent(key, captureEpoch, revision, activeAxis, surface, cacheOnly);
                 PredictionDepthBound surfaceBounds = PredictionDepthBound.fromSamples(samples);
                 if (resident != null && !surface && retainSurface
@@ -3502,6 +3666,7 @@ public final class PredictionTileManager implements AutoCloseable {
                 if (captureEpoch != captureEpochs.getOrDefault(key, 0L))
                     captureDiscardNanos.add(System.nanoTime() - buildStartedNanos);
                 if (diskLease != null) diskLease.close();
+                if (decorationRequest != null) decorationRequest.close();
                 if (terrainRequest != null) terrainRequest.close();
                 activeBuildThreads.remove(Thread.currentThread());
                 runningVoxyDetails.remove(key);
@@ -3642,6 +3807,13 @@ public final class PredictionTileManager implements AutoCloseable {
         int localX = (x - VssLodLayout.SAMPLE_MARGIN) * step;
         int localZ = (z - VssLodLayout.SAMPLE_MARGIN) * step;
         int oldStep = resident.spacingBlocks(), axis = resident.cellAxis() + 1;
+        var progress=resident.data().surfaceRefinement;
+        int fullGrid=axis+1;
+        if(progress!=null && progress.length==fullGrid*fullGrid && localX%oldStep==0 && localZ%oldStep==0
+                && localX>=-oldStep && localZ>=-oldStep && localX/oldStep<axis && localZ/oldStep<axis) {
+            var sample=progress[(localZ/oldStep+1)*fullGrid+localX/oldStep+1];
+            if(sample!=null && (display?sample.reusableForDisplay():sample.reusableFor(preview)))return sample;
+        }
         if (localX < 0 || localZ < 0 || localX % oldStep != 0 || localZ % oldStep != 0
                 || localX / oldStep >= axis || localZ / oldStep >= axis
                 || resident.samples().length != axis * axis) return null;
@@ -3650,10 +3822,18 @@ public final class PredictionTileManager implements AutoCloseable {
     }
 
     private ClientColumnSample[] sampleGridFast(int baseBlockX, int baseBlockZ,
-                                                int stepBlocks, int gridSize, ClientColumnSample[] samples, boolean preview, boolean display,
+                                                int stepBlocks, int gridSize, ClientColumnSample[] samples, boolean preview, boolean display, boolean basicSurface,
                                                 java.util.function.BooleanSupplier captureCurrent) {
         boolean floating = sampler.floatingTerrain();
-        if (sampler.interiorTerrain() || floating) {
+        if(sampler.stagedSurface() && !basicSurface) {
+            // Sparse basic columns establish the new grid immediately. Full hooks improve it in bounded slices.
+            sampleGridFast(baseBlockX,baseBlockZ,stepBlocks,gridSize,samples,true,false,true,captureCurrent);
+            for(int i=0;i<samples.length;i++)if(samples[i]!=null && !samples[i].reusableFor(false))
+                samples[i]=PredictionSurfaceRefinement.basic(samples[i]);
+            PredictionSurfaceRefinement.completeGridSlice(sampler,baseBlockX,baseBlockZ,stepBlocks,gridSize,samples,captureCurrent);
+            return samples;
+        }
+        if ((basicSurface ? sampler.basicInteriorTerrain() : sampler.interiorTerrain()) || floating) {
             long revision = meshRevision.get();
             for (int z = 0; z < gridSize; z++) for (int x = 0; x < gridSize; x++) {
                 if (!captureCurrent.getAsBoolean()) return samples;
@@ -3666,8 +3846,9 @@ public final class PredictionTileManager implements AutoCloseable {
                 // A captured height alone cannot replace the entire underground column.
                 if (samples[i] == null || samples[i].volume() == null
                         || floating && PredictionExteriorColumns.profiled(samples[i]))
-                    samples[i] = sampler.sampleInterior(baseBlockX + (x - VssLodLayout.SAMPLE_MARGIN) * stepBlocks,
-                            baseBlockZ + (z - VssLodLayout.SAMPLE_MARGIN) * stepBlocks);
+                    samples[i] = (basicSurface ? sampler.sampleBasicInterior(baseBlockX + (x - VssLodLayout.SAMPLE_MARGIN) * stepBlocks,
+                            baseBlockZ + (z - VssLodLayout.SAMPLE_MARGIN) * stepBlocks) : sampler.sampleInterior(baseBlockX + (x - VssLodLayout.SAMPLE_MARGIN) * stepBlocks,
+                            baseBlockZ + (z - VssLodLayout.SAMPLE_MARGIN) * stepBlocks));
             }
             return samples;
         }
@@ -4055,6 +4236,8 @@ public final class PredictionTileManager implements AutoCloseable {
         coverageSpatial.clear(); coverageSpatialSize = 0;
         if (closed) return;
         closed = true;
+        decorationUpdates.close();
+        partialSurfaceRanges.clear();
         visibilityFeedback = lastScheduledVisibility = PredictionVisibilityFeedback.Snapshot.EMPTY;
         displayGoals = Map.of(); recentlyVisible.clear();
         viewBands = Map.of(); viewDependencies = Set.of();

@@ -1,1 +1,3 @@
 dev/xantha/vss/networking/server/ServerIdentityConfigurationTask.java
+dev/xantha/vss/common/worldgen/LithostitchedBiomeSnapshot.java
+dev/xantha/vss/mixin/worldgen/LithostitchedBiomeInjectorMixin.java

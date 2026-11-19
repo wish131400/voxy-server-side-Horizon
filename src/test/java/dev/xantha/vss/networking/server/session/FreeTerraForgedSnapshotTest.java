@@ -17,6 +17,26 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 class FreeTerraForgedSnapshotTest {
+    @Test void ultraRuntimeStructureRulesAreCopiedWithoutSerializedHolderReferences() {
+        for (boolean empty : new boolean[]{false, true}) {
+        var variant = FreeTerraForgedVariant.ULTRA;
+        var registries = new java.util.ArrayList<net.minecraft.core.Registry<?>>();
+        var codecs = new java.util.ArrayList<RegistryDataLoader.RegistryData<?>>();
+        for (String path : List.of("worldgen/preset", "worldgen/noise", "worldgen/structure_rule")) {
+            var key = ResourceKey.<String>createRegistryKey(Identifier.parse(variant.namespace + ":" + path));
+            var registry = new MappedRegistry<String>(key, Lifecycle.stable());
+            if (!empty || !path.equals("worldgen/structure_rule")) registry.register(ResourceKey.create(key, Identifier.parse(variant.namespace + ":preset")), path, RegistrationInfo.BUILT_IN);
+            registries.add(registry.freeze());
+            codecs.add(new RegistryDataLoader.RegistryData<>(key, Codec.STRING, false));
+        }
+        var access = new RegistryAccess.ImmutableRegistryAccess(registries);
+        var dependencies = new WorldgenRegistryDependencies(access, codecs);
+        WorldgenCodecSnapshot.snapshotFreeTerraForged(new JsonObject(), access, dependencies, variant.namespace::equals);
+        assertTrue(dependencies.encode().has("ultraterraforged:worldgen/structure_rule"));
+        if (!empty) assertEquals("worldgen/structure_rule", dependencies.encode()
+                .getAsJsonObject("ultraterraforged:worldgen/structure_rule").get("ultraterraforged:preset").getAsString());
+        }
+    }
     @BeforeAll static void bootstrap() {
 
         net.minecraft.SharedConstants.tryDetectVersion();

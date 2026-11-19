@@ -47,6 +47,31 @@ class VoxyRealCoveragePersistenceTest {
     }
     byte[] image(int variant) { byte[] data = new byte[128]; Arrays.fill(data, (byte) variant); return data; }
 
+    @Test void groupedRuntimeCoverageMatchesIndividualCellsAcrossSignedBoundaries() {
+        var engine=new Object();var coverage=VoxyRealCoverage.of(engine);
+        for(int y=-40;y<40;y++)if(Math.floorMod(y,5)!=1)coverage.mark(-3,y,5);
+        for(int start=-42;start<=42;start++)for(int count=0;count<=32;count++) {
+            int expected=0;
+            for(int i=0;i<count;i++)if(coverage.containsSection(-3,start+i,5))expected|=1<<i;
+            assertEquals(expected,coverage.coverageMask(-3,start,5,count,0));
+            assertEquals(0,coverage.coverageMask(-2,start,5,count,0));
+        }
+    }
+    @Test void groupedSavedCoverageMatchesIndividualCellsAcrossAllLods() {
+        Session original=session("grouped-masks");
+        for(int y=-36;y<36;y++)if(Math.floorMod(y,5)!=1)VoxyRealCoveragePersistence.committed(original.engine,-3,y,5);
+        for(int lod=0;lod<=4;lod++)for(int y=-36;y<36;y+=1<<(lod+1))
+            image(original,lod,-3,y,5,image(lod),true,true);
+        VoxyRealCoveragePersistence.reset();Session restored=session("grouped-masks");
+        for(int lod=0;lod<=4;lod++)for(int y=-36;y<36;y+=1<<(lod+1))
+            image(restored,lod,-3,y,5,image(lod),false,true);
+        for(int lod=0;lod<=4;lod++)for(int start=-42;start<=42;start++)for(int count=0;count<=32;count++) {
+            int expected=0;
+            for(int i=0;i<count;i++)if(VoxyRealCoveragePersistence.contains(restored.engine,-3,start+i,5,lod))expected|=1<<i;
+            assertEquals(expected,VoxyRealCoveragePersistence.coverageMask(restored.engine,-3,start,5,count,lod));
+        }
+    }
+
     @Test void reopeningRestoresOnlyTheIndividuallyVerifiedLodAndCovered16Cube() {
         Session a = session("world-overworld");
         assertEquals(31, VoxyRealCoveragePersistence.committed(a.engine, -3, 2, 5));

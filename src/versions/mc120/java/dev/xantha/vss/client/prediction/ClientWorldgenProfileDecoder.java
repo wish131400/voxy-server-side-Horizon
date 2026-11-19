@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import dev.xantha.vss.common.VSSLogger;
 import dev.xantha.vss.common.processing.LodByteCompression;
+import dev.xantha.vss.common.worldgen.BlueprintSnapshotEncoding;
 import dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload;
 import dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionProfile;
 import java.io.IOException;
@@ -133,6 +134,11 @@ final class ClientWorldgenProfileDecoder {
                     JsonObject generatorRoot = profile.generatorData().length == 0 ? null : parse(LodByteCompression.decompress(
                             profile.generatorData(), profile.generatorCompression(), profile.generatorRawSize(),
                             WorldgenProfileS2CPayload.MAX_GENERATOR_RAW_BYTES));
+                    if (generatorRoot != null && generatorRoot.has("vss_blueprint")) {
+                        var section = generatorRoot.getAsJsonObject("vss_blueprint");
+                        if (BlueprintSnapshotEncoding.packed(section))
+                            generatorRoot.add("vss_blueprint", BlueprintSnapshotEncoding.unpack(section));
+                    }
                     java.util.function.Supplier<String> legacyIdentity = () -> PredictionCacheMigration.contentHash(
                             payload.formatVersion(), payload.seed(), profile, legacyRegistryHash.get(), generatorRoot);
                     if (generatorRoot != null) {
@@ -231,6 +237,7 @@ final class ClientWorldgenProfileDecoder {
                         continue;
                     }
                     if (javaSampler != null) {
+                        javaSampler=PredictionExecutionPlan.resolve(generatorRoot,registryRoot).javaSampler(javaSampler,generatorRoot);
                         publish(profile, javaSampler, generatorRoot, registryRoot, registries.ops(), legacyIdentity, active, ready);
                         dimensionTiming.finish();
                         if (dev.xantha.vss.config.VSSClientConfig.CONFIG.debugLogging) {
@@ -298,9 +305,7 @@ final class ClientWorldgenProfileDecoder {
             JsonObject generatorRoot, ClientWorldgenRegistries registries) {
         BiomeSource biomeSource = generatorRoot.has("vss_blueprint")
                 ? BlueprintBiomeCompat.decode(generatorRoot.getAsJsonObject("vss_blueprint"), profile.seed(), registries)
-                : BiomeSource.CODEC
-                .parse(registries.ops(), generatorRoot.get("biome_source"))
-                .getOrThrow(false, message -> { throw new IllegalArgumentException(message); });
+                : WorldWeaverBiomeContext.decode(generatorRoot.get("biome_source"), registries);
         // A required server routing section can never fall through to the lossy vanilla codec.
         if (generatorRoot.has("vss_terrablender")) {
             biomeSource = TerraBlenderBackend.buildRoutingSource(generatorRoot.getAsJsonObject("vss_terrablender"),
@@ -313,6 +318,8 @@ final class ClientWorldgenProfileDecoder {
             biomeSource = new TerraBlenderEndBiomeSource(generatorRoot.getAsJsonObject("vss_terrablender_end"),
                     profile.seed(), registries);
         }
+        if(generatorRoot.has("vss_biolith"))
+            biomeSource=new BiolithBiomeSource(generatorRoot.getAsJsonObject("vss_biolith"),profile.seed(),registries);
         return biomeSource;
     }
 
@@ -323,11 +330,13 @@ final class ClientWorldgenProfileDecoder {
         NoiseGeneratorSettings settings = NoiseGeneratorSettings.DIRECT_CODEC
                 .parse(registries.ops(), generatorRoot.get("settings"))
                 .getOrThrow(false, message -> { throw new IllegalArgumentException(message); });
-        NoiseBasedChunkGenerator generator = new NoiseBasedChunkGenerator(
+        NoiseBasedChunkGenerator generator = generatorRoot.has("vss_original_stages") ? originalGenerator(generatorRoot, registries)
+                : new NoiseBasedChunkGenerator(
                 biomeSource, Holder.direct(settings));
         boolean freeTerraForged = generatorRoot.has("vss_freeterraforged")
                 && generatorRoot.get("vss_freeterraforged").getAsBoolean();
         RandomState randomState = FreeTerraForgedCompat.create(freeTerraForged,
+                generatorRoot.has("vss_freeterraforged_variant") ? generatorRoot.get("vss_freeterraforged_variant").getAsString() : null,
                 profile.levelKey().equals(Level.OVERWORLD), registries.access(),
                 () -> RandomState.create(settings, registries.noiseLookup(), profile.seed()));
         LevelHeightAccessor profileHeights = LevelHeightAccessor.create(profile.minY(), profile.height());
@@ -341,7 +350,22 @@ final class ClientWorldgenProfileDecoder {
         sampler.bindDimensionType(generatorRoot, registries.ops());
         // Epic Terrain uses height-dependent cache_2d nodes. Its surface needs
         // NoiseChunk's evaluation order, including when no native library loads.
-        return registries.hasDensityNamespace("etn") ? new MinecraftColumnTerrainSampler(sampler) : sampler;
+        return generatorRoot.has("vss_original_stages") ? originalStages(sampler)
+                : registries.hasDensityNamespace("etn") ? new MinecraftColumnTerrainSampler(sampler) : sampler;
+    }
+
+    private static ClientTerrainSampler originalStages(ClientTerrainSampler sampler) {
+        try { return new PredictionOriginalStages(sampler); }
+        catch (RuntimeException | Error failure) { sampler.close(); throw failure; }
+    }
+
+    private static NoiseBasedChunkGenerator originalGenerator(JsonObject root, ClientWorldgenRegistries registries) {
+        if (!root.has("vss_generator")) throw new IllegalArgumentException("Original generator codec missing; use authoritative LOD");
+        var decoded = WorldWeaverBiomeContext.decodeGenerator(root.get("vss_generator"), root.get("biome_source"), registries);
+        if (!(decoded instanceof NoiseBasedChunkGenerator noise)) throw new IllegalArgumentException("Original noise generator type changed");
+        if (!root.has("vss_original_generator_class") || !decoded.getClass().getName().equals(root.get("vss_original_generator_class").getAsString()))
+            throw new IllegalArgumentException("Generator codec did not preserve the original implementation");
+        return noise;
     }
 
     private static JsonObject parse(byte[] bytes) {

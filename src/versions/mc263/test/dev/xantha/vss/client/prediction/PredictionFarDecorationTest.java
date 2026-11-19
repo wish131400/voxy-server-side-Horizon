@@ -66,6 +66,7 @@ class PredictionFarDecorationTest {
         int radius=config.predictionExactDistanceBlocks;
         config.predictionFarDecorations=true;config.predictionExactDistanceBlocks=4096;
         var sampler=org.mockito.Mockito.mock(RustTerrainSampler.class);
+        org.mockito.Mockito.when(sampler.supportsFarDecorations()).thenReturn(true);
         org.mockito.Mockito.when(sampler.profile()).thenReturn(new dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionProfile(
                 Level.OVERWORLD.identifier(),42,-64,384,"noise","minecraft:overworld",1));
         org.mockito.Mockito.when(sampler.decorationContext()).thenReturn(sampler);
@@ -130,6 +131,7 @@ class PredictionFarDecorationTest {
         boolean enabled=config.predictionFarDecorations;int radius=config.predictionExactDistanceBlocks,workers=config.predictionRefinementWorkers;
         config.predictionFarDecorations=true;config.predictionExactDistanceBlocks=4096;config.predictionRefinementWorkers=4;
         var sampler=org.mockito.Mockito.mock(RustTerrainSampler.class);
+        org.mockito.Mockito.when(sampler.supportsFarDecorations()).thenReturn(true);
         org.mockito.Mockito.when(sampler.profile()).thenReturn(new dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionProfile(
                 Level.OVERWORLD.identifier(),42,-64,384,"noise","minecraft:overworld",1));
         org.mockito.Mockito.when(sampler.decorationContext()).thenReturn(sampler);

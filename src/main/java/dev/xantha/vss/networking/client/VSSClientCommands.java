@@ -29,6 +29,11 @@ public final class VSSClientCommands {
                 .then(ClientCommandManager.literal("prediction")
                         .executes(context -> clientHelp(context.getSource(), "prediction"))
                         .then(performanceCommand())
+                        .then(ClientCommandManager.literal("acceptance-mode")
+                                .requires(source -> dev.xantha.vss.client.prediction.PredictionAcceptanceProbe.enabled())
+                                .then(ClientCommandManager.argument("mode", StringArgumentType.word()).executes(context ->
+                                        dev.xantha.vss.client.prediction.PredictionAcceptanceProbe.mode(StringArgumentType.getString(context,"mode")))))
+                        .then(acceptanceCommand())
                         .then(ClientCommandManager.literal("rendercapture")
                                 .executes(context -> captureRender(context.getSource(), 0.5, 0.65))
                                 .then(ClientCommandManager.argument("x", com.mojang.brigadier.arguments.DoubleArgumentType.doubleArg(0, 1))
@@ -79,6 +84,25 @@ public final class VSSClientCommands {
                         .executes(context -> clientHelp(context.getSource(),
                                 StringArgumentType.getString(context, "unknown_command")))));
         VSSCommandHelp.clientAliases(root);
+    }
+
+    private static LiteralArgumentBuilder<FabricClientCommandSource> acceptanceCommand() {
+        return ClientCommandManager.literal("acceptance")
+                                .requires(source -> dev.xantha.vss.client.prediction.PredictionAcceptanceProbe.enabled())
+                                .then(ClientCommandManager.argument("id", StringArgumentType.word())
+                                  .then(ClientCommandManager.argument("x", com.mojang.brigadier.arguments.IntegerArgumentType.integer(-30000000,30000000))
+                                    .then(ClientCommandManager.argument("z", com.mojang.brigadier.arguments.IntegerArgumentType.integer(-30000000,30000000))
+                                      .then(ClientCommandManager.argument("side", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1,8))
+                                        .then(ClientCommandManager.argument("step", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1,256))
+                                          .executes(context -> {
+                                            var future=dev.xantha.vss.client.prediction.PredictionAcceptanceProbe.request(
+                                                StringArgumentType.getString(context,"id"),
+                                                com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context,"x"),
+                                                com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context,"z"),
+                                                com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context,"side"),
+                                                com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context,"step"));
+                                            performanceResult(context.getSource(),future,"vss.command.perf.report");return 1;
+                                          }))))));
     }
 
     private static LiteralArgumentBuilder<FabricClientCommandSource> performanceCommand() {

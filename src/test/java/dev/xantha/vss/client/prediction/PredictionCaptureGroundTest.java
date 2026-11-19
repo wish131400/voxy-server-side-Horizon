@@ -90,11 +90,11 @@ class PredictionCaptureGroundTest {
             var leaf = new PredictionCapturedTerrain.Node(columns,null);
             var parent = new PredictionCapturedTerrain.Node(null,new PredictionCapturedTerrain.Summary[]{leaf.summary,null,null,null});
             for (var node : List.of(leaf,parent)) {
-                var bytes = new ByteArrayOutputStream(); node.write(new DataOutputStream(bytes),null);
+                var bytes = new ByteArrayOutputStream(); node.write(new DataOutputStream(bytes),null,PredictionBlockMappings.capture());
                 var in = new DataInputStream(new ByteArrayInputStream(bytes.toByteArray()));
-                if (modern() && flags != CURRENT) assertThrows(IOException.class,()->PredictionCapturedTerrain.Node.read(in,null));
+                if (modern() && flags != CURRENT) assertThrows(IOException.class,()->PredictionCapturedTerrain.Node.read(in,null,PredictionBlockMappings.capture()));
                 else {
-                    var restored = PredictionCapturedTerrain.Node.read(in,null);
+                    var restored = PredictionCapturedTerrain.Node.read(in,null,PredictionBlockMappings.capture());
                     var mip = restored.summary.sample(sample(0),256);
                     assertEquals(flags & ClientColumnSample.FLAG_CAPTURE_GROUND_V2,mip.flags() & ClientColumnSample.FLAG_CAPTURE_GROUND_V2);
                     assertFalse(PredictionCaptureGround.obsolete(mip));

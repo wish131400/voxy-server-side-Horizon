@@ -25,21 +25,34 @@ final class FreeTerraForgedCompat {
         return variant(state) != null;
     }
 
-    private static FreeTerraForgedVariant variant(Object state) {
+    static FreeTerraForgedVariant variant(Object state) {
+        FreeTerraForgedVariant fallback = null;
         for (Class<?> type = state.getClass(); type != null; type = type.getSuperclass()) {
             for (Class<?> api : type.getInterfaces()) for (var variant : FreeTerraForgedVariant.values()) {
-                if (api.getName().equals(variant.stateClass())) return variant;
+                if (!api.getName().equals(variant.stateClass())) continue;
+                if (fallback == null) fallback = variant;
+                try {
+                    if (api.getMethod("generatorContext").invoke(state) != null) return variant;
+                } catch (ReflectiveOperationException failure) {
+                    throw new IllegalStateException("FreeTerraForged state context unavailable", failure);
+                }
             }
         }
-        return null;
+        return fallback;
     }
 
     static RandomState create(boolean required, boolean overworld, RegistryAccess registries,
+                              Supplier<RandomState> factory) {
+        return create(required, null, overworld, registries, factory);
+    }
+
+    static RandomState create(boolean required, String namespace, boolean overworld, RegistryAccess registries,
                               Supplier<RandomState> factory) {
         if (!required) return factory.get();
         try {
             var loader = FreeTerraForgedCompat.class.getClassLoader();
             var variant = java.util.Arrays.stream(FreeTerraForgedVariant.values())
+                    .filter(candidate -> namespace == null || candidate.namespace.equals(namespace))
                     .filter(candidate -> candidate.hasPreset(registries)).findFirst()
                     .orElseThrow(() -> new IllegalStateException("FreeTerraForged snapshot contains no active preset"));
             Api api = new Api(loader, variant);
@@ -64,11 +77,21 @@ final class FreeTerraForgedCompat {
     }
 
     static void copyClimateContext(Object source, Object target) {
-        Class<?> api = java.util.Arrays.stream(source.getClass().getInterfaces())
-                .filter(type -> type.getName().equals(FreeTerraForgedVariant.CURRENT.worldgenClass("biome.FTFClimateSampler")))
-                .findFirst().orElse(null);
-        if (api == null) return;
+        for (Class<?> api : source.getClass().getInterfaces()) {
+            if (api.getName().equals(FreeTerraForgedVariant.CURRENT.worldgenClass("biome.FTFClimateSampler"))
+                    || api.getName().equals(FreeTerraForgedVariant.ULTRA.worldgenClass("biome.UTFClimateSampler"))) {
+                copyClimateContext(api, source, target);
+            }
+        }
+    }
+
+    private static void copyClimateContext(Class<?> api, Object source, Object target) {
         try {
+            if (api.getName().equals(FreeTerraForgedVariant.ULTRA.worldgenClass("biome.UTFClimateSampler"))) {
+                api.getMethod("setSpawnSearchCenter", net.minecraft.core.BlockPos.class).invoke(target,
+                        api.getMethod("getSpawnSearchCenter").invoke(source));
+                return;
+            }
             var preset = api.getMethod("getUndergroundBiomeBandingPreset");
             var context = api.getMethod("getUndergroundBiomeSurfaceContext");
             api.getMethod("setUndergroundBiomeBandingPreset", preset.getReturnType(), long.class).invoke(target,
@@ -97,6 +120,8 @@ final class FreeTerraForgedCompat {
         mapField.setAccessible(true);
         Object map = mapField.get(ownedCache);
         mapField.getType().getMethod("clear").invoke(map);
+        // UTF uses weak poll ownership and has no process-wide cache list.
+        if (FreeTerraForgedVariant.fromClass(ownedCache.getClass()) == FreeTerraForgedVariant.ULTRA) return;
         Class<?> manager = Class.forName(FreeTerraForgedVariant.fromClass(ownedCache.getClass()).packagePrefix + "concurrent.cache.CacheManager",
                 false, ownedCache.getClass().getClassLoader());
         var cachesField = manager.getDeclaredField("CACHES");
@@ -123,7 +148,7 @@ final class FreeTerraForgedCompat {
                 dimensionContext = (ThreadLocal<Boolean>) loader.loadClass(variant.worldgenClass(variant.abbreviation + "WorldGenContext"))
                         .getField("IS_VANILLA_OVERWORLD").get(null);
             } catch (ClassNotFoundException legacyRelease) {
-                if (variant != FreeTerraForgedVariant.LEGACY) throw legacyRelease;
+                if (!variant.discoversContextFromMarkers()) throw legacyRelease;
                 // Earlier releases discover their context from CellSampler markers.
                 dimensionContext = ThreadLocal.withInitial(() -> false);
             }
@@ -137,6 +162,8 @@ final class FreeTerraForgedCompat {
             try {
                 if (!stateType.isInstance(state)) throw new IllegalStateException("FreeTerraForged RandomState mixin is not active");
                 initialize.invoke(state, registries);
+                if (variant == FreeTerraForgedVariant.ULTRA)
+                    FreeTerraForgedPredictionTasks.own(context.invoke(state));
                 // Vanilla presets legitimately have no CellSampler even with the mod installed.
                 // A missing preset, however, cannot initialize any RTF terrain correctly.
                 if (stateType.getMethod("preset").invoke(state) == null) {

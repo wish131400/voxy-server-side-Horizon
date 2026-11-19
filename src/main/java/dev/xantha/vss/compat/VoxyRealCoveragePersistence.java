@@ -102,11 +102,17 @@ public final class VoxyRealCoveragePersistence {
         Binding binding = binding(engine);
         if (binding == null || lod < 0 || lod > 4 || count <= 0
                 || !binding.restoredColumns.contains(column(cx, cz))) return 0;
-        int result = 0;
-        for (int i = 0; i < Math.min(32, count); i++) {
-            int cy = firstY + i;
+        int result = 0, limit = Math.min(32, count), width = 1 << (lod + 1);
+        // A mask query often reads 32 cells of the same immutable saved node.
+        // Query each node once, including negative and unaligned vertical ranges.
+        for (int i = 0; i < limit;) {
+            int cy = firstY + i, run = Math.min(limit - i, width - (cy & (width - 1)));
             Node node = binding.nodes.get(key(lod, cx >> (lod + 1), cy >> (lod + 1), cz >> (lod + 1)));
-            if (node != null && node.restored.get(bit(cx, cy, cz, lod))) result |= 1 << i;
+            if (node != null) {
+                BitSet restored = node.restored;
+                for (int j = 0; j < run; j++) if (restored.get(bit(cx, cy + j, cz, lod))) result |= 1 << (i + j);
+            }
+            i += run;
         }
         return result;
     }

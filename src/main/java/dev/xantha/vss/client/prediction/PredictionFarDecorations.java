@@ -6,8 +6,7 @@ import java.util.function.LongPredicate;
 /** World-owned distant decoration context. Approximate placements never enter exact surface/disk caches. */
 final class PredictionFarDecorations {
     static boolean supported(ClientTerrainSampler terrain) {
-        return (terrain instanceof RustTerrainSampler || terrain instanceof FreeTerraForgedTerrainSampler)
-                && !terrain.interiorTerrain();
+        return terrain.supportsFarDecorations();
     }
     private final ClientTerrainSampler terrain;
     private volatile PredictionVegetation vegetation;
@@ -54,7 +53,8 @@ final class PredictionFarDecorations {
         long start=System.nanoTime();
         var session=models(current).session();
         try(var scope=session.enter(current,captured,base)) {
-            boolean regenerate=!base.approximateDecorations() || base.needsDecorationRefinement();
+            boolean regenerate=!base.approximateDecorations() || base.needsDecorationRefinement()
+                    || PredictionDecorationRange.partial(base);
             var scattered=regenerate ? session.generate(base.baseX(),base.baseZ(),base.span(),base.step(),true) : null;
             var fallback=complete && !base.surfaceComplete() ? vegetation().tileForRendering(base.baseX(),base.baseZ(),base.span(),1,trees,captured,current)
                     : PredictionVegetation.Tile.EMPTY;
@@ -87,8 +87,11 @@ final class PredictionFarDecorations {
     }
     void invalidate(int x,int z) { var value=vegetation;if(value!=null)value.invalidate(x,z); }
     java.util.Map<String,Object> performanceSnapshot() {
+        var active=models;
         return java.util.Map.of("initialized",models!=null,"previewBuilds",previews.sum(),"previewNanos",previewNanos.sum(),
-                "completionBuilds",builds.sum(),"completionNanos",nanos.sum(),"woodyAnchors",woodyAnchors.sum(),"boxes",scatteredBoxes.sum());
+                "completionBuilds",builds.sum(),"completionNanos",nanos.sum(),"woodyAnchors",woodyAnchors.sum(),"boxes",scatteredBoxes.sum(),
+                "selectionCache",active==null?java.util.Map.of():active.selections.statistics(),
+                "rotationCache",active==null?java.util.Map.of():active.rotations.statistics());
     }
     String diagnostics() { return "farDecoration="+performanceSnapshot(); }
 }

@@ -212,6 +212,7 @@ final class PredictionVegetation {
             var sources=new ArrayList<PredictionVegetationDisplayCache.Source>();boolean complete=true;
             for(int cz=Math.floorDiv(z,16)-1;cz<=Math.floorDiv(z+span-1,16)+1;cz++)
                 for(int cx=Math.floorDiv(x,16)-1;cx<=Math.floorDiv(x+span-1,16)+1;cx++) {
+                    if (!PredictionDecorationRange.placementChunk(cx, cz)) continue;
                     var cached=chunk(cx,cz,current,true);
                     if(cached==null)complete=false;
                     else sources.add(new PredictionVegetationDisplayCache.Source(
@@ -229,6 +230,7 @@ final class PredictionVegetation {
         for (int cz = Math.floorDiv(z, 16) - 1; cz <= Math.floorDiv(z + span - 1, 16) + 1; cz++)
             for (int cx = Math.floorDiv(x, 16) - 1; cx <= Math.floorDiv(x + span - 1, 16) + 1; cx++) {
                 requireCurrent(current);
+                if (!PredictionDecorationRange.placementChunk(cx, cz)) continue;
                 sources.add(new PredictionVegetationDisplayCache.Source(
                         PredictionVegetationDisplayCache.chunkKey(cx, cz), chunk(cx, cz, current)));
             }
@@ -245,6 +247,7 @@ final class PredictionVegetation {
         // are filtered after gathering sources, so they remain dependencies.
         for (int cz = Math.floorDiv(z, 16) - 1; cz <= Math.floorDiv(z + span - 1, 16) + 1; cz++)
             for (int cx = Math.floorDiv(x, 16) - 1; cx <= Math.floorDiv(x + span - 1, 16) + 1; cx++) {
+                if (!PredictionDecorationRange.placementChunk(cx, cz)) continue;
                 long key = PredictionVegetationDisplayCache.chunkKey(cx, cz);
                 if (!generationJobs.containsKey(key)) continue;
                 synchronized (chunks) {
@@ -426,7 +429,7 @@ final class PredictionVegetation {
         var enabled = enabledFeatures().indices();
         var pruning = biomePruning.job();
         // Native and Java placements share complete cave columns and ordered edits.
-        try (var nativeStage = terrain instanceof RustTerrainSampler rust
+        try (var nativeStage = terrain instanceof RustTerrainSampler rust && rust.nativeDecorationCompatible()
                 ? new RustVegetationStage(rust, level, chunkX, chunkZ, treeModels != null) : null) {
             for (int step = 0; step < Math.max(featureSteps.size(), DECORATION_STEPS.length); step++) {
                 requireCurrent(current);

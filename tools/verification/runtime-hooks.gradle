@@ -1,0 +1,17 @@
+allprojects { configurations.configureEach { resolutionStrategy.force 'net.fabricmc:fabric-loader:0.20.1' } }
+gradle.projectsEvaluated {
+    def project=gradle.rootProject
+    if(project.minecraft_version!='26.3')throw new GradleException('Runtime fixture currently targets 26.3')
+    def probe=project.sourceSets.create('runtimeHooksProbe') {
+        java.srcDir 'tools/verification/runtime-hooks/java'
+        resources.srcDir 'tools/verification/runtime-hooks/resources'
+        compileClasspath+=project.sourceSets.main.output+project.sourceSets.main.compileClasspath
+        runtimeClasspath+=project.sourceSets.main.runtimeClasspath
+    }
+    project.loom.mods { runtimeHooksProbe { sourceSet probe } }
+    project.tasks.named('runServer').configure {
+        dependsOn project.tasks.named(probe.classesTaskName)
+        classpath+=probe.runtimeClasspath
+        jvmArgs '-Xmx3G','-Dfabric.addMods='+project.providers.gradleProperty('vssTerrestriaJar').get()
+    }
+}

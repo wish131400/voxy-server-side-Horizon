@@ -1,0 +1,66 @@
+// Offline terrain-family integration against one real, development-mapped release.
+// -I tools/verification/terrain-family.gradle ultraTerraForgedSurfaceTest
+// -PvssUltraTerraForgedJar=<release.jar>
+// Never distribute a dependency remapped for this test JVM.
+initscript { repositories { mavenCentral() }; dependencies { classpath 'org.ow2.asm:asm:9.8' } }
+import org.objectweb.asm.*
+import java.util.zip.*
+allprojects { afterEvaluate {
+    tasks.register('ultraTerraForgedSurfaceTest', Test) {
+        dependsOn tasks.named('testClasses')
+        testClassesDirs = sourceSets.test.output.classesDirs
+        classpath = sourceSets.test.runtimeClasspath
+        useJUnitPlatform()
+        include '**/UltraTerraForgedSurfacePreviewTest.class', '**/UltraTerraForgedSurfaceProductionNamesTest.class'
+        maxParallelForks = 1
+        forkEvery = 1
+        maxHeapSize = '3G'
+        doFirst {
+            def released = project.file(providers.gradleProperty('vssUltraTerraForgedJar').get())
+            if (!released.isFile()) throw new GradleException('Terrain release JAR missing: ' + released)
+            systemProperty 'vss.ultraTerraForgedJar', released.absolutePath
+            ['RawJar', 'IntermediaryGame'].each { suffix ->
+                def value = providers.gradleProperty('vssUltraTerraForged' + suffix)
+                if (value.isPresent()) systemProperty 'vss.ultraTerraForged' + suffix, project.file(value.get()).absolutePath
+            }
+
+        }
+  doFirst {
+   // Apply only access rules required by the release's density bootstrap, on a test copy.
+   def targets=['net/minecraft/world/level/levelgen/NoiseRouterData',
+    'net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator',
+    'net/minecraft/world/level/levelgen/RandomState',
+    'net/minecraft/world/level/levelgen/OreVeinifier$VeinType',
+    'net/minecraft/world/level/levelgen/DensityFunctions$WeirdScaledSampler$RarityValueMapper',
+    'net/minecraft/world/level/levelgen/SurfaceRules$Context',
+    'net/minecraft/world/level/levelgen/SurfaceRules$LazyCondition',
+    'net/minecraft/world/level/levelgen/SurfaceRules$LazyYCondition',
+    'net/minecraft/world/level/levelgen/SurfaceRules$LazyXZCondition',
+    'net/minecraft/world/level/levelgen/material/MaterialRuleContext',
+    'net/minecraft/world/level/levelgen/material/MaterialRuleContext$LazyCondition',
+    'net/minecraft/world/level/levelgen/material/MaterialRuleContext$LazyYCondition',
+    'net/minecraft/world/level/levelgen/material/MaterialRuleContext$LazyXZCondition'] as Set
+   def source=classpath.files.find { it.isFile() && it.name.endsWith('.jar') && new ZipFile(it).withCloseable { z -> z.getEntry('net/minecraft/world/level/levelgen/NoiseRouterData.class')!=null } }
+   if(source==null)throw new GradleException('Named game JAR missing')
+   def output=layout.buildDirectory.file('terrain-family-test/game.jar').get().asFile;output.parentFile.mkdirs()
+   new ZipFile(source).withCloseable { zip -> new ZipOutputStream(new FileOutputStream(output)).withCloseable { out ->
+    zip.entries().each { e ->
+     out.putNextEntry(new ZipEntry(e.name));byte[] data=zip.getInputStream(e).bytes
+     if(e.name.endsWith('.class') && targets.contains(e.name.substring(0,e.name.length()-6))) {
+      def writer=new ClassWriter(0)
+      def publicFlags={ int flags -> (flags & ~6) | 1 }
+      new ClassReader(data).accept(new ClassVisitor(Opcodes.ASM9,writer) {
+       void visit(int v,int a,String n,String sig,String sup,String[] interfaces) { super.visit(v,publicFlags(a) & ((n.endsWith('/NoiseBasedChunkGenerator') || n.endsWith('/RandomState') || (n.endsWith('/SurfaceRules$Context') || n.endsWith('/MaterialRuleContext'))) ? ~Opcodes.ACC_FINAL : -1),n,sig,sup,interfaces) }
+       void visitInnerClass(String n,String outer,String inner,int a) { super.visitInnerClass(n,outer,inner,targets.contains(n) ? publicFlags(a) & ((n.endsWith('/SurfaceRules$Context') || n.endsWith('/MaterialRuleContext')) ? ~Opcodes.ACC_FINAL : -1) : a) }
+       FieldVisitor visitField(int a,String n,String d,String sig,Object value) { super.visitField(e.name.endsWith('/NoiseBasedChunkGenerator.class') ? a : publicFlags(a),n,d,sig,value) }
+       MethodVisitor visitMethod(int a,String n,String d,String sig,String[] exceptions) { super.visitMethod(e.name.endsWith('/NoiseBasedChunkGenerator.class') ? a : publicFlags(a),n,d,sig,exceptions) }
+      },0);data=writer.toByteArray()
+     }
+     out.write(data);out.closeEntry()
+    }
+   } }
+   classpath=files(classpath.files.collect { it==source ? output : it })
+  }
+        testLogging { events 'failed', 'skipped'; exceptionFormat 'full'; showStandardStreams = true }
+    }
+} }

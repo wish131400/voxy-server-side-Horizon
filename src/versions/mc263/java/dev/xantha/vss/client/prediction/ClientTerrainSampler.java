@@ -202,8 +202,10 @@ public class ClientTerrainSampler implements AutoCloseable {
         NoiseRouter router = FreeTerraForgedCompat.predictionRouter(randomState, generator.generatorSettings().value().noiseRouter());
         this.cacheExactHeights = !"off".equals(System.getProperty("vss.javaHeightCache"));
         this.densityCompilation = new PredictionDensityContext(randomState);
-        this.finalDensity = densityCompilation.bind(router.finalDensity());
-        this.initialDensity = densityCompilation.bind(router.chunkSurfaceLevel());
+        var replacements = new dev.xantha.vss.api.worldgen.DensityFunctionReplacements.Context(seed,
+                registries == null ? access : registries.access(), randomState);
+        this.finalDensity = densityCompilation.bind(PredictionDensityReplacements.apply(replacements,router.finalDensity()));
+        this.initialDensity = densityCompilation.bind(PredictionDensityReplacements.apply(replacements,router.chunkSurfaceLevel()));
         this.initialDensityIsConstant = router.chunkSurfaceLevel().range().min() == router.chunkSurfaceLevel().range().max();
         this.lavaOcean = generator.generatorSettings().value().defaultFluid().is(Blocks.LAVA);
         this.biomeSource = generator.getBiomeSource();
@@ -227,6 +229,16 @@ public class ClientTerrainSampler implements AutoCloseable {
 
     ClientColumnSample resolveSurface(ClientColumnSample sample, int x, int z, TerrainFunction terrain) {
         return surfaceMaterials == null ? sample : surfaceMaterials.resolve(sample, x, z, terrain);
+    }
+
+    ClientColumnSample resolvePreviewSurface(ClientColumnSample sample, int x, int z, TerrainFunction terrain) {
+        return surfaceMaterials == null ? sample : surfaceMaterials.resolvePreview(sample, x, z, terrain);
+    }
+
+    int previewGroundBlock(int x, int floor, int z) {
+        var biome = previewBiome(x, floor - 1, z);
+        String path = biome.unwrapKey().map(key -> key.identifier().getPath()).orElse("");
+        return PredictionMaterialPalette.representativeBlock(path, false, lavaOcean, false);
     }
 
     public DimensionProfile profile() {
@@ -354,6 +366,22 @@ public class ClientTerrainSampler implements AutoCloseable {
     }
 
     /** Ceiling worlds need occupancy throughout the column, not an exterior heightfield. */
+    boolean stagedSurface() { return false; }
+    /** Display templates are independent of the full-volume surface implementation. */
+    boolean supportsFarDecorations() { return false; }
+
+    void refineSurfaceChunk(int baseX,int baseZ,int step,int grid,ClientColumnSample[] samples,
+                            int fromX,int toX,int fromZ,int toZ,java.util.function.BooleanSupplier current) {
+        for(int z=fromZ;z<toZ;z++)for(int x=fromX;x<toX;x++) {
+            int i=z*grid+x;
+            if(!PredictionSurfaceRefinement.required(samples[i]))continue;
+            if(!current.getAsBoolean() || Thread.currentThread().isInterrupted())throw new java.util.concurrent.CancellationException();
+            samples[i]=sampleInterior(baseX+(x-VssLodLayout.SAMPLE_MARGIN)*step,baseZ+(z-VssLodLayout.SAMPLE_MARGIN)*step);
+        }
+    }
+    boolean basicInteriorTerrain() { return interiorTerrain(); }
+    ClientColumnSample sampleBasicInterior(int x, int z) { return sampleInterior(x,z); }
+
     boolean interiorTerrain() {
         return profile.dimension().equals(net.minecraft.world.level.Level.NETHER.identifier());
     }
@@ -410,7 +438,7 @@ public class ClientTerrainSampler implements AutoCloseable {
     /** Mutable sampling work belongs to this worker request and ends even on cancellation. */
     SamplingScope exteriorRequest() { return () -> {}; }
 
-    SamplingScope terrainRequest() { return () -> {}; }
+    SamplingScope terrainRequest() { return surfaceMaterials == null ? () -> {} : surfaceMaterials.request(); }
 
     ClientColumnSample retainAfterCapture(ClientColumnSample sample) { return null; }
 
@@ -423,7 +451,11 @@ public class ClientTerrainSampler implements AutoCloseable {
     }
 
     ClientColumnSample resolveInterior(ClientColumnSample sample, int x, int z) {
-        return surfaceMaterials == null ? sample : surfaceMaterials.resolveInterior(sample, x, z, this::surfaceY);
+        return resolveInterior(sample,x,z,this::surfaceY);
+    }
+
+    ClientColumnSample resolveInterior(ClientColumnSample sample, int x, int z, TerrainFunction terrain) {
+        return surfaceMaterials == null ? sample : surfaceMaterials.resolveInterior(sample,x,z,terrain);
     }
 
     ClientColumnSample sampleInterior(int x, int z) {
@@ -608,6 +640,9 @@ public class ClientTerrainSampler implements AutoCloseable {
      * Prediction displays the outer surface at every LOD. Placed features
      * generate decoration separately; neither stage needs underground spans.
      */
+    /** Stable display-only ground; exact placement and captured terrain use their own samples. */
+    ClientColumnSample sampleDisplay(int x, int z) { return sampleForLod(x, z, 1); }
+
     public ClientColumnSample sampleForLod(int blockX, int blockZ, int stepBlocks) {
         return sampleSurface(blockX, blockZ);
     }

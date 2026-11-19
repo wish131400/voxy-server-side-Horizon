@@ -23,8 +23,11 @@
     "minecraft.TrackedEntitySeenByAccessor"
   ],
   "client": [
+    "client.WorldWeaverPredictionRegistryMixin",
     "client.PredictionStructureTerrainMixin",
     "client.SodiumLegacyOptionsMixin",
+    "client.LegacyPredictionThreadOptionsMixin",
+    "client.SodiumPredictionThreadOptionsMixin",
     "voxy.VoxyServerLodClientMixin",
     "voxy.PredictionVoxyMeshSourceMixin",
     "voxy.PredictionVoxyNeighborSourceMixin",
@@ -42,6 +45,11 @@
     "client.PredictionFrameMixin",
     "client.PredictionFogCaptureMixin",
     "client.FreeTerraForgedPredictionFiltersMixin",
+    "client.UltraTerraForgedPredictionTasksMixin",
+    "client.UltraTerraForgedPredictionTileCacheMixin",
+    "client.SurfaceRulesContextAccessor",
+    "client.UltraTerraForgedPredictionNearGroundMixin",
+    "client.UltraTerraForgedPredictionCellConditionMixin",
     "client.ByePregenPredictionPredicateMixin",
     "client.NbtTreePredictionTemplatesMixin",
     "client.ClientPacketListenerServerIdentityMixin",

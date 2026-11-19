@@ -67,6 +67,9 @@ allprojects {
         if (providers.gradleProperty('vssFreeTerraForgedJar').isPresent()) {
             systemProperty 'vss.freeTerraForgedJar', providers.gradleProperty('vssFreeTerraForgedJar').get()
         }
+        if (providers.gradleProperty('vssUltraTerraForgedJar').isPresent()) {
+            systemProperty 'vss.ultraTerraForgedJar', providers.gradleProperty('vssUltraTerraForgedJar').get()
+        }
         if (providers.gradleProperty('vssLithostitchedJar').isPresent()) {
             systemProperty 'vss.lithostitchedJar', providers.gradleProperty('vssLithostitchedJar').get()
         }

@@ -67,6 +67,22 @@ class PredictionSharedCacheTest {
         assertEquals(2, cache.size());
     }
 
+    @Test void byteBudgetEvictsLeastRecentAndOversizedResultsDoNotRemainResident() {
+        var cache = new PredictionSharedCache<Integer, byte[]>(16, 8, value -> value.length);
+        var first = cache.get(1, () -> new byte[4], () -> {});
+        cache.get(2, () -> new byte[4], () -> {});
+        assertSame(first, cache.get(1, () -> fail("recent result"), () -> {}));
+        cache.get(3, () -> new byte[4], () -> {});
+        assertEquals(8L, cache.statistics().get("bytes"));
+        assertEquals(1L, cache.statistics().get("evictions"));
+        var rebuilt = cache.get(2, () -> new byte[4], () -> {});
+        assertEquals(4, rebuilt.length);
+        assertEquals(4, cache.get(1, () -> new byte[4], () -> {}).length);
+        assertEquals(12, cache.get(9, () -> new byte[12], () -> {}).length);
+        assertEquals(0, cache.size());
+        assertEquals(0L, cache.statistics().get("bytes"));
+    }
+
     private static void await(CountDownLatch latch) {
         try { if (!latch.await(5, TimeUnit.SECONDS)) throw new AssertionError("worker timeout"); }
         catch (InterruptedException failure) { Thread.currentThread().interrupt(); throw new CancellationException(); }

@@ -52,7 +52,7 @@ def generateWireFormat = tasks.register('generateWireFormat') {
         def output = wireSources.get().file('dev/xantha/vss/common/VSSWireFormat.java').asFile
         output.parentFile.mkdirs()
         output.setText(template.getText('UTF-8')
-                .replace('PROTOCOL_VERSION = 54', 'PROTOCOL_VERSION = ' + selectedTarget.protocol)
+                .replace('PROTOCOL_VERSION = 63', 'PROTOCOL_VERSION = ' + selectedTarget.protocol)
                 .replace('COLUMN_SCHEMA = 6', 'COLUMN_SCHEMA = ' + selectedTarget.columnSchema), 'UTF-8')
     }
 }

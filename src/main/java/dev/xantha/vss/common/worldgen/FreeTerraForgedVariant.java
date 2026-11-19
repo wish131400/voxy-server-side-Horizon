@@ -4,10 +4,11 @@ import net.minecraft.core.RegistryAccess;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.Identifier;
 
-/** Published FreeTerraForged APIs before and after the 1.0 namespace migration. */
+/** Verified FTF-derived APIs and their release-specific contracts. */
 public enum FreeTerraForgedVariant {
     CURRENT("freeterraforged", "etcodehome.freeterraforged.", "FTF"),
-    LEGACY("reterraforged", "raccoonman.reterraforged.", "RTF");
+    LEGACY("reterraforged", "raccoonman.reterraforged.", "RTF"),
+    ULTRA("ultraterraforged", "com.pandaismyname1.ultraterraforged.", "UTF");
 
     public final String namespace;
     public final String packagePrefix;
@@ -17,6 +18,16 @@ public enum FreeTerraForgedVariant {
         this.namespace = namespace;
         this.packagePrefix = packagePrefix;
         this.abbreviation = abbreviation;
+    }
+
+    /** These capabilities describe verified contracts, not arbitrary namespace aliases. */
+    public boolean discoversContextFromMarkers() { return this == LEGACY || this == ULTRA; }
+    public boolean usesNativeTileFilters() { return this != ULTRA; }
+    public boolean singleArgumentCellFields() { return this == ULTRA; }
+
+    /** Runtime lookups which are not represented by serialized holder references. */
+    public java.util.List<String> additionalRuntimeRegistries() {
+        return this == ULTRA ? java.util.List.of("worldgen/structure_rule") : java.util.List.of();
     }
 
     public String worldgenClass(String name) { return packagePrefix + "world.worldgen." + name; }

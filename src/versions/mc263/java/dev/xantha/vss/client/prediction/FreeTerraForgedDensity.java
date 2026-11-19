@@ -27,8 +27,8 @@ final class FreeTerraForgedDensity {
         var variant = FreeTerraForgedVariant.fromClass(context.getClass());
         var cellType = loader.loadClass(variant.worldgenClass("densityfunction.CellSampler"));
         var fieldMethod = cellType.getMethod("field");
-        var lookup = context.getClass().getField("lookup").get(context);
-        Object heightmap = lookup.getClass().getMethod("getHeightmap").invoke(lookup);
+        var fields = new FreeTerraForgedFieldReader(context, fieldMethod.getReturnType(), true);
+        Object heightmap = fields.heightmap;
         Object cache = context.getClass().getField("cache").get(context);
         var provideMethod = cache.getClass().getMethod("provideAtChunk", int.class, int.class);
         var handles = MethodHandles.publicLookup();
@@ -44,9 +44,7 @@ final class FreeTerraForgedDensity {
             return mapped.computeIfAbsent(function, original -> {
                 try {
                     Object field = fieldMethod.invoke(original);
-                    MethodHandle read = handles.unreflect(fieldMethod.getReturnType().getMethod("read",
-                            loader.loadClass(variant.worldgenClass("cell.Cell")), heightmap.getClass()))
-                            .bindTo(field).asType(MethodType.methodType(float.class, Object.class, Object.class));
+                    MethodHandle read = fields.bind(field);
                     return new ExactCell(original, heightmap, provide, cell, read);
                 } catch (ReflectiveOperationException failure) {
                     throw new IllegalStateException("FreeTerraForged cell-field API unavailable", failure);

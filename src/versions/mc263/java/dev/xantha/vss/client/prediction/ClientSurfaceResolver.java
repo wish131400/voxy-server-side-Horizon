@@ -31,8 +31,41 @@ final class ClientSurfaceResolver {
     private final Registry<Biome> biomes;
     private final PredictionBiomeCache biomeCache;
     private final PredictionBiomeCache previewBiomeCache;
-    private final ThreadLocal<Worker> workers = new ThreadLocal<>();
-    private final ThreadLocal<Worker> previewWorkers = new ThreadLocal<>();
+    private static final int WORKERS_PER_THREAD = 8;
+    private final ThreadLocal<java.util.LinkedHashMap<Long, Worker>> workers =
+            ThreadLocal.withInitial(() -> new java.util.LinkedHashMap<>(WORKERS_PER_THREAD, 0.75f, true));
+    private final ThreadLocal<java.util.LinkedHashMap<Long, Worker>> previewWorkers =
+            ThreadLocal.withInitial(() -> new java.util.LinkedHashMap<>(WORKERS_PER_THREAD, 0.75f, true));
+    private final ThreadLocal<Boolean> requestActive = new ThreadLocal<>();
+
+    ClientTerrainSampler.SamplingScope request() {
+        if (Boolean.TRUE.equals(requestActive.get())) return () -> {};
+        requestActive.set(true);
+        return () -> {
+            // Rules may hold an upstream pooled tile. Retain them only for the
+            // current prediction task, never in an idle worker across worlds.
+            workers.remove();
+            previewWorkers.remove();
+            requestActive.remove();
+        };
+    }
+
+    private Worker worker(int x, int z, ClientTerrainSampler.TerrainFunction terrain, boolean preview)
+            throws ReflectiveOperationException {
+        var cache = (preview ? previewWorkers : workers).get();
+        long key = ((long) (x >> 4) & 0xffffffffL) | ((long) (z >> 4) << 32);
+        Worker worker = cache.get(key);
+        if (worker == null || worker.columns >= 4096) {
+            worker = new Worker(preview, x, z, terrain);
+            cache.put(key, worker);
+            if (cache.size() > WORKERS_PER_THREAD) cache.remove(cache.keySet().iterator().next());
+        }
+        worker.columns++;
+        worker.x = x;
+        worker.z = z;
+        worker.terrain = terrain;
+        return worker;
+    }
 
     ClientSurfaceResolver(NoiseBasedChunkGenerator generator, RandomState randomState,
                           LevelHeightAccessor heights, Registry<Biome> biomes) {
@@ -66,12 +99,7 @@ final class ClientSurfaceResolver {
         var volume = sample.volume();
         if (volume == null || volume.size() == 0) return sample;
         try {
-            Worker worker = workers.get();
-            if (worker == null || worker.columns >= 4096 || (worker.x >> 4) != (x >> 4) || (worker.z >> 4) != (z >> 4)) {
-                worker = new Worker(false,x,z);
-                workers.set(worker);
-            }
-            worker.columns++; worker.x = x; worker.z = z; worker.terrain = terrain;
+            Worker worker = worker(x, z, terrain, false);
             worker.updateXZ(x,z);
             int min = volume.minY(), height = volume.maxY() - min;
             int[] blocks = new int[height];
@@ -114,18 +142,7 @@ final class ClientSurfaceResolver {
     private ClientColumnSample resolve(ClientColumnSample sample, int x, int z,
                                 ClientTerrainSampler.TerrainFunction terrain, boolean preview) {
         try {
-            var local = preview ? previewWorkers : workers;
-            Worker worker = local.get();
-            // NoiseChunk caches preliminary heights. Bound its lifetime even when
-            // a worker travels indefinitely through coarse tiles.
-            if (worker == null || worker.columns >= 4096 || (worker.x >> 4) != (x >> 4) || (worker.z >> 4) != (z >> 4)) {
-                worker = new Worker(preview,x,z);
-                local.set(worker);
-            }
-            worker.columns++;
-            worker.x = x;
-            worker.z = z;
-            worker.terrain = terrain;
+            Worker worker = worker(x, z, terrain, preview);
             worker.updateXZ(x,z);
             int top = worker.material(sample, 0);
             int under = worker.material(sample, 1);
@@ -164,8 +181,9 @@ final class ClientSurfaceResolver {
         private final boolean preview;
 
         @SuppressWarnings("unchecked")
-        private Worker(boolean preview, int x, int z) throws ReflectiveOperationException {
-            this.preview = preview; this.x=x; this.z=z;
+        private Worker(boolean preview, int blockX, int blockZ,
+                       ClientTerrainSampler.TerrainFunction initialTerrain) throws ReflectiveOperationException {
+            this.preview = preview; this.x=blockX; this.z=blockZ; this.terrain=initialTerrain;
             NoiseGeneratorSettings settings = generator.generatorSettings().value();
             DensityVolume volume = new DensityVolume(16,heights.getHeight(),16,x & ~15,heights.getMinY(),z & ~15);
             var samplerContext = SamplerContext.builder().enableCaches().build();

@@ -25,5 +25,5 @@ ext.fabricCompileApi = dependencyBaseline ? fabricApiMinimum : selectedTarget.ap
 // Vanilla section headers, palettes, registry IDs and worldgen codecs are
 // versioned together. Never reuse a column body across Minecraft upgrades.
 def targetIndex = minecraftTargets.keySet().toList().indexOf(selectedMinecraft)
-ext.selectedTarget.protocol = 54 + targetIndex
+ext.selectedTarget.protocol = 63 + targetIndex
 ext.selectedTarget.columnSchema = 6 + targetIndex

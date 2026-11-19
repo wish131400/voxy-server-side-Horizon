@@ -3,19 +3,19 @@
   "commit": "7685b690839a92024e0b474185c8c62d654a5c9b",
   "workingTreeModified": true,
   "buildKind": "local-cross",
-  "sourceSha256": "33b3619fb0d51892c973e98edbb870c5b00afcadf84d1e3cbcf5eae8b1845e55",
+  "sourceSha256": "1973e6169317fd791812f2fc3e11da83b35ec8b58f4ca5e367735117cd533a3c",
   "libraries": {
-    "windows-x86_64/vss_native_core.dll": "e7e8a7f00d50142437664814c88de3550b3084a95d13437bd2b4adb939a231a1",
-    "linux-x86_64/libvss_native_core.so": "83252bf90f50300ff894ec9df9946df3141e8a6f3b95fb9662c4d6afa8bca210",
-    "linux-aarch64/libvss_native_core.so": "f3e32a65df27cb107b0307fd5736d3b6e1c6c2744f69e74fa9fc046510216751",
-    "macos-x86_64/libvss_native_core.dylib": "5ff2f9976699f2ade3a6df93c7b86fbbdd98c8aaece540bffb84a619c6ba5ecf",
-    "macos-aarch64/libvss_native_core.dylib": "b3eacd83d65dc484e3f9f78dd76949656f63450a1804e8263fa5b412ced88b6e"
+    "windows-x86_64/vss_native_core.dll": "038de334fa7a1a431d507abf3015029552bad0aa51dc43c412e00888addddc85",
+    "linux-x86_64/libvss_native_core.so": "c8b415bda4aa9e99da450dde85b2ae529d3f3d573fe777879564a7fc9b670ba3",
+    "linux-aarch64/libvss_native_core.so": "2b86a1bd51537a1006333aba964571d2b6e07315c56a97c688985e4502a286b7",
+    "macos-x86_64/libvss_native_core.dylib": "fc2d561f5f04e39dbaaa9ad475d5932b1590ad4f3dcaf84c3da162fb369fc96d",
+    "macos-aarch64/libvss_native_core.dylib": "ff55b397087722b52e9cd9f03d17419297fcf63cfb2d11f5a2541107070eac45"
   },
   "validation": {
-    "buildId": "20261104-exterior-layout",
+    "buildId": "chunk-refinement-20261115-r3",
     "executedPlatform": "windows-x86_64",
-    "regressionScope": "Java/Rust scalar and batch exterior parity; compact/full descriptions; different dimension/noise heights and minima; interior columns and production cliff enrichment",
-    "otherPlatforms": "Cross compiled; JNI exports, architectures, dependencies and package hashes audited. No Linux/macOS/ARM execution.",
-    "gameplay": "No new live game validation"
+    "regressionScope": "Raw chunk JNI layout and occupancy compared with independent columns; bounded surface refinement regressions and actual Terrestria runtime fixture",
+    "otherPlatforms": "Linux x86_64/aarch64 and macOS x86_64/aarch64 cross compiled; architectures, exports, dependencies, deployment and hashes audited. No execution on those platforms.",
+    "gameplay": "No live gameplay validation of this build yet"
   }
 }

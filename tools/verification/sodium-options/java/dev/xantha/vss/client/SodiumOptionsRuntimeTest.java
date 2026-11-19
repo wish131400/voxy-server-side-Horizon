@@ -64,6 +64,7 @@ class SodiumOptionsRuntimeTest {
         assertNotNull(call(distance, "getControl"), "Integer sliders must use this Sodium family's types");
         Object tier = findLegacyOption(pages, "vss.voxy_options.performance_tier");
         assertNotNull(call(tier, "getControl"), "Enum controls must use this Sodium family's types");
+        verifyThreadControls(tier, findLegacyOption(pages, "vss.voxy_options.prediction_worker_threads"), false, null);
     }
 
     private void verifyModern() throws Exception {
@@ -99,6 +100,48 @@ class SodiumOptionsRuntimeTest {
         assertSaved("enablePrediction", !old);
         call(prediction, "modifyValue", old);
         call(config, "applyAllOptions");
+        Object tier = findModernOption(all, "vss.voxy_options.performance_tier");
+        Object threads = findModernOption(all, "vss.voxy_options.prediction_worker_threads");
+        VSSPredictionThreadOptions.registerSodium08(tier);
+        verifyThreadControls(tier, threads, true, config);
+    }
+
+    private void verifyThreadControls(Object tier, Object threads, boolean modern, Object config) throws Exception {
+        String oldTier = VSSClientConfig.CONFIG.performanceTier;
+        int oldCount = VSSClientConfig.CONFIG.predictionWorkerThreads;
+        String set = modern ? "modifyValue" : "setValue", get = modern ? "getValidatedValue" : "getValue";
+        int maximum = Math.max(1, Runtime.getRuntime().availableProcessors());
+        try {
+            Object high = modern ? Integer.valueOf(2) : dev.xantha.vss.client.prediction.PredictionPerformanceProfile.HIGH;
+            call(tier, set, high); VSSPredictionThreadOptions.changed(tier);
+            assertEquals(Math.max(1, maximum-2), call(threads, get));
+            assertEquals(oldTier, VSSClientConfig.CONFIG.performanceTier, "pending preset must not save config");
+            assertEquals(oldCount, VSSClientConfig.CONFIG.predictionWorkerThreads);
+            call(threads, set, maximum); VSSPredictionThreadOptions.changed(threads);
+            assertEquals(modern ? Integer.valueOf(3) : dev.xantha.vss.client.prediction.PredictionPerformanceProfile.CUSTOM, call(tier,get));
+            if (modern) call(config,"resetAllOptionsFromBindings");
+            else { call(tier,"reset"); call(threads,"reset"); }
+            assertEquals(oldTier,VSSClientConfig.CONFIG.performanceTier);
+            assertEquals(oldCount,VSSClientConfig.CONFIG.predictionWorkerThreads);
+            call(threads,set,maximum); VSSPredictionThreadOptions.changed(threads);
+            if (modern) call(config,"applyAllOptions");
+            else {
+                call(tier,"applyChanges"); call(threads,"applyChanges");
+                call(call(tier,"getStorage"),"save");
+            }
+            assertEquals("custom",VSSClientConfig.CONFIG.performanceTier);
+            assertEquals(maximum,VSSClientConfig.CONFIG.predictionWorkerThreads);
+            var json=JsonParser.parseString(Files.readString(configDirectory.resolve("vss-client-config.json"))).getAsJsonObject();
+            assertEquals("custom",json.get("performanceTier").getAsString());
+            assertEquals(maximum,json.get("predictionWorkerThreads").getAsInt());
+        } finally {
+            VSSClientConfig.CONFIG.performanceTier=oldTier; VSSClientConfig.CONFIG.predictionWorkerThreads=oldCount;
+        }
+    }
+
+    private static Object findModernOption(List<Object> options,String key) throws Exception {
+        for (Object option:options) if (((Component)call(option,"getName")).getString().equals(Component.translatable(key).getString())) return option;
+        throw new AssertionError("Missing modern option: "+key);
     }
 
     private void assertSaved(String field, boolean value) throws Exception {

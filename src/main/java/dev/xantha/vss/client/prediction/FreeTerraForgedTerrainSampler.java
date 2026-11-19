@@ -13,10 +13,12 @@ import dev.xantha.vss.networking.payloads.WorldgenProfileS2CPayload.DimensionPro
 
 /** Ensures density and biome queries can see FreeTerraForged's filtered tiles. */
 final class FreeTerraForgedTerrainSampler extends ClientTerrainSampler implements AutoCloseable {
+    @Override boolean supportsFarDecorations() { return !interiorTerrain(); }
     private final Object cache;
     private final MethodHandle provide;
     private final MethodHandle cellLookup;
     private final FreeTerraForgedWater water;
+    private final FreeTerraForgedSurfaceRules previewRules;
 
     FreeTerraForgedTerrainSampler(DimensionProfile profile, NoiseBasedChunkGenerator generator,
             RandomState randomState, LevelHeightAccessor heights,
@@ -24,7 +26,7 @@ final class FreeTerraForgedTerrainSampler extends ClientTerrainSampler implement
         super(profile.seed(), profile, generator, randomState, heights,
                 generator.generatorSettings().value().seaLevel(), registries, clientRegistries);
         try {
-            var api = new FreeTerraForgedCompat.Api(getClass().getClassLoader());
+            var api = new FreeTerraForgedCompat.Api(randomState.getClass().getClassLoader(), FreeTerraForgedCompat.variant(randomState));
             Object context = api.context.invoke(randomState);
             cache = context == null ? null : context.getClass().getField("cache").get(context);
             provide = cache == null ? null : MethodHandles.publicLookup()
@@ -35,6 +37,8 @@ final class FreeTerraForgedTerrainSampler extends ClientTerrainSampler implement
                     .unreflect(tileType.getMethod("lookup", int.class, int.class))
                     .asType(MethodType.methodType(Object.class, Object.class, int.class, int.class));
             water = context == null ? null : new FreeTerraForgedWater(context);
+            previewRules = context != null && api.variant == dev.xantha.vss.common.worldgen.FreeTerraForgedVariant.ULTRA
+                    ? new FreeTerraForgedSurfaceRules(context) : null;
             dev.xantha.vss.common.VSSLogger.info("VSS FreeTerraForged adapter ready: dimension="
                     + profile.dimension() + ", filteredTerrain=" + (cache != null));
         } catch (ReflectiveOperationException failure) {
@@ -68,8 +72,11 @@ final class FreeTerraForgedTerrainSampler extends ClientTerrainSampler implement
         return FreeTerraForgedDensity.coarse(false, () -> super.sampleForLod(x, z, stepBlocks));
     }
 
+    @Override ClientColumnSample sampleDisplay(int x, int z) { return samplePreview(x, z); }
+
     @Override public ClientColumnSample samplePreview(int x, int z) {
-        return FreeTerraForgedDensity.coarse(true, () -> super.samplePreview(x,z));
+        return FreeTerraForgedDensity.coarse(true, () -> previewRules == null
+                ? super.samplePreview(x,z) : previewRules.preview(() -> super.samplePreview(x,z)));
     }
 
     @Override int surfaceColorForLod(int x,int y,int z,boolean preview) {
