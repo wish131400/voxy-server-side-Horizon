@@ -110,6 +110,8 @@ final class PredictionExteriorColumns {
         int batchSize = sampler instanceof FreeTerraForgedTerrainSampler ? 64 : 8;
         int[] pending = new int[batchSize], xs = new int[batchSize], zs = new int[batchSize];
         int[] bottoms = new int[batchSize], tops = new int[batchSize], requestIndex = new int[batchSize];
+        int minY = sampler.profile().minY();
+        int maxY = minY + sampler.profile().height();
         while (!queue.isEmpty()) {
             if (Thread.currentThread().isInterrupted() || !valid.getAsBoolean())
                 throw new java.util.concurrent.CancellationException();
@@ -118,14 +120,16 @@ final class PredictionExteriorColumns {
                 int index = queue.removeFirst();
                 pending[count] = index;
                 var sample = samples[index];
-                if (((sample.flags() & CHECKED) == 0 || spacing(sample) != step) && !sample.captured()) {
+                int top = sample.surfaceY();
+                // Noise settings can extend outside the dimension, leaving no in-world roof to profile.
+                if (top > minY && top <= maxY && ((sample.flags() & CHECKED) == 0 || spacing(sample) != step)
+                        && !sample.captured()) {
                     int x = index % grid, z = index / grid;
                     xs[requests] = baseX + (x - 1) * step;
                     zs[requests] = baseZ + (z - 1) * step;
                     requestIndex[requests] = count;
-                    tops[requests] = sample.surfaceY();
-                    int min = sampler.profile().minY();
-                    bottoms[requests] = Math.max(min, Math.min(sampler.seaLevel() - 16, tops[requests] - 1));
+                    tops[requests] = top;
+                    bottoms[requests] = Math.max(minY, Math.min(sampler.seaLevel() - 16, top - 1));
                     requests++;
                 }
                 count++;
@@ -137,9 +141,8 @@ final class PredictionExteriorColumns {
                 if (occupied == null) continue;
                 int index = pending[requestIndex[request]];
                 var sample = samples[index];
-                int min = sampler.profile().minY();
                 int floor = bottoms[request];
-                sample = capture(sample, min, floor, y -> occupied[y - floor]);
+                sample = capture(sample, minY, floor, y -> occupied[y - floor]);
                 sample = withProfile(sample, sample.volume(), floor, step);
                 samples[index] = sample; changed++;
             }

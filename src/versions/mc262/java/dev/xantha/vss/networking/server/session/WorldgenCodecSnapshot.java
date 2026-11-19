@@ -619,6 +619,7 @@ final class WorldgenCodecSnapshot {
         JsonObject placement = set.getAsJsonObject("placement");
         if (!placement.has("exclusion_zone")) return null;
         JsonElement other = placement.getAsJsonObject("exclusion_zone").get("other_set");
+        if (other == null || other.isJsonNull()) return null;
         if (other.isJsonPrimitive() && other.getAsJsonPrimitive().isString()
                 && !sets.has(other.getAsString())) return "structure set " + other.getAsString();
         return other.isJsonObject() ? missingStructureDependency(other.getAsJsonObject(), structures, sets) : null;

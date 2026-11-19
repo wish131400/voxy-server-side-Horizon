@@ -14,8 +14,8 @@ final class BiolithBiomeSource extends BiomeSource {
     private final BiolithWorldgenContext.Routing routing;
     private final List<Holder<Biome>> possible;
     BiolithBiomeSource(JsonObject snapshot,long seed,ClientWorldgenRegistries registries) {
-        var entries=MultiNoiseBiomeSource.DIRECT_CODEC.codec().parse(registries.ops(),snapshot.get("entries")).getOrThrow();
         var biomes=registries.access().registryOrThrow(Registries.BIOME);
+        var entries = BiolithWorldgenContext.decodeEntries(snapshot, registries.ops(), biomes);
         var choices=new java.util.LinkedHashSet<>(entries.values().stream().map(com.mojang.datafixers.util.Pair::getSecond).toList());
         choices.addAll(BiolithWorldgenContext.additionalBiomes(snapshot,biomes));
         possible=List.copyOf(choices);

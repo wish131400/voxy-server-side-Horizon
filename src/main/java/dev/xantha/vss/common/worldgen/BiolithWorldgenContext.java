@@ -2,6 +2,7 @@ package dev.xantha.vss.common.worldgen;
 
 import com.google.gson.*;
 import com.mojang.serialization.Codec;
+import com.mojang.datafixers.util.Pair;
 import com.mojang.serialization.DynamicOps;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
@@ -46,7 +47,9 @@ public final class BiolithWorldgenContext {
                             && !m.getName().contains("$"))
                     .findFirst().orElseThrow();parameters.setAccessible(true);
             @SuppressWarnings("unchecked") var entries=(Climate.ParameterList<Holder<Biome>>)parameters.invoke(source);
-            result.add("entries",MultiNoiseBiomeSource.DIRECT_CODEC.codec().encodeStart(ops,entries).getOrThrow());
+            var vanilla = MultiNoiseBiomeSource.DIRECT_CODEC.codec().encodeStart(ops, entries).result();
+            if (vanilla.isPresent()) result.add("entries", vanilla.get());
+            else result.add("quantized_entries", encodeQuantizedEntries(entries));
             for(String kind:List.of("replacementRequests","subBiomeRequests")) {
                 JsonObject sets=new JsonObject();
                 for(var entry:map(placement,kind).entrySet()) {
@@ -67,6 +70,43 @@ public final class BiolithWorldgenContext {
         } catch (ReflectiveOperationException failure) {
             throw new IllegalStateException("Biolith runtime snapshot unavailable",failure);
         }
+    }
+
+    // Runtime placements can use coordinates that the vanilla datapack codec rejects.
+    // Keep the exact quantized ranges instead of clamping and changing biome selection.
+    private static JsonArray encodeQuantizedEntries(Climate.ParameterList<Holder<Biome>> entries) {
+        JsonArray result = new JsonArray();
+        for (var entry : entries.values()) {
+            var point = entry.getFirst();
+            JsonArray row = new JsonArray(14);
+            row.add(key(entry.getSecond().unwrapKey().orElseThrow()));
+            for (var range : List.of(point.temperature(), point.humidity(), point.continentalness(),
+                    point.erosion(), point.depth(), point.weirdness())) {
+                row.add(range.min());
+                row.add(range.max());
+            }
+            row.add(point.offset());
+            result.add(row);
+        }
+        return result;
+    }
+
+    public static Climate.ParameterList<Holder<Biome>> decodeEntries(JsonObject snapshot,
+            DynamicOps<JsonElement> ops, Registry<Biome> biomes) {
+        if (!snapshot.has("quantized_entries")) return MultiNoiseBiomeSource.DIRECT_CODEC.codec().parse(ops,snapshot.get("entries")).getOrThrow();
+        List<Pair<Climate.ParameterPoint, Holder<Biome>>> entries = new ArrayList<>();
+        for (var element : snapshot.getAsJsonArray("quantized_entries")) {
+            var row = element.getAsJsonArray();
+            if (row.size() != 14) throw new IllegalArgumentException("Invalid Biolith climate entry");
+            var point = new Climate.ParameterPoint(range(row, 1), range(row, 3), range(row, 5),
+                    range(row, 7), range(row, 9), range(row, 11), row.get(13).getAsLong());
+            entries.add(Pair.of(point, biomes.getOrThrow(biomeKey(row.get(0).getAsString()))));
+        }
+        return new Climate.ParameterList<>(entries);
+    }
+
+    private static Climate.Parameter range(JsonArray row, int from) {
+        return new Climate.Parameter(row.get(from).getAsLong(), row.get(from + 1).getAsLong());
     }
 
     /** Routing can emit replacement biomes absent from the climate parameter list. */
@@ -132,7 +172,7 @@ public final class BiolithWorldgenContext {
                     map(placement,collection).put(target,group);
                 }
             }
-            var entries=MultiNoiseBiomeSource.DIRECT_CODEC.codec().parse(ops,snapshot.get("entries")).getOrThrow();
+            var entries = decodeEntries(snapshot, ops, biomes);
             Object tree=null;
             for(Field field:Climate.ParameterList.class.getDeclaredFields())if(Arrays.stream(field.getType().getMethods()).anyMatch(m->m.getName().equals("biolith$searchTreeGet"))) {
                 field.setAccessible(true);tree=field.get(entries);break;

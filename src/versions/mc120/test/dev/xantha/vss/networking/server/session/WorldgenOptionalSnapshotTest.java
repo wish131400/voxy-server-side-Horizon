@@ -19,13 +19,13 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 class WorldgenOptionalSnapshotTest {
-    private static final ResourceKey<net.minecraft.core.Registry<Integer>> KEY =
-            ResourceKey.createRegistryKey(ResourceLocation.parse("vss:optional_test"));
+    private static ResourceKey<net.minecraft.core.Registry<Integer>> key;
 
     @BeforeAll
     static void bootstrap() {
         net.minecraft.SharedConstants.tryDetectVersion();
         net.minecraft.server.Bootstrap.bootStrap();
+        key = ResourceKey.createRegistryKey(ResourceLocation.parse("vss:optional_test"));
     }
 
     @Test
@@ -38,12 +38,12 @@ class WorldgenOptionalSnapshotTest {
             return DataResult.success(value);
         });
         JsonObject encoded = WorldgenCodecSnapshot.encodeOptional(
-                access, RegistryOps.create(JsonOps.INSTANCE, access), KEY, codec);
+                access, RegistryOps.create(JsonOps.INSTANCE, access), key, codec);
 
         assertEquals(Set.of("vss:entry_1", "vss:entry_5"), encoded.keySet());
         assertEquals(1, encoded.get("vss:entry_1").getAsInt());
         assertEquals(5, encoded.get("vss:entry_5").getAsInt());
-        assertEquals(5, access.registryOrThrow(KEY).size(), "the server's actual registry must remain intact");
+        assertEquals(5, access.registryOrThrow(key).size(), "the server's actual registry must remain intact");
     }
 
     @Test
@@ -52,7 +52,7 @@ class WorldgenOptionalSnapshotTest {
         var fatal = new OutOfMemoryError("test sentinel");
         Codec<Integer> codec = Codec.INT.xmap(value -> value, value -> { throw fatal; });
         assertSame(fatal, assertThrows(OutOfMemoryError.class, () -> WorldgenCodecSnapshot.encodeOptional(
-                access, RegistryOps.create(JsonOps.INSTANCE, access), KEY, codec)));
+                access, RegistryOps.create(JsonOps.INSTANCE, access), key, codec)));
     }
 
     @Test
@@ -80,6 +80,20 @@ class WorldgenOptionalSnapshotTest {
         assertEquals(Set.of("vss:healthy_set"), result.keySet());
         assertEquals(sets.get("vss:healthy_set"), result.get("vss:healthy_set"));
         assertEquals(3, sets.size(), "filtering prediction data must not mutate the supplied snapshot");
+    }
+
+    @Test
+    void preservesModdedPlacementWithAnExclusionZoneThatDoesNotReferenceAStructureSet() {
+        JsonObject structures = json("{'blue_skies:village':{}}");
+        JsonObject sets = json("""
+                {'blue_skies:village': {
+                  'structures':[{'structure':'blue_skies:village','weight':1}],
+                  'placement':{'type':'structure_gel:grid_placement',
+                               'exclusion_zone':{'radius':7,'structures':'#blue_skies:dungeons'}}
+                }}
+                """);
+
+        assertEquals(sets, WorldgenCodecSnapshot.filterStructureSets(structures, sets));
     }
 
     @Test
@@ -124,9 +138,9 @@ class WorldgenOptionalSnapshotTest {
     }
 
     private static RegistryAccess access(int... values) {
-        var registry = new MappedRegistry<Integer>(KEY, Lifecycle.stable());
+        var registry = new MappedRegistry<Integer>(key, Lifecycle.stable());
         for (int value : values) {
-            registry.register(ResourceKey.create(KEY, ResourceLocation.parse("vss:entry_" + value)),
+            registry.register(ResourceKey.create(key, ResourceLocation.parse("vss:entry_" + value)),
                     value, Lifecycle.stable());
         }
         registry.freeze();

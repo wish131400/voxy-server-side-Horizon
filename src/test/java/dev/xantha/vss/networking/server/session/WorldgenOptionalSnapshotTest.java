@@ -85,6 +85,20 @@ class WorldgenOptionalSnapshotTest {
     }
 
     @Test
+    void preservesModdedPlacementWithAnExclusionZoneThatDoesNotReferenceAStructureSet() {
+        JsonObject structures = json("{'blue_skies:village':{}}");
+        JsonObject sets = json("""
+                {'blue_skies:village': {
+                  'structures':[{'structure':'blue_skies:village','weight':1}],
+                  'placement':{'type':'structure_gel:grid_placement',
+                               'exclusion_zone':{'radius':7,'structures':'#blue_skies:dungeons'}}
+                }}
+                """);
+
+        assertEquals(sets, WorldgenCodecSnapshot.filterStructureSets(structures, sets));
+    }
+
+    @Test
     void removesTransitiveExclusionZoneDependenciesAndPreservesIndependentSets() {
         JsonObject structures = json("{'vss:healthy':{}}");
         JsonObject sets = json("""
