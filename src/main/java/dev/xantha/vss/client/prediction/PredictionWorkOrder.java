@@ -43,9 +43,17 @@ final class PredictionWorkOrder {
 
     static int coveragePriority(double distanceSquared, int residentAxis, boolean surface, int screenPriority,
                                 boolean nearbyDetail) {
+        return coveragePriority(distanceSquared, residentAxis, surface, screenPriority, nearbyDetail, false);
+    }
+
+    static int coveragePriority(double distanceSquared, int residentAxis, boolean surface, int screenPriority,
+                                boolean nearbyDetail, boolean coverageEstablished) {
         int priority = nearPriority(distanceSquared, residentAxis, surface, screenPriority);
-        return !surface && (residentAxis == 0 && distanceSquared <= 2048.0 * 2048 || nearbyDetail)
-                ? priority - 5_000 : priority;
+        if (surface) return priority;
+        if (residentAxis == 0 && distanceSquared <= 2048.0 * 2048) return priority - 5_000;
+        // Once broad coverage is visible, finish a nearby resident instead of
+        // spending the next ordinary turns on more previews. Fair turns still fill the horizon.
+        return nearbyDetail ? priority - (coverageEstablished ? 7_500 : 2_500) : priority;
     }
 
     static boolean nearbyVisibleDetail(PredictionTileKey key, VssLodLayout layout, double distanceSquared, int band) {

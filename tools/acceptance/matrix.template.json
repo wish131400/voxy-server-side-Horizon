@@ -1,0 +1,62 @@
+[
+  {
+    "target": "fabric-1.20.1",
+    "case": null,
+    "sessions": null,
+    "mcpCommand": null
+  },
+  {
+    "target": "fabric-1.21.1",
+    "case": null,
+    "sessions": null,
+    "mcpCommand": null
+  },
+  {
+    "target": "fabric-1.21.11",
+    "case": null,
+    "sessions": null,
+    "mcpCommand": null
+  },
+  {
+    "target": "fabric-26.1.1",
+    "case": null,
+    "sessions": null,
+    "mcpCommand": null
+  },
+  {
+    "target": "fabric-26.1.2",
+    "case": null,
+    "sessions": null,
+    "mcpCommand": null
+  },
+  {
+    "target": "fabric-26.1",
+    "case": null,
+    "sessions": null,
+    "mcpCommand": null
+  },
+  {
+    "target": "fabric-26.2",
+    "case": null,
+    "sessions": null,
+    "mcpCommand": null
+  },
+  {
+    "target": "fabric-26.3",
+    "case": null,
+    "sessions": null,
+    "mcpCommand": null
+  },
+  {
+    "target": "forge-1.20.1",
+    "case": null,
+    "sessions": null,
+    "mcpCommand": null
+  },
+  {
+    "target": "neoforge-1.21.1",
+    "case": null,
+    "sessions": null,
+    "mcpCommand": null
+  }
+]

@@ -3,6 +3,11 @@ plugins {
     id 'maven-publish'
 }
 
+apply from: 'gradle/worldgen-compat.gradle'
+sourceSets.main.java.srcDirs(worldgenAdapterRoots('main'))
+sourceSets.test.java.srcDirs(worldgenAdapterRoots('test'))
+
+
 apply from: 'gradle/minecraft-targets.gradle'
 
 version = "${vss_version}-fabric-${minecraft_version}"
@@ -60,7 +65,8 @@ tasks.named('processResources', ProcessResources).configure {
 
 tasks.named('jar', Jar).configure {
     from('LICENSE') { rename { 'LICENSE_vss' } }
-    def productionInputs = files(fileTree('src/main'), fileTree('src/versions'),
+    def productionInputs = files(fileTree('src/main'), fileTree('src/versions'), fileTree('src/compat'),
+            'gradle/worldgen-compat.gradle',
             'build.gradle', 'fabric-next.gradle', 'fabric-legacy.gradle', 'settings.gradle', 'gradle.properties', 'gradle/minecraft-targets.gradle')
     inputs.files(productionInputs)
     doFirst {

@@ -530,6 +530,22 @@ class PredictionVoxySourceTest {
         source.put(tile(0,0,0,32,1,4));
         assertNull(source.section(pos,MAPPER),"Late old-world completion cannot republish");
     }
+    @Test void coarseEndVoxelsKeepTheAirBetweenThinAndThickIslandLayers() {
+        try (var source = new PredictionVoxySource()) {
+            var key = new PredictionTileManager.PredictionTileKey(Level.END, 0, 0, 0);
+            var column = new PredictionVoxySource.Column(List.of(
+                    new PredictionVoxySource.Run(0, 1, Blocks.DIRT.defaultBlockState()),
+                    new PredictionVoxySource.Run(8, 16, Blocks.DIRT.defaultBlockState())), "minecraft:the_end");
+            var columns = new PredictionVoxySource.Column[32 * 32];
+            Arrays.fill(columns, column);
+            source.put(new PredictionVoxySource.Tile(key, 0, 0, 32, 32, 1, columns, List.of(), 256));
+            long[] fine = source.section(VoxyPredictionBridge.position(0, 0, 0, 0), MAPPER);
+            long[] coarse = source.section(VoxyPredictionBridge.position(3, 0, 0, 0), MAPPER);
+            assertEquals(3L << 27, fine[0] & (0xfffffL << 27));
+            assertEquals(0, coarse[0] & (0xfffffL << 27));
+            assertEquals(3L << 27, coarse[1 << 10] & (0xfffffL << 27));
+        }
+    }
     @Test void featuresRetainTheirFootprintAndCoarseLodsKeepNarrowPeaks() {
         try(var source=new PredictionVoxySource()) {
             var base=tile(0,0,0,32,1,4);

@@ -11,7 +11,15 @@ final class PredictionVoxyWorkPreparation {
                  int surfaceRadius, long revision, long navigation,
                  Set<PredictionTileKey> targets, Set<PredictionTileKey> surfaces,
                  Set<PredictionTileKey> surfaceReady, Set<PredictionTileKey> dirty,
-                 RenderSnapshot residents, Map<PredictionTileKey,Integer> bands, int farRadius) {
+                 RenderSnapshot residents, Map<PredictionTileKey,Integer> bands, int farRadius, boolean coverageEstablished) {
+        Input(VssLodLayout layout, VssLodFocus focus, PredictionWorkView view,
+              double x, double y, double z, double pixels, double minY, double maxY,
+              int surfaceRadius, long revision, long navigation, Set<PredictionTileKey> targets,
+              Set<PredictionTileKey> surfaces, Set<PredictionTileKey> surfaceReady, Set<PredictionTileKey> dirty,
+              RenderSnapshot residents, Map<PredictionTileKey, Integer> bands, int farRadius) {
+            this(layout, focus, view, x, y, z, pixels, minY, maxY, surfaceRadius, revision,
+                    navigation, targets, surfaces, surfaceReady, dirty, residents, bands, farRadius, false);
+        }
         int band(PredictionTileKey key) {
             if (PredictionWorkOrder.scoped(key,layout,focus)) return PredictionWorkView.VISIBLE;
             // Native requests outlive a planning snapshot. Rank against the current projection.
@@ -39,7 +47,8 @@ final class PredictionVoxyWorkPreparation {
             double distance=PredictionWorkOrder.distanceSquared(key,input.layout(),input.x(),input.z());
             var ranked=new Ranked(key,band,PredictionWorkOrder.coveragePriority(distance,
                     tile==null ? 0 : tile.cellAxis(),false,0,
-                    needsTerrain && PredictionWorkOrder.nearbyVisibleDetail(key,input.layout(),distance,band)),distance);
+                    needsTerrain && PredictionWorkOrder.nearbyVisibleDetail(key,input.layout(),distance,band),
+                    input.coverageEstablished() || key.dimension().equals(net.minecraft.world.level.Level.END)),distance);
             if(needsTerrain)terrain.add(ranked);
             if(needsSurface && band<=PredictionWorkView.BUFFER)surfaces.add(ranked);
         }

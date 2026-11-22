@@ -305,7 +305,8 @@ final class ClientWorldgenProfileDecoder {
     private static BiomeSource decodeBiomeSource(DimensionProfile profile,
             JsonObject generatorRoot, ClientWorldgenRegistries registries) {
         BiomeSource biomeSource = generatorRoot.has("vss_blueprint")
-                ? BlueprintBiomeCompat.decode(generatorRoot.getAsJsonObject("vss_blueprint"), profile.seed(), registries)
+                ? BlueprintBiomeCompat.decode(generatorRoot.getAsJsonObject("vss_blueprint"), profile.seed(), registries,
+                        (routing, original) -> TerraBlenderBackend.buildRoutingSource(routing, original, profile.seed(), registries))
                 : WorldWeaverBiomeContext.decode(generatorRoot.get("biome_source"), registries);
         // A required server routing section can never fall through to the lossy vanilla codec.
         if (generatorRoot.has("vss_terrablender")) {

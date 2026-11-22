@@ -220,7 +220,8 @@ final class WorldgenCodecSnapshot {
             // behaving as a plain forwarder for a source that routes most of
             // the world through slices.
             JsonObject blueprint = BlueprintBiomeSnapshot.capture(noise.getBiomeSource(), access, ops,
-                    mods.isModLoaded("terrablender") ? terrablenderRegionType : null);
+                    mods.isModLoaded("terrablender") && terrablenderRegionType != null
+                            ? () -> TerraBlenderRegionSnapshot.capture(terrablenderRegionType, access) : null);
             if (blueprint != null) {
                 if (inheritedNoise) {
                     root.add("vss_blueprint", blueprint);
@@ -376,18 +377,8 @@ final class WorldgenCodecSnapshot {
         }
     }
 
-    // Tectonic's NoisesMixin changes only the positional RNG name. The
-    // parameters still belong to the original noise registry entry. A data
-    // pack with the same namespace, without this mixin, must keep its own seed.
     static JsonObject noiseSeedAliases(java.util.Set<ResourceLocation> noiseIds, boolean tectonicLoaded) {
-        JsonObject aliases = new JsonObject();
-        if (tectonicLoaded) noiseIds.stream().sorted().forEach(id -> {
-            if (id.getNamespace().equals("tectonic") && id.getPath().startsWith("parameter/")) {
-                aliases.addProperty(id.toString(), ResourceLocation.withDefaultNamespace(
-                        id.getPath().substring("parameter/".length())).toString());
-            }
-        });
-        return aliases;
+        return TectonicNoiseSeeds.noiseSeedAliases(noiseIds, tectonicLoaded);
     }
 
     private static boolean requiresAppliedDensityGraph() {

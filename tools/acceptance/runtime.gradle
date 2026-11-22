@@ -1,0 +1,11 @@
+allprojects { afterEvaluate {
+ tasks.register('acceptanceRuntimeTest', Test) {
+  dependsOn tasks.named('testClasses')
+  testClassesDirs=sourceSets.test.output.classesDirs
+  classpath=sourceSets.test.runtimeClasspath
+  useJUnitPlatform()
+  include '**/PredictionAcceptanceSettingsTest.class','**/PredictionPerformanceServiceTest.class'
+  maxHeapSize='2G';maxParallelForks=1;forkEvery=1
+  testLogging { events 'failed'; exceptionFormat 'full' }
+ }
+} }

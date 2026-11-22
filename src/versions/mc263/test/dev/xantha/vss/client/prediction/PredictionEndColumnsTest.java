@@ -188,10 +188,10 @@ class PredictionEndColumnsTest {
         try(var manager=new PredictionTileManager(Level.END,sampler,
                 new PredictionMemoryBudget(256L*PredictionMemoryBudget.MIB,0,()->Long.MAX_VALUE,System::nanoTime,1),null)) {
             var method=PredictionTileManager.class.getDeclaredMethod("sampleGridFast",int.class,int.class,int.class,
-                    int.class,ClientColumnSample[].class,boolean.class,boolean.class,java.util.function.BooleanSupplier.class);
+                    int.class,ClientColumnSample[].class,boolean.class,boolean.class,boolean.class,java.util.function.BooleanSupplier.class);
             method.setAccessible(true);
             var samples=new ClientColumnSample[9];
-            method.invoke(manager,0,0,32,3,samples,true,false,(java.util.function.BooleanSupplier)()->true);
+            method.invoke(manager,0,0,32,3,samples,true,false,false,(java.util.function.BooleanSupplier)()->true);
             assertEquals(9,fullCalls.get());for(var sample:samples)assertNotNull(sample.volume());
             assertEquals(0,PredictionExteriorColumns.enrich(samples,3,32,0,0,sampler,()->true));
             assertEquals(9,fullCalls.get());

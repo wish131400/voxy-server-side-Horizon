@@ -327,7 +327,9 @@ def verify_worldgen_interface_paths(read_class, minecraft):
     tectonic = "common/worldgen/TectonicConfigNoise"
     read_class(tectonic, "tectonic_config_noise", "smoother_scaling", "multiplier", "offset")
     calls("VSSMod", "onInitialize", prefix + tectonic, "register")
-    calls(density, None, prefix + tectonic, "<init>")
+    tectonic_snapshot = "common/worldgen/TectonicDensitySnapshot"
+    calls(density, None, prefix + tectonic_snapshot, "capture")
+    calls(tectonic_snapshot, "capture", prefix + tectonic, "<init>")
     if minecraft == "26.3":
         read_class(density, "dev.worldgen.lithostitched.impl.worldgen.densityfunction.marker.MergedFunction", "full")
         calls(density, "applied", "java/lang/Class", "getMethod")
@@ -336,7 +338,6 @@ def verify_worldgen_interface_paths(read_class, minecraft):
     else:
         calls(density, "applied", prefix + "common/worldgen/AppliedDensityRecords", "capture")
         calls(density, "applied", prefix + density, "UNWRAP")
-        calls(density, None, prefix + density, "legacyTectonic")
         if not any(entry[1] == "<instanceof>" for entries in class_references(read_class(density)).values()
                    for entry in entries):
             raise ValueError("Applied density graph snapshot lacks its holder-unwrapping instruction")
@@ -429,7 +430,8 @@ def verify_worldgen_interface_paths(read_class, minecraft):
 def source_files(root):
     paths = [p for p in (root / "src/main").rglob("*") if p.is_file()]
     paths += [p for p in (root / "src/versions").rglob("*") if p.is_file()]
-    paths += [root / p for p in ("build.gradle", "fabric-next.gradle", "fabric-legacy.gradle", "settings.gradle", "gradle.properties",
+    paths += [p for p in (root / "src/compat").rglob("*") if p.is_file()]
+    paths += [root / p for p in ("gradle/worldgen-compat.gradle", "build.gradle", "fabric-next.gradle", "fabric-legacy.gradle", "settings.gradle", "gradle.properties",
                                "gradle/minecraft-targets.gradle")]
     return sorted(paths, key=lambda p: p.relative_to(root).as_posix())
 

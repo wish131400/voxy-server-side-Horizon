@@ -1,0 +1,146 @@
+{
+  "schema": 1,
+  "target": "fabric-26.1",
+  "loader": "fabric",
+  "minecraft": "26.1",
+  "java": 25,
+  "sourceOverlays": [
+    "mc26"
+  ],
+  "build": {
+    "arguments": [
+      "-PmcTarget=26.1",
+      "compileJava"
+    ],
+    "artifact": "vss-0.3.7-fabric-26.1.jar"
+  },
+  "control": {
+    "provider": "MineClient-Bridge",
+    "upstreamCommit": "6f2e8cc84e24b1496d30f30aec8c0ec6e05363a3",
+    "upstreamVersion": "1.1.8",
+    "upstreamSupportsTarget": false,
+    "requiredAdapter": "A build for this exact Minecraft version and loader with the seven minecraft_client_* tool contracts; NeoForge JAR cannot be used as a substitute",
+    "transport": "mcp-stdio",
+    "operatingSystem": "Windows prepared isolated desktop; rendered graphics context required",
+    "portingNotes": [
+      "Rebind loader event registration and input hooks to this target"
+    ]
+  },
+  "preflight": {
+    "disposableWorld": true,
+    "uniqueRuntimeAndEvidenceRoots": true,
+    "exactModHashes": true,
+    "maxConcurrentPerformanceClients": 1,
+    "jvmProperties": [
+      "-Dvss.acceptance.enabled=true",
+      "-Dvss.acceptance.runId=<run-id>",
+      "-Dvss.acceptance.background=true",
+      "-Dvss.acceptance.capture=true"
+    ],
+    "gameOptions": {
+      "pauseOnLostFocus": false,
+      "backgroundFps": "Explicitly configure and record a limit matching the foreground comparison",
+      "resolution": "Fixed across paired runs",
+      "predictionDistanceBlocks": "Fixed by case",
+      "threadCount": "Fixed by case",
+      "shaders": "Exact shader pack and settings, or disabled"
+    },
+    "requiredInputs": [
+      "Exact MC/loader/Voxy/VSS/terrain-mod versions and SHA-256s",
+      "Seed and exported preset/worldgen configuration",
+      "Prepared launch root with final-preflight.json, launch.ps1 and launch/java-arguments.txt",
+      "Quick-play test save or verified version-specific enter-world sequence"
+    ]
+  },
+  "phases": [
+    {
+      "id": "cold-load",
+      "fixture": "Fresh disposable world plus empty VSS prediction namespace; preserve a pristine copy",
+      "observe": [
+        "time from accepted profile and first interval separately",
+        "first ready tile",
+        "coverage 80% and 95%",
+        "target refinement 95%",
+        "freshness",
+        "stalls",
+        "frame time and heap"
+      ],
+      "pass": "Fixed nonzero target set, fresh measured intervals, within explicit case limits; screenshots reviewed"
+    },
+    {
+      "id": "warm-load",
+      "fixture": "One-shot prepared root cloned after cold client closes; same world/mods/options; copy prediction and Voxy caches after all writers stop",
+      "observe": [
+        "cold/warm inventory equality",
+        "cache hits and mesh restores",
+        "coverage/refinement timings",
+        "frame time"
+      ],
+      "pass": "Warm-cache hits observed and same fixed target reaches required coverage; compare durations with same origin"
+    },
+    {
+      "id": "movement",
+      "fixture": "Same seed/preset and target mods; production key and look actions on a fixed route",
+      "observe": [
+        "actual displacement",
+        "continuous publishing/refinement",
+        "terrain and vegetation stability",
+        "P95/P99 intervals",
+        "CPU/GC/heap"
+      ],
+      "pass": "Route actually traversed, progress resumes after movement, no failed rendering, visual review"
+    },
+    {
+      "id": "prediction-toggle",
+      "fixture": "Explicit internal off -> loading options using the same config fields as the UI",
+      "observe": [
+        "predictionEnabled false then true",
+        "off screenshot",
+        "on screenshot",
+        "loading resumes"
+      ],
+      "pass": "State transitions observed and both screenshots reviewed; performance quality is never changed automatically"
+    },
+    {
+      "id": "world-reentry",
+      "fixture": "Leave and reenter the same save in the same Java process through the target-specific GUI sequence",
+      "observe": [
+        "world absent between sessions",
+        "same PID",
+        "new performance epoch",
+        "new prediction work",
+        "cache restoration"
+      ],
+      "pass": "Second entry renders prediction and reaches the case demand threshold"
+    },
+    {
+      "id": "terrain-biomes",
+      "fixture": "Loaded reference points at peaks, valleys, rivers/coasts, biome borders and mod-specific terrain; avoid edited or structure-modified ground",
+      "observe": [
+        "same X/Z preview and exact heights",
+        "loaded real surface",
+        "same-quart biome ID",
+        "resident sample coordinate/spacing/provenance",
+        "reference image"
+      ],
+      "pass": "Enough noncaptured same-coordinate evidence within explicit per-LOD tolerances, no missing points, image review"
+    }
+  ],
+  "evidence": {
+    "statuses": [
+      "passed",
+      "failed",
+      "incomplete",
+      "awaiting-visual-review"
+    ],
+    "missingEvidence": "incomplete",
+    "frameReview": "Required verdict with concrete observations bound to PNG SHA-256",
+    "performance": "Frame capture and terrain probes run outside measured intervals",
+    "forbiddenClaims": [
+      "Compile success is not game acceptance",
+      "Task failure count zero is not correct terrain",
+      "Raw generator columns are not final post-decoration blocks",
+      "A readback of real captured terrain is not independent prediction proof"
+    ]
+  }
+}

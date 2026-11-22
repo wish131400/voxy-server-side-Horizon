@@ -17,14 +17,14 @@ class PredictionRefinementBudgetTest {
         try {
             config.performanceTier = "low";
             assertEquals(1,PredictionWorkOrder.refinementWorkers(1,0));
-            assertEquals(1,PredictionWorkOrder.refinementWorkers(4,0));
-            assertEquals(3,PredictionWorkOrder.refinementWorkers(16,0));
-            assertEquals(3,PredictionWorkOrder.refinementWorkers(32,0));
+            assertEquals(2,PredictionWorkOrder.refinementWorkers(4,0));
+            assertEquals(4,PredictionWorkOrder.refinementWorkers(16,0));
+            assertEquals(8,PredictionWorkOrder.refinementWorkers(32,0));
             config.performanceTier = "medium";
             assertEquals(1,PredictionWorkOrder.refinementWorkers(1,0));
             assertEquals(2,PredictionWorkOrder.refinementWorkers(4,0));
-            assertEquals(6,PredictionWorkOrder.refinementWorkers(16,0));
-            assertEquals(6,PredictionWorkOrder.refinementWorkers(32,0));
+            assertEquals(8,PredictionWorkOrder.refinementWorkers(16,0));
+            assertEquals(16,PredictionWorkOrder.refinementWorkers(32,0));
             config.performanceTier = "high";
             assertEquals(1,PredictionWorkOrder.refinementWorkers(1,0));
             assertEquals(2,PredictionWorkOrder.refinementWorkers(4,0));

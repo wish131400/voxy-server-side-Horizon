@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "id": "terrain-compatibility",
+  "disposableWorld": true,
+  "seed": "42",
+  "preset": "REPLACE_WITH_EXACT_PRESET_HASH",
+  "terrainMods": [
+    {
+      "id": "REPLACE_WITH_TERRAIN_MOD_ID",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256"
+    }
+  ],
+  "expected": {
+    "predictionDistanceBlocks": 8192,
+    "resolution": [
+      1920,
+      1080
+    ],
+    "shadersActive": false
+  },
+  "phaseSeconds": {
+    "cold-load": 120,
+    "warm-load": 90,
+    "movement": 45,
+    "prediction-toggle": 30,
+    "world-reentry": 60,
+    "terrain-biomes": 5
+  },
+  "limits": {
+    "maxHeightError": 1,
+    "minPoints": 4,
+    "maxStallSeconds": 30,
+    "minMovementBlocks": 16,
+    "maxFrameP95Ms": 50,
+    "maxCoverage95Seconds": 120,
+    "maxTarget95Seconds": 120,
+    "residentHeightToleranceByStep": {
+      "1": 1,
+      "2": 2,
+      "4": 4,
+      "8": 8,
+      "16": 16
+    }
+  },
+  "movement": [
+    {
+      "kind": "key",
+      "mapping": "key.forward",
+      "holdSeconds": 4
+    },
+    {
+      "kind": "look",
+      "yaw": 90,
+      "pitch": 0,
+      "relative": false
+    },
+    {
+      "kind": "key",
+      "mapping": "key.forward",
+      "holdSeconds": 4
+    }
+  ],
+  "leaveWorld": [],
+  "enterWorld": [],
+  "probes": [
+    {
+      "x": 0,
+      "z": 0,
+      "side": 2,
+      "step": 1
+    }
+  ],
+  "notes": "Internal template. Fill exact hashes, reference coordinates and GUI actions for the prepared save. Empty lifecycle actions and placeholders are incomplete, never an acceptance pass.",
+  "reference": "REPLACE_WITH_EXPORTED_REFERENCE_JSON"
+}

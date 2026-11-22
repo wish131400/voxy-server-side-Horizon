@@ -224,7 +224,7 @@ public final class PredictionTileManager implements AutoCloseable {
                     cameraBlockX,cameraBlockY,cameraBlockZ,schedulingPixels,sampler.profile().minY(),
                     sampler.profile().minY()+sampler.profile().height()+64,surfaceRadius,meshRevision.get(),navigationGeneration,
                     inputSnapshots.set(voxyDetailTargets),surfaceDesired,inputSnapshots.set(surfaceReady),inputSnapshots.set(dirtyTiles),
-                    renderSnapshot(),viewBands,farDecorationRadius()));
+                    renderSnapshot(),viewBands,farDecorationRadius(), coverageEstablished()));
         }
     }
 
@@ -377,6 +377,17 @@ public final class PredictionTileManager implements AutoCloseable {
 
     private boolean serviceGenerationTurn(int cx, int cz, long until) {
         boolean fair = nearGenerationAdmissions >= NEAR_WORK_BURST;
+        // Spend one turn of each burst on the current near terrain goals.
+        // The remaining turns still feed Voxy requests, surfaces and missing coverage.
+        if (nearGenerationAdmissions == 0 && coverageEstablished()) {
+            long generationBefore = generationEnqueues;
+            Admission near = serviceNearTerrainGoals(cx, cz, until);
+            if (near == Admission.CPU_BUSY) return false;
+            if (near == Admission.QUEUED) {
+                if (generationEnqueues != generationBefore) nearGenerationAdmissions++;
+                return true;
+            }
+        }
         int first = fair ? fairGenerationLane : generationAdmissionLane;
         if (!fair) {
             BuildRequest best = null;
@@ -412,6 +423,20 @@ public final class PredictionTileManager implements AutoCloseable {
         }
         } finally { fairGenerationAdmission=false; }
         return false;
+    }
+
+    private Admission serviceNearTerrainGoals(int cx, int cz, long until) {
+        for (var key : nearTerrainGoals) {
+            if (System.nanoTime() >= until) break;
+            if (pending.contains(key) || !viewWork(key, false) || !retryReady(key)) continue;
+            int goal = ordinaryTargets.getOrDefault(key, 0);
+            var tile = ready.get(key);
+            int axis = tile == null ? 0 : tile.cellAxis();
+            if (goal == 0 || axis >= goal || targetCellAxis(key) <= axis) continue;
+            Admission admitted = enqueue(key, cx, cz, false);
+            if (admitted != Admission.DEFERRED) return admitted;
+        }
+        return Admission.DEFERRED;
     }
 
     private BuildRequest generationHead(int lane) {
@@ -548,6 +573,7 @@ public final class PredictionTileManager implements AutoCloseable {
     private volatile boolean foregroundWorkPending;
     private Map<PredictionTileKey, PredictionLoadingPreparation.DisplayGoal> displayGoals = Map.of();
     private List<PredictionTileKey> scheduledPlan = List.of(), scheduledLeaves = List.of();
+    private List<PredictionTileKey> nearTerrainGoals = List.of();
     private Set<PredictionTileKey> desiredSnapshot() {
         return inputSnapshots.set(desiredKeys);
     }
@@ -1040,7 +1066,7 @@ public final class PredictionTileManager implements AutoCloseable {
         if (diskCache != null) diskCache.resetTerrainProbes();
         voxyOwnedTiles = Set.of(); renderSnapshot = null;
         planning.invalidate();
-        scheduledPlan = List.of(); scheduledLeaves = List.of();
+        scheduledPlan = List.of(); scheduledLeaves = List.of(); nearTerrainGoals = List.of();
         // Keep overlapping demand/residents, but old native requests must not pin
         // invisible terrain or occupy admission while the asynchronous window catches up.
         voxyDetailTargets.removeIf(key -> key.lod()>=layout.levelCount()
@@ -1150,6 +1176,13 @@ public final class PredictionTileManager implements AutoCloseable {
         mediumCoverage = result.medium(); refreshMediumCoveragePending();
         idleTargets = result.idleTargets();
         scheduledPlan = result.plan(); scheduledLeaves = result.leaves();
+        double nearRadius = PredictionDetailBands.fineRadius(layout.maxDistanceBlocks(), dimension);
+        nearTerrainGoals = scheduledLeaves.stream()
+                .filter(key -> PredictionWorkOrder.distanceSquared(key, layout, cameraBlockX, cameraBlockZ)
+                        <= nearRadius * nearRadius)
+                .sorted(Comparator.comparingDouble(key ->
+                        PredictionWorkOrder.distanceSquared(key, layout, cameraBlockX, cameraBlockZ)))
+                .toList();
         foregroundWorkPending = true; previewWorkPending = surfacePreviewWorkPending = true;
         loadingProgress = PredictionLoadingProgress.INITIALIZING;
         requestViewWork(now); return true;
@@ -1223,6 +1256,8 @@ public final class PredictionTileManager implements AutoCloseable {
                 candidate.input(), current, scheduledPlan, now));
         if (result == null) return;
         var request = result.input();
+        // Refresh the native ranking on the coverage transition, even if demand is unchanged.
+        if (unifiedVoxy && coverageEstablished() != coverageEstablished(result.progress())) voxyDemandRefill = true;
         loadingDisplayProgress = result.progress(); loadingDisplayAt = request.scheduling().now(); loadingDisplayCommits++;
         loadingDisplayCurrent = false;
         // Display is a dated observation. Only exact evidence may release the
@@ -1417,7 +1452,21 @@ public final class PredictionTileManager implements AutoCloseable {
                 ? screenWorkPriority(key, surface) : 0;
         return viewPriorityOffset(key, surface) + (surface && farCompletion(key) ? 50_000 : 0)
                 + PredictionWorkOrder.coveragePriority(distance, axis, surface, screen, voxyDetail(key)
-                    && PredictionWorkOrder.nearbyVisibleDetail(key,layout,distance,viewBand(key)));
+                    && PredictionWorkOrder.nearbyVisibleDetail(key,layout,distance,viewBand(key)),
+                    coverageAllowsFinePriority(key));
+    }
+
+    private boolean coverageAllowsFinePriority(PredictionTileKey key) {
+        // Sparse End islands can refine while the horizon still includes unproven void.
+        return key.dimension().equals(net.minecraft.world.level.Level.END) || coverageEstablished();
+    }
+
+    private boolean coverageEstablished() {
+        return coverageEstablished(loadingDisplayProgress);
+    }
+
+    private static boolean coverageEstablished(PredictionLoadingProgress progress) {
+        return progress.coverageTotal() > 0 && progress.coverageReady() * 10L >= progress.coverageTotal() * 9L;
     }
 
     private int viewPriorityOffset(PredictionTileKey key, boolean surface) {
@@ -3023,6 +3072,8 @@ public final class PredictionTileManager implements AutoCloseable {
         int target = terrainTargets.getOrDefault(key, sampler.initialTerrainCellAxis(key.lod()));
         if (mediumCoverage.frontier().contains(key)) target = Math.max(mediumAxis(key), target);
         if (mediumCoveragePending && !PredictionWorkOrder.scoped(key, layout, buildFocus)
+                && !(coverageEstablished() && ordinaryTargets.containsKey(key)
+                    && nearbyDetail(key) && viewWork(key, false))
                 && mediumCoverage.paths().contains(key) && (!mediumCoverage.frontier().contains(key)
                 || mediumCoverageWork(key))) {
             return mediumAxis(key);
@@ -3196,9 +3247,10 @@ public final class PredictionTileManager implements AutoCloseable {
         }
         // Terrain upgrades of resident grids and decoration use the expensive
         // lane. Fresh coverage and finished-cache restores retain their own lane.
-        boolean needsDetail = !cacheOnly && (surface || !surface && voxyDetail(key) || current != null
-                && Math.max(current.cellAxis(), Math.min(targetCellAxis(key), current.cellAxis() * 2))
-                    > PredictionWorkOrder.PREVIEW_CELL_AXIS);
+        boolean endInteriorDetail = key.dimension().equals(net.minecraft.world.level.Level.END) && voxyDetail(key);
+        boolean needsDetail = !cacheOnly && (surface || endInteriorDetail || current != null && (voxyDetail(key)
+                || Math.max(current.cellAxis(), Math.min(targetCellAxis(key), current.cellAxis() * 2))
+                    > PredictionWorkOrder.PREVIEW_CELL_AXIS));
         BuildSlots buildSlots = needsDetail ? tryReserveBuildSlots(key,surface,surface && farCompletion(key)) : null;
         if (needsDetail && buildSlots == null) {
             detailEvent(key,"detail-slot");
@@ -4242,7 +4294,7 @@ public final class PredictionTileManager implements AutoCloseable {
         displayGoals = Map.of(); recentlyVisible.clear();
         viewBands = Map.of(); viewDependencies = Set.of();
         scheduledOccluded = Set.of();
-        scheduledPlan = List.of(); scheduledLeaves = List.of();
+        scheduledPlan = List.of(); scheduledLeaves = List.of(); nearTerrainGoals = List.of();
         meshRevision.incrementAndGet();
         ready.clear();
         coverageSpatial.clear(); coverageSpatialSize = 0; cacheScan = retirementScan = null; cacheScanCandidates.clear();

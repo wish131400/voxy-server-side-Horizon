@@ -186,6 +186,55 @@ class ModuleArchitectureTest {
     }
 
     @Test
+    void worldgenAdaptersUseTheHostToComposeOtherAdapters() throws Exception {
+        Path root = Path.of(System.getProperty("vss.worldgenAdapters"));
+        var owners = new java.util.HashMap<String, String>();
+        try (var files = Files.walk(root)) {
+            for (Path file : files.filter(path -> path.toString().endsWith(".java")).toList()) {
+                Path relative = root.relativize(file);
+                int packageRoot = relative.getName(1).toString().equals("main") ? 2 : 3;
+                if (relative.getNameCount() <= packageRoot
+                        || !relative.getName(packageRoot - 1).toString().equals("main")
+                        || file.getFileName().toString().equals("package-info.java")) continue;
+                String className = relative.subpath(packageRoot, relative.getNameCount()).toString()
+                        .replace(File.separatorChar, '.').replaceFirst("\\.java$", "");
+                String module = relative.getName(0).toString();
+                String old = owners.putIfAbsent(className, module);
+                assertTrue(old == null || old.equals(module), className + " has multiple adapter owners");
+            }
+        }
+        assertFalse(owners.isEmpty());
+        Set<String> violations = new TreeSet<>();
+        for (var type : production) {
+            String module = owners.get(type.getName().split("\\$", 2)[0]);
+            if (module == null) continue;
+            for (var dependency : type.getDirectDependenciesFromSelf()) {
+                String peer = owners.get(dependency.getTargetClass().getName().split("\\$", 2)[0]);
+                if (peer == null || module.equals(peer)) continue;
+                if (terraForgedIntegration(type.getName(), module, dependency.getTargetClass().getName(), peer)) continue;
+                violations.add(dependency.getDescription());
+            }
+        }
+        assertTrue(violations.isEmpty(), () -> String.join(System.lineSeparator(), violations));
+    }
+
+    private static boolean terraForgedIntegration(String from, String module, String to, String peer) {
+        String prediction = "dev.xantha.vss.client.prediction.";
+        // UTF hooks use lifecycle and surface services owned by the shared runtime.
+        if (module.equals("ultraterraforged") && peer.equals("freeterraforged")) {
+            return from.startsWith("dev.xantha.vss.mixin.client.UltraTerraForged")
+                    && (to.equals(prediction + "FreeTerraForgedPredictionTasks")
+                        || to.equals(prediction + "FreeTerraForgedSurfaceRules"));
+        }
+        // Only the shared entry point selects another TerraForged implementation.
+        if (!module.equals("freeterraforged")
+                || !(from.equals(prediction + "FreeTerraForgedCompat")
+                    || from.startsWith(prediction + "FreeTerraForgedCompat$"))) return false;
+        return peer.equals("reterraforged") && to.equals(prediction + "LegacyRtfRuntime")
+                || peer.equals("neoterraforged") && to.equals(prediction + "NeoTerraForgedRegistries");
+    }
+
+    @Test
     void boundaryCheckerRejectsAnActualForbiddenDependency() {
         ArchRule rule = noClasses().should().dependOnClassesThat()
                 .resideInAPackage("dev.xantha.vss.networking..");

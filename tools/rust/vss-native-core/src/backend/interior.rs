@@ -27,44 +27,50 @@ impl World {
                 .map(|b| self.base_ids[b as usize])
                 .collect(),
         };
-        let mut scratch = t
-            .graph
-            .scratch(x & !15, z & !15, t.cell_width, t.cell_height)?;
-        let mut last = None;
-        let mut cache = HashMap::new();
-        let biome = |p| {
-            let mut q = zoom_quart(self.zoom_seed, p);
-            q[1] = q[1].clamp(t.min_y >> 2, (t.min_y + t.height - 1) >> 2);
-            let name = *cache
-                .entry(q)
-                .or_insert_with(|| self.source.sample(&t.graph, q, &mut scratch, &mut last));
-            Ok((name, self.biomes.get(name).ok_or("missing interior biome")?))
-        };
-        let mut heights = [column.top; 4];
-        for (i, (xx, zz)) in [
-            (x, (z - 1).max(z & !15)),
-            (x, (z + 1).min((z & !15) + 15)),
-            ((x - 1).max(x & !15), z),
-            ((x + 1).min((x & !15) + 15), z),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if (xx, zz) != key {
-                heights[i] = job.surface_top(xx, zz).map_or(t.min_y, |(y, _)| y + 1);
+        // Empty columns cannot match a surface rule. Keep their exact air
+        // volume without building biome scratch state or sampling neighbours.
+        if column.top > t.min_y {
+            let mut scratch = t
+                .graph
+                .scratch(x & !15, z & !15, t.cell_width, t.cell_height)?;
+            let mut last = None;
+            let mut cache = HashMap::new();
+            let biome = |p| {
+                let mut q = zoom_quart(self.zoom_seed, p);
+                q[1] = q[1].clamp(t.min_y >> 2, (t.min_y + t.height - 1) >> 2);
+                let name = *cache
+                    .entry(q)
+                    .or_insert_with(|| self.source.sample(&t.graph, q, &mut scratch, &mut last));
+                Ok((name, self.biomes.get(name).ok_or("missing interior biome")?))
+            };
+            let mut heights = [column.top; 4];
+            if self.surface.uses_steep {
+                for (i, (xx, zz)) in [
+                    (x, (z - 1).max(z & !15)),
+                    (x, (z + 1).min((z & !15) + 15)),
+                    ((x - 1).max(x & !15), z),
+                    ((x + 1).min((x & !15) + 15), z),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if (xx, zz) != key {
+                        heights[i] = job.surface_top(xx, zz).map_or(t.min_y, |(y, _)| y + 1);
+                    }
+                }
             }
+            self.surface.apply_retained(
+                &mut job,
+                &mut column,
+                &self.palette,
+                x,
+                z,
+                heights,
+                &self.colors,
+                biome,
+                false,
+            )?;
         }
-        self.surface.apply_retained(
-            &mut job,
-            &mut column,
-            &self.palette,
-            x,
-            z,
-            heights,
-            &self.colors,
-            biome,
-            false,
-        )?;
         self.check_active()?;
         let result = Arc::new(column.blocks);
         let mut cache = self

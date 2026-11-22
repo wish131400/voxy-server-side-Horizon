@@ -196,21 +196,8 @@ final class ClientWorldgenRegistries {
     /** The decoded registry snapshot, including the TerraBlender section when present. */
     JsonObject snapshotRoot() { return snapshotRoot; }
 
-    /** Mirrors Lithostitched's server-start seed binding on isolated snapshot values only. */
     void bindWorldSeed(long seed) {
-        var key = ResourceKey.createRegistryKey(ResourceLocation.parse("lithostitched:fast_noise_config"));
-        Registry<?> configs = extraRegistries.get(key);
-        if (configs == null || configs.size() == 0) return;
-        try {
-            Object first = configs.iterator().next();
-            Class<?> configType = Class.forName(
-                    "dev.worldgen.lithostitched.api.worldgen.densityfunction.fastnoise.FastNoiseConfig",
-                    false, first.getClass().getClassLoader());
-            var bind = configType.getMethod("bind", long.class);
-            for (Object config : configs) bind.invoke(configType.cast(config), seed);
-        } catch (ReflectiveOperationException | ClassCastException failure) {
-            throw new IllegalStateException("Cannot seed Lithostitched FastNoise snapshot", failure);
-        }
+        LithostitchedWorldSeed.bind(extraRegistries, seed);
     }
 
     /** Use the same holder instances for decoding, biome predicates and feature placement. */

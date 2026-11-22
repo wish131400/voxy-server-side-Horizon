@@ -1,0 +1,58 @@
+内部世界生成验收工具，不属于用户使用文档或发布说明。
+
+入口
+  python acceptance.py catalog
+  python acceptance.py plan neoforge-1.21.1 <plan.json>
+  python acceptance.py run <target> <case.json> <sessions.json> <mcp-command.json> <new-evidence-directory>
+  python acceptance.py reference <probe.json> <reference.json>
+  python acceptance.py evaluate <evidence-directory> <visual-reviews.json>
+  python -m unittest discover -s tools/acceptance -p test_acceptance.py
+
+mcp-command.json 是调用已安装 MineClient-Bridge stdio server 的参数数组。
+外部 MCP 的实际调用契约固定到 6f2e8cc84e24b1496d30f30aec8c0ec6e05363a3。
+不要把凭证、完整 JVM 启动参数、实际存档或运行输出提交到仓库。
+本目录只复用原有 MCP 输入，不再实现另一套键盘、鼠标、操作系统注入。
+
+每个版本的流程位于 profiles，必须先核对该目标的 Bridge 二进制。
+上游目前只有 NeoForge 1.21.1。其他九目标要求真正移植后的 Bridge，不能改元数据冒充。
+26.3 的窗口输入为 SDL，不能复用 GLFW 隔离逻辑。
+
+准备
+  由各版本实际启动器创建独立 one-shot root，遵循 Bridge 的 final-preflight.json、launch.ps1、
+  launch/java-arguments.txt 契约；使用隔离桌面与进程内虚拟输入。
+  每个 root 的实际 JVM 必须接收流程中的四个 vss.acceptance 属性，runId 必须一致。
+  准备自动 quick-play 的一次性测试世界。种子、预设和精确依赖必须固定。
+  不操作玩家日常存档。不删除生产缓存，不改玩家配置。不同时跑多个性能客户端。
+  后台暂停必须关闭，后台 FPS 限制由夹具显式固定并记入 expected。
+  这些运行条件不由性能程序自动降低或动态调整。
+
+冷暖启动
+  cold root 由夹具准备器创建为空预测缓存的世界。runner 不删除任何目录。
+  warm root 先准备相同 mods/选项，但不要放测试 saves/cache。
+  cold 精确 PID 关闭以后，按 sessions 的 cachePaths 把指定 saves/cache 复制到 warm root。
+  所有缓存路径必须相对 root，存在外链或目标已有数据时停止该阶段。
+  起点是客户端进入世界开始采样，非 Java 进程启动，报告明确注明时间原点。
+  同一相机与非零固定目标数下测覆盖80/95与细化95；目标变化或陈旧数据不能宣称通过。
+
+移动、关开、重进
+  movement 使用真实映射 press/release 与 look，在测量过程中执行并核对实际位移。
+  prediction-toggle 明确执行 off -> loading，仅改正常 UI 使用的内存字段，退出不写配置。
+  world-reentry 必须填该目标的真实 leaveWorld/enterWorld GUI 动作，检查中途无世界、同 PID、
+  相同维度及新的采样 epoch。空动作不会通过。
+  开始/结束截图与数值探针均在性能区间之外。
+
+数值参考
+  用 acceptance 探针对已加载真实区块取参考，不发起服务器区块生成。
+  reference 命令导出实际地表/同 quart 群系。结构或玩家建筑修改过的点不能用作自然地形基准。
+  另一个空预测缓存的相同 worldgen fixture 在远处检验同一坐标；参考 fingerprint 与 seed 必须相同。
+  不把已经接收的 captured 真地形当作预测证据；不同采样坐标的粗 LOD 也不作逐点精确比较。
+  residentHeightToleranceByStep 是夹具明确给定的每种采样间距容差，不自动放宽。
+
+视觉结论
+  framebuffer PNG 返回成功只证明传输成功。
+  visual-reviews.json 使用每张图 SHA-256 作键，值为 {"status":"passed|failed", "observations":"具体看到了什么"}。
+  AI 或审查人需要真正查看图片后填写。没有结论、没有关键阶段、没有参考都保持 incomplete。
+
+验证边界
+  本工具的离线回归证明判定逻辑、身份/时效约束及错误不被误判通过。
+  编译、mock、固定夹具不代表某一个整合包已完成实际游戏验收。

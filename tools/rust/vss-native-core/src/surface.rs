@@ -109,6 +109,25 @@ struct BiomeRule {
     needs_secondary: bool,
 }
 impl Rule {
+    fn uses_steep(&self) -> bool {
+        match self {
+            Self::Sequence(rules) | Self::Weighted { rules, .. } => rules.iter().any(Self::uses_steep),
+            Self::Condition(condition, rule) => condition.uses_steep() || rule.uses_steep(),
+            Self::Namespaced { base, sources } => base.uses_steep() || sources.iter().any(|(_, rule)| rule.uses_steep()),
+            _ => false,
+        }
+    }
+}
+impl Condition {
+    fn uses_steep(&self) -> bool {
+        match self {
+            Self::Steep => true,
+            Self::Not(condition) => condition.uses_steep(),
+            _ => false,
+        }
+    }
+}
+impl Rule {
     fn needs_cold(&self) -> bool {
         match self {
             Self::Condition(condition, rule) => condition.needs_cold() || rule.needs_cold(),
@@ -205,6 +224,7 @@ struct Context<'a> {
 }
 pub struct Surface {
     rule: Rule,
+    pub(crate) uses_steep: bool,
     biome_rules: std::collections::HashMap<String, BiomeRule>,
     fallback_needs_cold: bool,
     fallback_needs_secondary: bool,
@@ -314,6 +334,7 @@ impl Surface {
             }
         }
         let mut surface = Self {
+            uses_steep: rule.uses_steep(),
             modern: doc["settings"].get("material_rule").is_some(),
             uses_density: uses_density(&rule),
             fallback_needs_cold: rule.needs_cold(),
@@ -360,6 +381,7 @@ impl Surface {
     fn replace_rule(&mut self, rule: Rule) {
         self.fallback_needs_cold = rule.needs_cold();
         self.fallback_needs_secondary = rule.needs_secondary();
+        self.uses_steep = rule.uses_steep();
         self.rule = rule;
         for (name, plan) in &mut self.biome_rules {
             let rule = self.rule.for_biome(name).unwrap_or_else(|| Rule::Sequence(Vec::new()));

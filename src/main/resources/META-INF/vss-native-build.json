@@ -1,21 +1,14 @@
 {
   "schema": 1,
-  "commit": "7685b690839a92024e0b474185c8c62d654a5c9b",
+  "commit": "fc8c61986b3593a864a6339f88e5aa1eedf2f900",
   "workingTreeModified": true,
   "buildKind": "local-cross",
-  "sourceSha256": "1973e6169317fd791812f2fc3e11da83b35ec8b58f4ca5e367735117cd533a3c",
+  "sourceSha256": "b00ac8105426a43c486ef47b4b23a21ab84ab9e22db55af1cdc2eab2bafa8a27",
   "libraries": {
-    "windows-x86_64/vss_native_core.dll": "038de334fa7a1a431d507abf3015029552bad0aa51dc43c412e00888addddc85",
-    "linux-x86_64/libvss_native_core.so": "c8b415bda4aa9e99da450dde85b2ae529d3f3d573fe777879564a7fc9b670ba3",
-    "linux-aarch64/libvss_native_core.so": "2b86a1bd51537a1006333aba964571d2b6e07315c56a97c688985e4502a286b7",
-    "macos-x86_64/libvss_native_core.dylib": "fc2d561f5f04e39dbaaa9ad475d5932b1590ad4f3dcaf84c3da162fb369fc96d",
-    "macos-aarch64/libvss_native_core.dylib": "ff55b397087722b52e9cd9f03d17419297fcf63cfb2d11f5a2541107070eac45"
-  },
-  "validation": {
-    "buildId": "chunk-refinement-20261115-r3",
-    "executedPlatform": "windows-x86_64",
-    "regressionScope": "Raw chunk JNI layout and occupancy compared with independent columns; bounded surface refinement regressions and actual Terrestria runtime fixture",
-    "otherPlatforms": "Linux x86_64/aarch64 and macOS x86_64/aarch64 cross compiled; architectures, exports, dependencies, deployment and hashes audited. No execution on those platforms.",
-    "gameplay": "No live gameplay validation of this build yet"
+    "windows-x86_64/vss_native_core.dll": "ab5f517e97fbe2ee75c2b0ce3b94ba9da2c642fd668ddd5d5eac10c4fe426fcf",
+    "linux-x86_64/libvss_native_core.so": "9ce8d4b2a7072d909c54ffcf3b5e57d686cefcd90ca705552f54cae84adee5c2",
+    "linux-aarch64/libvss_native_core.so": "518aa2c825d37d564b5c0159a566452a671b1155a55856e96a48f6e314f2cf7c",
+    "macos-x86_64/libvss_native_core.dylib": "b8fb3e88b0c85b37ebd61e57083fb5000463e585b1e16289b1be320cfd06f31d",
+    "macos-aarch64/libvss_native_core.dylib": "e2c7616ea2ae2d330236c6e1c2701d9a415022877e2090b361373f655c07be64"
   }
 }

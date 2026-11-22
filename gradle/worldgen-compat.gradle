@@ -1,0 +1,7 @@
+// Adapter roots share the host compilation and are laid out by mod for ownership.
+ext.worldgenAdapterRoots = { String layer, String variant = '' ->
+    (file('src/compat').listFiles() ?: [])
+            .findAll { it.isDirectory() }.sort { it.name }
+            .collect { variant ? new File(it, variant + '/' + layer) : new File(it, layer) }
+            .findAll { it.isDirectory() }
+}

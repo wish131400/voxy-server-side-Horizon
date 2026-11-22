@@ -11,6 +11,7 @@ tasks.register('architectureTest', Test) {
     maxHeapSize = '2G'
     systemProperty 'vss.mainClasses', sourceSets.main.output.classesDirs.asPath
     systemProperty 'vss.mainSources', sourceSets.main.java.srcDirs.first().absolutePath
+    systemProperty 'vss.worldgenAdapters', file('src/compat').absolutePath
     testLogging { events 'failed', 'skipped'; exceptionFormat 'full' }
 }
 

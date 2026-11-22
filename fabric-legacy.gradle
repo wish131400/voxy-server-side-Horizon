@@ -3,6 +3,8 @@ plugins {
     id 'maven-publish'
 }
 
+apply from: 'gradle/worldgen-compat.gradle'
+
 apply from: 'gradle/minecraft-targets.gradle'
 ext.minecraft_version = selectedMinecraft
 ext.java_version = selectedTarget.java.toString()
@@ -77,7 +79,11 @@ loom {
             dependsOn generateWireFormat
             from(wireSources)
         }
-        overlays.each { from(new File(it, overlayDirectory)) { exclude excluded } }
+        overlays.each { overlay ->
+            from(new File(overlay, overlayDirectory)) { exclude excluded }
+            worldgenAdapterRoots(setName, overlay.name).each { adapter -> from(adapter) { exclude excluded } }
+        }
+        worldgenAdapterRoots(setName).each { adapter -> from(adapter) { exclude excluded } }
         from('src/' + setName + '/java') { exclude excluded }
         into(destination)
         duplicatesStrategy = DuplicatesStrategy.EXCLUDE
@@ -126,7 +132,8 @@ tasks.withType(JavaCompile).configureEach {
 }
 tasks.named('jar', Jar).configure {
     from('LICENSE') { rename { 'LICENSE_vss' } }
-    def productionInputs = files(fileTree('src/main'), fileTree('src/versions'),
+    def productionInputs = files(fileTree('src/main'), fileTree('src/versions'), fileTree('src/compat'),
+            'gradle/worldgen-compat.gradle',
             'build.gradle', 'fabric-next.gradle', 'fabric-legacy.gradle', 'settings.gradle', 'gradle.properties', 'gradle/minecraft-targets.gradle')
     inputs.files(productionInputs)
     doFirst {

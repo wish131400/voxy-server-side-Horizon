@@ -1,0 +1,36 @@
+{
+  "cold-load": {
+    "runId": "replace-cold-load",
+    "preparedRoot": "REPLACE_WITH_ONE_SHOT_PREPARED_ROOT_cold-load",
+    "runtimeRoot": "REPLACE_WITH_RUNTIME_ROOT_cold-load"
+  },
+  "warm-load": {
+    "runId": "replace-warm-load",
+    "preparedRoot": "REPLACE_WITH_ONE_SHOT_PREPARED_ROOT_warm-load",
+    "runtimeRoot": "REPLACE_WITH_RUNTIME_ROOT_warm-load",
+    "cachePaths": [
+      "saves/acceptance-world",
+      ".vss"
+    ]
+  },
+  "movement": {
+    "runId": "replace-movement",
+    "preparedRoot": "REPLACE_WITH_ONE_SHOT_PREPARED_ROOT_movement",
+    "runtimeRoot": "REPLACE_WITH_RUNTIME_ROOT_movement"
+  },
+  "prediction-toggle": {
+    "runId": "replace-prediction-toggle",
+    "preparedRoot": "REPLACE_WITH_ONE_SHOT_PREPARED_ROOT_prediction-toggle",
+    "runtimeRoot": "REPLACE_WITH_RUNTIME_ROOT_prediction-toggle"
+  },
+  "world-reentry": {
+    "runId": "replace-world-reentry",
+    "preparedRoot": "REPLACE_WITH_ONE_SHOT_PREPARED_ROOT_world-reentry",
+    "runtimeRoot": "REPLACE_WITH_RUNTIME_ROOT_world-reentry"
+  },
+  "terrain-biomes": {
+    "runId": "replace-terrain-biomes",
+    "preparedRoot": "REPLACE_WITH_ONE_SHOT_PREPARED_ROOT_terrain-biomes",
+    "runtimeRoot": "REPLACE_WITH_RUNTIME_ROOT_terrain-biomes"
+  }
+}

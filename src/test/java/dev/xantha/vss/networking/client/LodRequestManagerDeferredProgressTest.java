@@ -2,6 +2,7 @@ package dev.xantha.vss.networking.client;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import dev.xantha.vss.common.ChebyshevRingOffsets;
 import dev.xantha.vss.common.PositionUtil;
 import dev.xantha.vss.networking.payloads.SessionConfigS2CPayload;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
@@ -137,6 +138,17 @@ class LodRequestManagerDeferredProgressTest {
         assertEquals(1, f.drain(new RequestWindow(0, 1, 0, 0, 0, 0, 0), 96));
         assertFalse(f.allowGeneration[0]);
         assertFalse(f.probes[0]);
+    }
+
+    @Test
+    void newReadOnlyColumnUsesSyncQuotaWithoutASeparateCacheProbe() throws Exception {
+        Fixture f = new Fixture();
+        field("sessionConfig").set(f.manager, config(false));
+        field("orderedOffsetCount").setInt(f.manager, ChebyshevRingOffsets.count(128));
+        assertEquals(0, f.collect(window(0, 2)));
+        assertEquals(1, f.collect(new RequestWindow(1, 0, 0, 0, 0, 0, 0)));
+        assertFalse(f.probes[0]);
+        assertFalse(f.allowGeneration[0]);
     }
 
     @Test

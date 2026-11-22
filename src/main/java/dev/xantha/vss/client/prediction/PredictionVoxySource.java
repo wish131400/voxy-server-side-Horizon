@@ -1026,9 +1026,17 @@ final class PredictionVoxySource implements VoxyPredictionBridge.Source, XaeroPr
         } catch(Throwable failure) {future.completeExceptionally(failure);throw failure;}
         finally {columnBuildNanos.add(System.nanoTime()-started);reducingColumns.remove(key,future);}
     }
+    // Sample the vertical centre for exposed End terrain. Rounding both ends
+    // outward makes a thin ledge occupy a full voxel even when its centre is air.
+    private static int terrainSampleOffset(Tile tile, int step) {
+        return tile.key().dimension().equals(net.minecraft.world.level.Level.END) ? step / 2 : 0;
+    }
+
     private PredictionVoxyColumnRuns.Page reduceColumn(Tile tile,ColumnKey key,VoxyPredictionBridge.Mapper mapper,PredictionVoxyMaterials materials) {
         var already=reducedColumns.get(key);if(already!=null)return already.runs;
         int step=key.step;
+        int sampleOffset = terrainSampleOffset(tile, step);
+        int bottomBias = sampleOffset == 0 ? 0 : step - 1 - sampleOffset;
         var scratch=COLUMN_SCRATCH.get();if(scratch.busy)scratch=new ColumnScratch();scratch.busy=true;
         var builder=scratch.builder;builder.reset();
         try {
@@ -1048,7 +1056,9 @@ final class PredictionVoxySource implements VoxyPredictionBridge.Source, XaeroPr
         if(minX==maxX && minZ==maxZ) {
             var column=tile.columns()[minZ*tile.axis()+minX];
             for(var run:column.runs()) {
-                int bottom=Math.floorDiv(run.bottom(),step),top=-Math.floorDiv(-run.top(),step);
+                int bottom = Math.floorDiv(run.bottom() + bottomBias, step);
+                int top = -Math.floorDiv(sampleOffset - run.top(), step);
+                if (bottom >= top) continue;
                 long value=dev.xantha.vss.compat.VoxyFluidSurface.body(materials.map(run.state(),column.biome()),run.state(),step);
                 long surface=dev.xantha.vss.compat.VoxyFluidSurface.top(value,run.state(),run.top(),step);
                 if(surface==value)builder.put(bottom,top,value);
@@ -1066,7 +1076,9 @@ final class PredictionVoxySource implements VoxyPredictionBridge.Source, XaeroPr
                 var runs=column.runs();
                 for(int i=0;i<runs.size();i++) {
                     var run=runs.get(runs.size()-1-i);
-                    int bottom=Math.floorDiv(run.bottom(),step),top=-Math.floorDiv(-run.top(),step);
+                    int bottom = Math.floorDiv(run.bottom() + bottomBias, step);
+                    int top = -Math.floorDiv(sampleOffset - run.top(), step);
+                    if (bottom >= top) continue;
                     if(coverage.covers(bottom,top))continue;
                     long value=dev.xantha.vss.compat.VoxyFluidSurface.body(materials.map(run.state(),column.biome()),run.state(),step);
                     long surface=dev.xantha.vss.compat.VoxyFluidSurface.top(value,run.state(),run.top(),step);
@@ -1434,16 +1446,18 @@ final class PredictionVoxySource implements VoxyPredictionBridge.Source, XaeroPr
                     var runs=reducedColumn(tile,step,minX,minZ,maxX,maxZ,mapper,cachedMapper,aligned,scratch.columnPages);
                     runs.write(index,result,x,z,Math.floorDiv(by,step),width,face);
                 } else {
+                int sampleOffset = terrainSampleOffset(tile, step);
+                int bottomBias = sampleOffset == 0 ? 0 : step - 1 - sampleOffset;
                 for(int cz=firstZ;cz<=lastZ;cz++) for(int cx=firstX;cx<=lastX;cx++) {
                 Column column = tile.columns()[cz * tile.axis() + cx];
                 int materialOffset=scratch.mapColumn(column);
                 for (int r = 0; r < column.runs().size(); r++) {
                     Run run = column.runs().get(r);
-                    int bottom = Math.max(y0, Math.floorDiv(run.bottom() - by, step));
-                    int top = Math.min(y1, -Math.floorDiv(by - run.top(), step));
+                    int bottom = Math.max(y0, Math.floorDiv(run.bottom() - by + bottomBias, step));
+                    int top = Math.min(y1, -Math.floorDiv(by + sampleOffset - run.top(), step));
                     if (bottom >= top) continue;
                     long value = dev.xantha.vss.compat.VoxyFluidSurface.body(scratch.mappedRuns[materialOffset+r],run.state(),step);
-                    int surfaceY=Math.floorDiv(run.top()-1-by,step);
+                    int surfaceY=-Math.floorDiv(by + sampleOffset - run.top(), step)-1;
                     long surface=dev.xantha.vss.compat.VoxyFluidSurface.top(value,run.state(),run.top(),step);
                     byte opacity = lighting == null ? 0 : lighting.opacity(run.state());
                     for (int y = bottom; y < top; y++) {

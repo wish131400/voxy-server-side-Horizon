@@ -1101,7 +1101,7 @@ public final class LodRequestManager {
             ScanBudget scanBudget) {
         if (nearScanCompletedForCurrentOffsets
                 || orderedOffsetCount == 0
-                || !requestWindow.hasNormalCandidateCapacity(0)
+                || !hasScanCapacity(requestWindow, 0)
                 || lodDistance <= 0
                 || !scanBudget.canScanMore()) {
             return count;
@@ -1110,7 +1110,7 @@ public final class LodRequestManager {
         int maxAllowedRing = Math.min(lodDistance, VSSConstants.SYNC_NEAR_DISTANCE_CHUNKS);
         int totalCandidates = orderedOffsetCount;
         while (count < maxCount
-                && requestWindow.hasNormalCandidateCapacity(0)
+                && hasScanCapacity(requestWindow, 0)
                 && scanBudget.canScanMore()) {
             if (nearScanOffsetIndex >= totalCandidates) {
                 nearScanCompletedForCurrentOffsets = true;
@@ -1370,7 +1370,7 @@ public final class LodRequestManager {
             if (offsetRing > maxAllowedRing) {
                 break;
             }
-            if (!requestWindow.hasNormalCandidateCapacity(offsetRing)) {
+            if (!hasScanCapacity(requestWindow, offsetRing)) {
                 break;
             }
 
@@ -1536,9 +1536,19 @@ public final class LodRequestManager {
     private boolean requiresFirstPassCacheProbe(long packed) {
         return sessionConfig != null
                 && sessionConfig.enabled()
+                && usesCacheProbePass()
                 && columnTimestamps.get(packed) <= 0L
                 && !diskMissedColumns.contains(packed)
                 && !hasKnownColumn(packed);
+    }
+
+    // Read-only sync already opens both the VSS cache and existing chunk data.
+    private boolean usesCacheProbePass() {
+        return generationAllowed() || cacheOnlyReload.isActive();
+    }
+
+    private boolean hasScanCapacity(RequestWindow window, int ring) {
+        return usesCacheProbePass() ? window.hasNormalCandidateCapacity(ring) : window.hasSyncCapacity(ring);
     }
 
     private boolean shouldRequestColumn(long packed, long now) {
